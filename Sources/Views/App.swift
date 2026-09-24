@@ -74,6 +74,8 @@ struct ContentView: View {
                         .tag("certificate")
                     Label("宝塔面板", systemImage: "server.rack")
                         .tag("btpanel")
+                    Label("网络代理", systemImage: "globe")
+                        .tag("vpn")
                 }
                 Section {
                     Label("设置", systemImage: "gearshape.fill")
@@ -90,6 +92,8 @@ struct ContentView: View {
                         CertificateView()
                     case "btpanel":
                         BTPanelView()
+                    case "vpn":
+                        VPNView()
                     case "mysql":
                         MySQLView()
                     case "redis":

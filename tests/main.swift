@@ -706,6 +706,42 @@ check("空输出不匹配", !ProcUtil.processNameMatches("", "redis-server"))
 check("有前后空白也能匹配",
       ProcUtil.processNameMatches("  /opt/homebrew/bin/redis-server\n", "redis-server"))
 
+print("== 网络代理：设置与随机凭据 ==")
+var vpnSettings = VPNSettings()
+check("默认客户端名", vpnSettings.clientName == "seraphine", vpnSettings.clientName)
+check("默认远端描述文件以 .mobileconfig 结尾",
+      vpnSettings.remoteProfilePath.hasSuffix(".mobileconfig"), vpnSettings.remoteProfilePath)
+check("默认备份到 iCloud", vpnSettings.icloudBackup)
+check("默认 SSH 端口 22", vpnSettings.sshPort == 22)
+// 随机串只含字母数字：安装脚本对特殊字符有忌讳，会破坏它生成的配置
+let vpnSecret = VPNService.randomSecret(32)
+check("随机串长度正确", vpnSecret.count == 32, "\(vpnSecret.count)")
+check("随机串只含字母数字",
+      vpnSecret.allSatisfy { $0.isLetter || $0.isNumber }, vpnSecret)
+check("两次生成不相同", VPNService.randomSecret(32) != VPNService.randomSecret(32))
+// 新增 vpn 段后：老设置文件（没有该段 / 只有部分字段）仍要能解码
+let vpnSettingsJSON = Data(#"{"vpn":{"host":"1.2.3.4"}}"#.utf8)
+check("只有部分字段的 vpn 段也能解码",
+      (try? JSONDecoder().decode(AppSettings.self, from: vpnSettingsJSON))?.vpn.host == "1.2.3.4")
+check("未给的字段回落到默认值",
+      (try? JSONDecoder().decode(AppSettings.self, from: vpnSettingsJSON))?.vpn.sshPort == 22)
+check("完全没有 vpn 段时用默认值",
+      (try? JSONDecoder().decode(AppSettings.self, from: Data("{}".utf8)))?.vpn.clientName == "seraphine")
+
+print("== 网络代理：日志脱敏（VPN 凭据绝不能落盘）==")
+check("VPN_IPSEC_PSK 被遮掉",
+      !Shell.redactSecrets("env VPN_IPSEC_PSK='abc123secret' bash x").contains("abc123secret"))
+check("VPN_PASSWORD 被遮掉",
+      !Shell.redactSecrets("env VPN_PASSWORD='pw123456' bash x").contains("pw123456"))
+check("DBM_SSH_PASSWORD 被遮掉",
+      !Shell.redactSecrets("DBM_SSH_PASSWORD=topsecret ssh x").contains("topsecret"))
+check("连接串里的密码仍被遮掉",
+      !Shell.redactSecrets("mongodb://user:secret@127.0.0.1:27017").contains("secret"))
+check("JSON 里的 password 仍被遮掉",
+      !Shell.redactSecrets(#"{"password":"hunter2"}"#).contains("hunter2"))
+check("非敏感文本原样保留",
+      Shell.redactSecrets("hello world") == "hello world", Shell.redactSecrets("hello world"))
+
 print("== 设置文件的宽松解码 ==")
 let partialSettings = Data("{\"mongo\":{\"adminUser\":\"u1\",\"adminPassword\":\"p1\"}}".utf8)
 let decodedSettings = try? JSONDecoder().decode(AppSettings.self, from: partialSettings)

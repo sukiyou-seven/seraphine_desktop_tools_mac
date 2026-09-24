@@ -60,12 +60,45 @@ struct RedisSettings: Codable {
     }
 }
 
+/// 「网络代理」设置：一台可通过 SSH 管理的服务器，用来搭建 IKEv2 VPN。
+/// 注意：这些字段会写进本地 settings.json（600），日志里对密码做脱敏。
+struct VPNSettings: Codable {
+    /// 服务器公网地址（SSH 和 VPN 都用它），例如 1.2.3.4
+    var host = ""
+    var sshPort = 22
+    var sshUser = "root"
+    var sshPassword = ""
+    /// VPN 客户端名，同时用作 IKEv2 的 LocalIdentifier
+    var clientName = "seraphine"
+    /// 安装脚本在服务器上生成的描述文件路径
+    var remoteProfilePath = "/root/vpnclient.mobileconfig"
+    /// 是否把描述文件复制一份到 iCloud Drive（方便 iPhone 取用）
+    var icloudBackup = true
+    /// 本机保存路径（留空则用默认位置）
+    var localProfilePath = ""
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        host = try container.decodeIfPresent(String.self, forKey: .host) ?? host
+        sshPort = try container.decodeIfPresent(Int.self, forKey: .sshPort) ?? sshPort
+        sshUser = try container.decodeIfPresent(String.self, forKey: .sshUser) ?? sshUser
+        sshPassword = try container.decodeIfPresent(String.self, forKey: .sshPassword) ?? sshPassword
+        clientName = try container.decodeIfPresent(String.self, forKey: .clientName) ?? clientName
+        remoteProfilePath = try container.decodeIfPresent(String.self, forKey: .remoteProfilePath) ?? remoteProfilePath
+        icloudBackup = try container.decodeIfPresent(Bool.self, forKey: .icloudBackup) ?? icloudBackup
+        localProfilePath = try container.decodeIfPresent(String.self, forKey: .localProfilePath) ?? localProfilePath
+    }
+}
+
 struct AppSettings: Codable {
     var mongo = MongoSettings()
     var redis = RedisSettings()
     var mysql = MySQLSettings()
     var acme = ACMESettings()
     var bt = BTSettings()
+    var vpn = VPNSettings()
 
     init() {}
 
@@ -76,6 +109,7 @@ struct AppSettings: Codable {
         mysql = try container.decodeIfPresent(MySQLSettings.self, forKey: .mysql) ?? mysql
         acme = try container.decodeIfPresent(ACMESettings.self, forKey: .acme) ?? acme
         bt = try container.decodeIfPresent(BTSettings.self, forKey: .bt) ?? bt
+        vpn = try container.decodeIfPresent(VPNSettings.self, forKey: .vpn) ?? vpn
     }
 }
 

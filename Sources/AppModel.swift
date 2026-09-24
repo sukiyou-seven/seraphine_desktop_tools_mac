@@ -63,6 +63,14 @@ final class AppModel: ObservableObject {
     @Published var toast: Toast?
     @Published var settingsMessage = ""
 
+    // 网络代理（IKEv2 VPN）
+    @Published var vpnProbe: VPNProbe?
+    @Published var vpnStatus = VPNStatus()
+    @Published var vpnLog = ""
+    @Published var vpnInstallDone = false
+    /// 本机已取回的描述文件路径
+    @Published var vpnLocalProfile = ""
+
     // MongoDB
     @Published var mongoStatus = MongoStatus()
     @Published var mongoDatabases: [MongoDatabase] = []
@@ -119,6 +127,7 @@ final class AppModel: ObservableObject {
     private var mysql: MySQLService
     private var acme: ACMEService
     private var bt: BTPanelService
+    private var vpn: VPNService
 
     init() {
         Diag.log("AppModel 初始化")
@@ -129,6 +138,7 @@ final class AppModel: ObservableObject {
         mysql = MySQLService(settings: loaded.mysql)
         acme = ACMEService(settings: loaded.acme)
         bt = BTPanelService(settings: loaded.bt)
+        vpn = VPNService(settings: loaded.vpn)
     }
 
     // MARK: 服务与设置
@@ -139,6 +149,7 @@ final class AppModel: ObservableObject {
         mysql = MySQLService(settings: settings.mysql)
         acme = ACMEService(settings: settings.acme)
         bt = BTPanelService(settings: settings.bt)
+        vpn = VPNService(settings: settings.vpn)
     }
 
     func applySettings() {
@@ -1221,6 +1232,158 @@ final class AppModel: ObservableObject {
     var btBlockedIP: String? { BTPanelService.blockedIP(from: btLastResponse) }
 
     /// 面板地址/密钥改了就存盘，并让服务拿到最新配置
+    // MARK: 网络代理（IKEv2 VPN）
+
+    /// 保存 VPN 设置并重建服务
+    private func syncVPNSettings() {
+        settings.vpn.host = settings.vpn.host.trimmingCharacters(in: .whitespaces)
+        settings.vpn.sshUser = settings.vpn.sshUser.trimmingCharacters(in: .whitespaces)
+        SettingsStore.save(settings)
+        rebuildServices()
+    }
+
+    /// 记录 VPN 操作输出（写进界面与日志前一律脱敏）
+    private func recordVPN(_ label: String, _ output: String) {
+        let clean = Shell.redactSecrets(output)
+        vpnLog = "【\(label)】\n" + (clean.isEmpty ? "（无输出）" : clean)
+    }
+
+    /// 测试 SSH 连接并探测服务器环境（系统 / 架构 / 内存 / 是否已装 IKEv2）
+    func vpnProbeServer() {
+        syncVPNSettings()
+        let service = vpn
+        perform("正在连接 \(settings.vpn.host)…") {
+            let (probe, output) = service.probe()
+            self.vpnProbe = probe
+            self.recordVPN("探测服务器", output)
+            guard !probe.osName.isEmpty else {
+                return .failure("SSH 连接失败，请检查地址 / 端口 / 用户名 / 密码",
+                                detail: Shell.redactSecrets(output))
+            }
+            return ActionResult(ok: true,
+                                message: "已连上：\(probe.osName)（\(probe.arch)）",
+                                detail: Shell.redactSecrets(output))
+        }
+    }
+
+    /// 检查 UDP 500/4500 是否真的能到达服务器。
+    /// 这是区分「云安全组没放行」和「服务端配置问题」最快的一步 ——
+    /// 服务器抓不到包就一定是防火墙，不用再折腾服务端。
+    func vpnCheckUDP() {
+        syncVPNSettings()
+        let service = vpn
+        perform("正在验证 UDP 500/4500 连通性…") {
+            let (reachable, detail) = service.checkUDP()
+            self.recordVPN("UDP 连通性", detail)
+            if reachable {
+                return ActionResult(ok: true, message: "UDP 500/4500 通畅", detail: detail)
+            }
+            return .failure("UDP 500/4500 不通", detail: detail)
+        }
+    }
+
+    /// 在服务器上安装 IPsec + IKEv2
+    func vpnInstall() {
+        syncVPNSettings()
+        let service = vpn
+        vpnInstallDone = false
+        perform("正在服务器上启动 IKEv2 安装…") {
+            let result = service.install()
+            self.recordVPN("启动安装", result.detail)
+            return result
+        } after: {
+            // 安装要几分钟，自动轮询进度
+            self.vpnPollInstallProgress(rounds: 40)
+        }
+    }
+
+    /// 轮询安装进度（安装耗时几分钟，所以做成可重复调用的）
+    func vpnPollInstallProgress(rounds: Int) {
+        guard rounds > 0, !vpnInstallDone else { return }
+        let service = vpn
+        perform("正在安装…（剩余尝试 \(rounds) 次）") {
+            let (done, failed, output) = service.installProgress()
+            self.recordVPN("安装进度", output)
+            if done {
+                self.vpnInstallDone = true
+                return ActionResult(ok: true, message: "IKEv2 安装完成，可以取回配置了")
+            }
+            if failed {
+                return .failure("安装过程中出现错误", detail: Shell.redactSecrets(output))
+            }
+            return ActionResult(ok: true, message: "安装进行中…", detail: output)
+        } after: {
+            if self.vpnInstallDone { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+                self.vpnPollInstallProgress(rounds: rounds - 1)
+            }
+        }
+    }
+
+    /// 从服务器取回描述文件（mobileconfig / p12 / sswan）
+    func vpnFetchProfile() {
+        syncVPNSettings()
+        let service = vpn
+        let directory = Paths.appSupport.appendingPathComponent("vpn").path
+        perform("正在取回描述文件…") {
+            let result = service.fetchProfile(into: directory)
+            self.vpnLocalProfile = result.backupPath
+            self.recordVPN("取回配置", result.detail)
+            return result
+        }
+    }
+
+    /// 打开描述文件 —— 交给系统弹安装向导。
+    /// macOS 27 起描述文件必须由用户点「安装」，命令行装不了（profiles install 已被移除）。
+    func vpnInstallProfile() {
+        guard !vpnLocalProfile.isEmpty, FileTools.exists(vpnLocalProfile) else {
+            toast = Toast(text: "还没有取回描述文件", ok: false, detail: "先点「取回配置」")
+            return
+        }
+        let service = vpn
+        let path = vpnLocalProfile
+        perform("正在打开描述文件…") {
+            service.openProfile(at: path)
+        } after: {
+            self.vpnRefreshStatus()
+        }
+    }
+
+    /// 把描述文件备份到 iCloud Drive（iPhone 直接取）
+    func vpnBackupToICloud() {
+        guard !vpnLocalProfile.isEmpty, FileTools.exists(vpnLocalProfile) else {
+            toast = Toast(text: "还没有取回描述文件", ok: false, detail: "先点「取回配置」")
+            return
+        }
+        let service = vpn
+        let path = vpnLocalProfile
+        perform("正在备份到 iCloud…") {
+            service.backupToICloud(from: path)
+        }
+    }
+
+    /// 刷新本机 VPN 状态（描述文件是否装了、有没有可用服务）
+    func vpnRefreshStatus() {
+        let service = vpn
+        load("正在读取本机 VPN 状态…", { .success(service.status()) },
+             into: { status in
+                 self.vpnStatus = status
+             },
+             onError: { message in
+                 self.toast = Toast(text: "读取 VPN 状态失败", ok: false, detail: message)
+             })
+    }
+
+    /// 连接 / 断开系统 VPN
+    func vpnSetConnected(_ connected: Bool) {
+        let service = vpn
+        perform(connected ? "正在连接 VPN…" : "正在断开 VPN…") {
+            service.setConnected(connected)
+        } after: {
+            self.vpnRefreshStatus()
+        }
+    }
+
     private func syncBTSettings() {
         SettingsStore.save(settings)
         rebuildServices()

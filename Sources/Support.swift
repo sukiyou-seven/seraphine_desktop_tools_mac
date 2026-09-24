@@ -39,6 +39,16 @@ enum Paths {
         return "/opt/homebrew"
     }
 
+    /// iCloud Drive 的「文稿」目录 —— 放这儿，iPhone 的「文件」App 能直接取到。
+    /// 没开 iCloud 云盘时返回空串。
+    static var iCloudDocuments: String {
+        let path = NSHomeDirectory() + "/Library/Mobile Documents/com~apple~CloudDocs/Documents"
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+              isDirectory.boolValue else { return "" }
+        return path
+    }
+
     static func which(_ name: String) -> String? {
         // 已经给了绝对路径
         if name.contains("/"), FileManager.default.isExecutableFile(atPath: name) { return name }
@@ -134,10 +144,25 @@ enum Shell {
     }
 
     /// 日志脱敏：连接串里的密码一律替换成 ***（工具会执行带凭据的 mongodb:// 命令）。
+    /// 把要写进日志的命令/输出里的敏感值遮掉。
+    /// 覆盖三类：URL 里的 `user:pass@`、环境变量式赋值（`VPN_IPSEC_PSK=…`、`VPN_PASSWORD=…`、
+    /// `DBM_SSH_PASSWORD=…`）、以及 JSON 里的 password 一类字段。
+    /// 装 VPN 时凭据是以 `env VAR='…'` 形式出现在命令行里的，所以这几条规则是必需的。
     static func redactSecrets(_ text: String) -> String {
-        guard let regex = try? NSRegularExpression(pattern: "://([^:/@\\s]+):([^@\\s]+)@") else { return text }
-        let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        return regex.stringByReplacingMatches(in: text, range: range, withTemplate: "://$1:***@")
+        var result = text
+        let rules: [(pattern: String, template: String)] = [
+            ("://([^:/@\\s]+):([^@\\s]+)@", "://$1:***@"),
+            ("(?i)(VPN_IPSEC_PSK|VPN_PASSWORD|DBM_SSH_PASSWORD)=(\\'?)([^\\'\\s]+)", "$1=$2***"),
+            ("(?i)\\b(password|passwd|pwd)=(\\'?)([^\\'\\s]+)", "$1=$2***"),
+            ("(?i)(\"(password|passwd|pwd|api_sk|secret)\"\\s*:\\s*\")[^\"]*(\")", "$1***$3"),
+        ]
+        for rule in rules {
+            guard let regex = try? NSRegularExpression(pattern: rule.pattern) else { continue }
+            let range = NSRange(result.startIndex..<result.endIndex, in: result)
+            result = regex.stringByReplacingMatches(in: result, range: range,
+                                                    withTemplate: rule.template)
+        }
+        return result
     }
 
     /// 把一段文本安全地包成 shell 单引号参数。

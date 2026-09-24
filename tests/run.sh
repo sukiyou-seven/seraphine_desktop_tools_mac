@@ -23,6 +23,7 @@ CORE=(
   "$ROOT/Sources/MySQLService.swift"
   "$ROOT/Sources/ACMEService.swift"
   "$ROOT/Sources/BTPanelService.swift"
+  "$ROOT/Sources/VPNService.swift"
   "$ROOT/tests/FakeRedis.swift"
   "$ROOT/tests/main.swift"
 )
