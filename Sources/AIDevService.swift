@@ -443,7 +443,7 @@ enum AIUsageLimit {
         guard !text.isEmpty else { return nil }
 
         // 1) 先试带/不带时区的完整格式
-        for formatter in absoluteFormatters(now: now) {
+        for formatter in absoluteFormatters(now: now, calendar: calendar) {
             if let date = formatter.date(from: text) { return date }
         }
         let iso = ISO8601DateFormatter()
@@ -460,13 +460,13 @@ enum AIUsageLimit {
         }
         if let datePart {
             let withTime = timePart.map { datePart + " " + $0 } ?? datePart
-            for formatter in dayFormatters(now: now) {
+            for formatter in dayFormatters(now: now, calendar: calendar) {
                 if let date = formatter.date(from: withTime) { return date }
             }
         }
         if let monthPart {
             let withTime = timePart.map { monthPart + " " + $0 } ?? monthPart
-            for formatter in monthFormatters(now: now) {
+            for formatter in monthFormatters(now: now, calendar: calendar) {
                 if let date = formatter.date(from: withTime) { return date }
             }
         }
@@ -515,21 +515,23 @@ enum AIUsageLimit {
     /// `defaultDate` 很关键：像 `Sep 26, 9:30 PM` 这种没有年份的文案，
     /// DateFormatter 会拿它补缺失字段 —— 默认是 **2000-01-01**，
     /// 于是「几点恢复」会被算成 2000 年。必须显式补上当前时间。
-    private static func formatter(_ format: String, defaultDate: Date? = nil) -> DateFormatter {
+    private static func formatter(_ format: String, defaultDate: Date? = nil,
+                                  timeZone: TimeZone? = nil) -> DateFormatter {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = format
+        if let timeZone { formatter.timeZone = timeZone }
         if let defaultDate { formatter.defaultDate = defaultDate }
         return formatter
     }
 
     /// 带日期（ISO / 年-月-日）的格式，先按本地时区解，解不出来再按 UTC。
-    private static func absoluteFormatters(now: Date) -> [DateFormatter] {
+    private static func absoluteFormatters(now: Date, calendar: Calendar) -> [DateFormatter] {
         let formats = [
             "yyyy-MM-dd'T'HH:mm:ssZ", "yyyy-MM-dd'T'HH:mm:ss", "yyyy-MM-dd HH:mm:ss Z",
             "yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm", "yyyy-MM-dd",
         ]
-        var formatters = formats.map { formatter($0, defaultDate: now) }
+        var formatters = formats.map { formatter($0, defaultDate: now, timeZone: calendar.timeZone) }
         for format in formats {
             let utc = formatter(format, defaultDate: now)
             utc.timeZone = TimeZone(identifier: "UTC")
@@ -538,14 +540,16 @@ enum AIUsageLimit {
         return formatters
     }
 
-    private static func dayFormatters(now: Date) -> [DateFormatter] {
-        ["yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm", "yyyy-MM-dd"].map { formatter($0, defaultDate: now) }
+    private static func dayFormatters(now: Date, calendar: Calendar) -> [DateFormatter] {
+        ["yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm", "yyyy-MM-dd"].map {
+            formatter($0, defaultDate: now, timeZone: calendar.timeZone)
+        }
     }
 
-    private static func monthFormatters(now: Date) -> [DateFormatter] {
+    private static func monthFormatters(now: Date, calendar: Calendar) -> [DateFormatter] {
         ["MMM d, yyyy h:mm a", "MMM d yyyy h:mm a", "MMM d, h:mm a", "MMM d h:mm a",
          "MMM d, yyyy", "MMM d yyyy", "MMM d", "MMMM d, h:mm a", "MMMM d h:mm a"].map {
-            formatter($0, defaultDate: now)
+            formatter($0, defaultDate: now, timeZone: calendar.timeZone)
         }
     }
 
