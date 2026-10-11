@@ -1,0 +1,628 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "宝塔面板 API（BT Panel / aaPanel）",
+    "version": "13.1.0",
+    "description": "宝塔面板的 HTTP API。**RPC 风格**：绝大多数接口都是 `POST /<模块>`，具体方法用表单参数 `action` 指定，业务参数平铺在同一层表单里（不是 JSON body）。\n\n## 鉴权\n每个请求都必须带两个 **表单字段**：\n\n- `request_time`：当前 Unix 时间戳（秒，字符串）\n- `request_token`：`md5(request_time + md5(API_KEY))`\n\n`API_KEY` 在面板「设置 → API 接口」生成。请求必须是 `POST`，`Content-Type: application/x-www-form-urlencoded`。时间戳要接近服务器当前时间；同一 IP 连续 20 次校验失败会被封 1 小时。\n\n> OpenAPI 的 apiKey 只支持 header/query/cookie，装不下「表单字段鉴权」，所以本文件用 `components.schemas.PanelAuth` 描述这两个字段，各请求用 `allOf` 组合它。\n\n## 响应\n\n- 操作类：`{\"status\": true, \"msg\": \"操作成功\"}` / `{\"status\": false, \"msg\": \"错误原因\"}`\n- 查询类：直接返回数据对象 / 数组 / 带 `PAGE` 字段的分页对象\n- **方法不存在**：返回 nginx 404（与鉴权失败的 `200 + 密钥校验失败` 可区分）\n- **参数缺失 / 非法**：`{\"status\": false, \"msg\": \"缺少参数！xxx\"}`\n\n## 版本差异（重点）\n\n1. 列表接口已统一到 `POST /data` 的 `action=getData&table=<表名>`；旧版的 `GetSiteList` / `GetDatabaseList` / `GetUserList` 已废弃。\n2. 新建网站仍是 `POST /site` 的 `action=AddSite`。⚠️ **实测：创建成功时也可能返回 nginx 404**（面板把建站后续步骤的异常吞成了 404），所以判定是否成功要拿 `table=sites` 回查，不能只看响应。\n3. 数据库列表在面板界面上走 `/database/<类型>/get_list`，MySQL 例外，走 `/data getData table=databases`。\n\n> 本文件依据面板 13.1.0 的源码与在线实测整理，覆盖范围为**本工具用到的接口 + 网站管理**，不是面板全部 997 个 action。",
+    "license": {
+      "name": "Internal reference"
+    }
+  },
+  "servers": [
+    {
+      "url": "{scheme}://{host}:{port}",
+      "description": "面板地址（宝塔默认端口 8888）",
+      "variables": {
+        "scheme": {
+          "default": "http",
+          "enum": ["http", "https"],
+          "description": "面板开了 SSL 就用 https"
+        },
+        "host": {
+          "default": "127.0.0.1",
+          "description": "服务器 IP 或域名"
+        },
+        "port": {
+          "default": "8888",
+          "description": "面板端口"
+        }
+      }
+    }
+  ],
+  "tags": [
+    { "name": "system", "description": "系统状态与服务管理" },
+    { "name": "site", "description": "网站管理：建站 / 域名 / SSL / 启停 / 目录 / 反代" },
+    { "name": "data", "description": "通用数据查询（新版列表接口，sites / databases / ftps / cron / firewall）" },
+    { "name": "database", "description": "数据库管理" },
+    { "name": "files", "description": "文件管理" },
+    { "name": "crontab", "description": "计划任务" },
+    { "name": "plugin", "description": "软件商店 / 插件" },
+    { "name": "ajax", "description": "进程与日志" },
+    { "name": "ssl", "description": "商业 SSL 证书" },
+    { "name": "acme", "description": "Let's Encrypt 证书" },
+    { "name": "firewall", "description": "系统防火墙" },
+    { "name": "config", "description": "面板设置" }
+  ],
+  "x-request": {
+    "method": "POST",
+    "contentType": "application/x-www-form-urlencoded",
+    "actionParam": "action",
+    "note": "所有业务参数都是表单字段；除少数路径式接口（如 /message/get_messages）外，方法名统一放在 action 字段里。"
+  },
+  "components": {
+    "schemas": {
+      "PanelAuth": {
+        "type": "object",
+        "required": ["request_time", "request_token"],
+        "properties": {
+          "request_time": {
+            "type": "string",
+            "description": "当前 Unix 时间戳（秒）",
+            "example": "1730000000"
+          },
+          "request_token": {
+            "type": "string",
+            "description": "md5(request_time + md5(API_KEY))"
+          }
+        }
+      },
+      "StatusResponse": {
+        "type": "object",
+        "description": "操作类接口的统一返回",
+        "properties": {
+          "status": { "type": "boolean", "description": "是否成功" },
+          "msg": { "type": "string", "description": "提示信息" }
+        },
+        "example": { "status": true, "msg": "站点删除成功!" }
+      },
+      "DataListResponse": {
+        "type": "object",
+        "description": "`/data action=getData` 的返回",
+        "properties": {
+          "auto_list": { "type": "boolean" },
+          "where": { "type": "string" },
+          "page": { "type": "string", "description": "分页 HTML 片段" },
+          "data": {
+            "type": "array",
+            "items": { "type": "object", "additionalProperties": true }
+          },
+          "search_history": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "AddSiteRequest": {
+        "allOf": [
+          { "$ref": "#/components/schemas/PanelAuth" },
+          {
+            "type": "object",
+            "required": ["action", "webname", "path", "version", "port"],
+            "properties": {
+              "action": { "type": "string", "enum": ["AddSite"] },
+              "webname": {
+                "type": "string",
+                "description": "JSON 字符串：{\"domain\":\"主域名\",\"domainlist\":[\"附加域名\"],\"count\":0}",
+                "example": "{\"domain\":\"example.com\",\"domainlist\":[],\"count\":0}"
+              },
+              "path": {
+                "type": "string",
+                "description": "网站根目录；宝塔惯例是 /www/wwwroot/<主域名>",
+                "example": "/www/wwwroot/example.com"
+              },
+              "type_id": { "type": "string", "default": "0", "description": "网站分类 ID（不是 PHP 版本）" },
+              "version": {
+                "type": "string",
+                "description": "PHP 版本号；纯静态传 00。可用值见 /site GetPHPVersion",
+                "example": "00"
+              },
+              "port": { "type": "string", "default": "80", "description": "端口" },
+              "type": {
+                "type": "string",
+                "description": "PHP 站点传 PHP；纯静态按官方口径不传（留空）"
+              },
+              "ps": { "type": "string", "description": "备注" },
+              "ftp": { "type": "string", "enum": ["true", "false"], "default": "false", "description": "是否同时创建同名 FTP" },
+              "sql": { "type": "string", "enum": ["true", "false"], "default": "false", "description": "是否同时创建同名数据库" },
+              "set_ssl": { "type": "string", "enum": ["true", "false"], "description": "是否顺便开启 SSL" }
+            }
+          }
+        ]
+      },
+      "DeleteSiteRequest": {
+        "allOf": [
+          { "$ref": "#/components/schemas/PanelAuth" },
+          {
+            "type": "object",
+            "required": ["action", "id", "webname"],
+            "properties": {
+              "action": { "type": "string", "enum": ["DeleteSite"] },
+              "id": { "type": "string", "description": "网站 ID（sites 表的 id）" },
+              "webname": { "type": "string", "description": "网站域名（注意：这里传域名，不是 AddSite 的那个 JSON）" },
+              "database": { "type": "string", "enum": ["true", "false"], "description": "是否连数据库一起删" },
+              "path": { "type": "string", "enum": ["true", "false"], "description": "是否连根目录一起删" }
+            }
+          }
+        ]
+      },
+      "SetSSLRequest": {
+        "allOf": [
+          { "$ref": "#/components/schemas/PanelAuth" },
+          {
+            "type": "object",
+            "required": ["action", "siteName", "key", "csr"],
+            "properties": {
+              "action": { "type": "string", "enum": ["SetSSL"] },
+              "siteName": { "type": "string", "description": "网站名（域名）" },
+              "key": { "type": "string", "description": "私钥 PEM 全文" },
+              "csr": { "type": "string", "description": "证书（fullchain）PEM 全文" }
+            }
+          }
+        ]
+      },
+      "GetDataRequest": {
+        "allOf": [
+          { "$ref": "#/components/schemas/PanelAuth" },
+          {
+            "type": "object",
+            "required": ["action", "table"],
+            "properties": {
+              "action": { "type": "string", "enum": ["getData"] },
+              "table": {
+                "type": "string",
+                "description": "要查的表",
+                "enum": ["sites", "databases", "ftps", "crontab", "firewall", "domain", "logs"]
+              },
+              "p": { "type": "string", "default": "1", "description": "页码" },
+              "limit": { "type": "string", "default": "10", "description": "每页条数" },
+              "search": { "type": "string", "description": "关键字搜索" },
+              "where": { "type": "string", "description": "附加 SQL 条件" },
+              "order": { "type": "string", "description": "排序，如 id desc" },
+              "type": { "type": "string", "default": "-1", "description": "类型过滤，-1 表示全部" }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "paths": {
+    "/project/{kind}/{method}": {
+      "post": {
+        "tags": ["site"],
+        "summary": "新建项目（9 类）",
+        "description": "面板 13.x 把项目分成 9 类，对应源码 `/www/server/panel/class/projectModel/` 下的 9 个 Model。\n\n⚠️ **必须同时带 `action`**：路径里的 `<method>` 决定路由，表单里还要再给一个同名的 `action`，否则面板返回 404（实测：只给路径不给 action，9 类全部 404）。\n\n⚠️ 参数缺失或内部异常时，面板也会把它吞成 nginx 404 —— 判定成功要拿 `/data getData table=sites` 回查名字是否真的出现。",
+        "parameters": [
+          { "name": "kind", "in": "path", "required": true, "schema": { "type": "string", "enum": ["html", "php", "proxy", "python", "nodejs", "java", "go", "net", "other"] }, "description": "项目类型" },
+          { "name": "method", "in": "path", "required": true, "schema": { "type": "string" }, "description": "创建方法：create_project（多数）/ CreateProject（Python）/ AddSite（反向代理）" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": { "$ref": "#/components/schemas/PanelAuth" }
+            }
+          }
+        },
+        "x-kinds": [
+          { "kind": "html", "path": "/project/html/create_project", "required": ["webname", "path"], "note": "webname 是 JSON 字符串，含 domain / domainlist / count；固定带 ftp=false、port=80" },
+          { "kind": "php", "path": "/site?action=AddSite", "required": ["webname", "path", "version"], "note": "其实是经典建站接口；固定参数：type=PHP、type_id=0、codeing=utf8mb4、need_index=0、need_404=0、ftp/sql=false" },
+          { "kind": "proxy", "path": "/mod/proxy/com/create", "required": ["domains", "proxy_pass"], "note": "参数照官方前端：proxy_type=http、proxy_host=$http_host、remark=备注" },
+          { "kind": "python", "path": "/project/python/CreateProject", "required": ["pjname", "path", "port", "stype", "rfile"], "note": "项目名参数是 pjname，运行方式是 stype（gunicorn / uwsgi / command）；xsgi 是 wsgi/asgi，不是运行方式" },
+          { "kind": "nodejs", "path": "/project/nodejs/create_project", "required": ["project_name", "project_cwd", "project_script", "port"], "note": "依赖 Node.js，没装版本管理器会被拒" },
+          { "kind": "java", "path": "/project/java/create_project", "required": ["project_type", "project_path"], "note": "project_type: 1 内置 / 2 独立 / 3 Spring Boot" },
+          { "kind": "go", "path": "/project/go/create_project", "required": ["project_name", "project_exe", "port"], "note": "project_exe 是可执行文件，必须已存在" },
+          { "kind": "net", "path": "/project/net/create_project", "required": ["project_name", "project_path", "project_cmd", "port"], "note": "依赖 .NET" },
+          { "kind": "other", "path": "/project/other/create_project", "required": ["project_name", "project_exe", "project_cmd", "port"], "note": "project_exe 是项目目录" }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功返回 {\"siteStatus\": true, \"siteId\": 12, ...}",
+            "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } }
+          },
+          "404": { "description": "缺 action 字段，或参数缺失 / 内部异常被吞" }
+        }
+      }
+    },
+    "/system": {
+      "post": {
+        "tags": ["system"],
+        "summary": "系统状态 / 服务管理",
+        "description": "用 action 区分具体操作。查询类接口直接返回数据（没有 status/data 包装）。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": { "$ref": "#/components/schemas/PanelAuth" }
+            }
+          }
+        },
+        "x-actions": [
+          { "name": "GetSystemTotal", "summary": "内存 / CPU / 系统概况", "params": {}, "note": "返回 memTotal、memNewRealUsed、cpuNum、system、version、time 等" },
+          { "name": "GetDiskInfo", "summary": "磁盘分区与用量", "params": {} },
+          { "name": "GetCpuInfo", "summary": "CPU 使用率 / 核数", "params": {} },
+          { "name": "GetMemInfo", "summary": "内存详情", "params": {} },
+          { "name": "GetLoadAverage", "summary": "系统负载（1/5/15 分钟）", "params": {} },
+          { "name": "GetNetWork", "summary": "实时网卡流量", "params": {} },
+          { "name": "ServiceAdmin", "summary": "服务启停", "params": { "name": "服务名，如 nginx / mysqld / redis", "type": "start | stop | restart | reload" } },
+          { "name": "RestartServer", "summary": "重启面板", "params": {} },
+          { "name": "ReMemory", "summary": "释放内存", "params": {} },
+          { "name": "ReloadWeb", "summary": "重载 Web 服务", "params": {} },
+          { "name": "GetConcifInfo", "summary": "面板配置（Web 服务器 / 已装软件）", "params": {} }
+        ],
+        "responses": {
+          "200": {
+            "description": "查询类接口直接返回数据对象",
+            "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } }
+          }
+        }
+      }
+    },
+    "/site": {
+      "post": {
+        "tags": ["site"],
+        "summary": "网站管理（建站 / 域名 / SSL / 启停 / 目录 / 反代）",
+        "description": "网站的一切操作都走这个模块，用 action 区分。\n\n⚠️ **建站要回查**：`AddSite` 成功时也可能返回 nginx 404（面板吞掉了后续步骤的异常），所以创建后用 `/data getData table=sites` 确认站点是否真的出现。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "oneOf": [
+                  { "$ref": "#/components/schemas/AddSiteRequest" },
+                  { "$ref": "#/components/schemas/DeleteSiteRequest" },
+                  { "$ref": "#/components/schemas/SetSSLRequest" },
+                  { "$ref": "#/components/schemas/PanelAuth" }
+                ]
+              }
+            }
+          }
+        },
+        "x-actions": [
+          { "name": "AddSite", "summary": "创建网站", "params": { "webname": "JSON：{domain,domainlist,count}", "path": "根目录", "type_id": "分类 ID，默认 0", "version": "PHP 版本；纯静态 00", "port": "端口，默认 80", "type": "PHP 或留空", "ps": "备注", "ftp": "true/false", "sql": "true/false" } },
+          { "name": "DeleteSite", "summary": "删除网站", "params": { "id": "网站 ID", "webname": "网站域名", "database": "是否删库", "path": "是否删根目录" } },
+          { "name": "AddDomain", "summary": "给网站加域名", "params": { "webname": "网站名", "domain": "新域名", "port": "端口", "ps": "备注" } },
+          { "name": "DelDomain", "summary": "删除网站域名", "params": { "webname": "网站名", "domain": "域名", "port": "端口" } },
+          { "name": "GetSiteDomains", "summary": "网站的域名列表", "params": { "id": "网站 ID" } },
+          { "name": "SetSSL", "summary": "给网站部署 SSL", "params": { "siteName": "网站名", "key": "私钥 PEM", "csr": "证书 PEM" } },
+          { "name": "GetSSL", "summary": "读取网站 SSL 信息", "params": { "siteName": "网站名" } },
+          { "name": "GetPHPVersion", "summary": "可用的 PHP 版本 / 运行模式", "params": {}, "note": "返回数组：[{version,name,status}]，version=00 表示纯静态" },
+          { "name": "SetPHPVersion", "summary": "切换网站的 PHP 版本", "params": { "siteName": "网站名", "version": "目标版本，00=纯静态" } },
+          { "name": "SiteStart", "summary": "启用网站", "params": { "id": "网站 ID", "name": "网站名" } },
+          { "name": "SiteStop", "summary": "停用网站", "params": { "id": "网站 ID", "name": "网站名" } },
+          { "name": "SetPath", "summary": "修改网站根目录", "params": { "id": "网站 ID", "path": "新根目录" } },
+          { "name": "GetSiteLogs", "summary": "读取网站日志", "params": { "siteName": "网站名" } },
+          { "name": "GetRewriteList", "summary": "伪静态列表", "params": { "siteName": "网站名" } },
+          { "name": "SetRewriteLists", "summary": "设置伪静态", "params": { "siteName": "网站名", "rewrite": "JSON" } },
+          { "name": "GetProxyList", "summary": "反向代理列表", "params": { "siteName": "网站名" } },
+          { "name": "CreateProxy", "summary": "创建反向代理", "params": { "siteName": "网站名", "proxies": "JSON", "cache": "是否缓存" } },
+          { "name": "RemoveProxy", "summary": "删除反向代理", "params": { "siteName": "网站名" } },
+          { "name": "Get301Status", "summary": "查询 301 跳转", "params": { "siteName": "网站名" } },
+          { "name": "Set301Status", "summary": "设置 301 跳转", "params": { "siteName": "网站名", "srcDomain": "源域名", "toDomain": "目标域名" } },
+          { "name": "GetDirBinding", "summary": "子目录绑定列表", "params": { "siteName": "网站名" } },
+          { "name": "AddDirBinding", "summary": "绑定子目录", "params": { "siteName": "网站名", "dir": "目录", "domains": "域名" } },
+          { "name": "DelDirBinding", "summary": "删除子目录绑定", "params": { "siteName": "网站名", "dir": "目录" } },
+          { "name": "ToBackup", "summary": "备份网站", "params": { "id": "网站 ID", "type": "备份类型" } },
+          { "name": "DelBackup", "summary": "删除网站备份", "params": { "id": "网站 ID" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "操作类返回 StatusResponse，查询类返回对应数据",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StatusResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "方法不存在，或建站过程中内部抛异常被吞（AddSite 实测会这样，需回查 sites）"
+          }
+        }
+      }
+    },
+    "/data": {
+      "post": {
+        "tags": ["data"],
+        "summary": "通用数据查询（新版列表接口）",
+        "description": "新版面板把各模块的列表查询统一到这里。网站列表、数据库列表、FTP、计划任务、防火墙都用它。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": { "$ref": "#/components/schemas/GetDataRequest" }
+            }
+          }
+        },
+        "x-actions": [
+          { "name": "getData", "summary": "按表查列表", "params": { "table": "sites | databases | ftps | crontab | firewall | domain | logs", "p": "页码", "limit": "每页条数", "search": "关键字", "where": "附加条件", "order": "排序" } },
+          { "name": "getFind", "summary": "按 ID 查单条", "params": { "table": "表名", "id": "记录 ID" } },
+          { "name": "getKey", "summary": "按键取值", "params": { "table": "表名", "key": "键" } },
+          { "name": "setPs", "summary": "改备注", "params": { "table": "表名", "id": "记录 ID", "ps": "备注" } },
+          { "name": "setSort", "summary": "改排序", "params": { "table": "表名", "ids": "JSON 数组" } },
+          { "name": "get_site_num", "summary": "网站数量", "params": {} }
+        ],
+        "responses": {
+          "200": {
+            "description": "列表数据",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DataListResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/database": {
+      "post": {
+        "tags": ["database"],
+        "summary": "数据库管理",
+        "description": "面板界面的「数据库」列表走 `/database/<类型>/get_list`（参数是名为 `data` 的 JSON 字符串）；**MySQL 例外**，走 `/data getData table=databases`。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": { "$ref": "#/components/schemas/PanelAuth" }
+            }
+          }
+        },
+        "x-actions": [
+          { "name": "AddDatabase", "summary": "创建数据库", "params": { "name": "库名", "db_user": "用户名", "password": "密码", "codeing": "字符集，如 utf8mb4", "dataAccess": "访问权限", "ps": "备注" } },
+          { "name": "DeleteDatabase", "summary": "删除数据库", "params": { "id": "数据库 ID", "name": "库名" } },
+          { "name": "ResDatabasePassword", "summary": "重置数据库密码", "params": { "id": "ID", "name": "库名", "password": "新密码" } },
+          { "name": "GetBackup", "summary": "备份列表", "params": { "id": "数据库 ID", "page": "页码", "limit": "条数" } },
+          { "name": "ToBackup", "summary": "备份数据库", "params": { "id": "ID", "name": "库名" } },
+          { "name": "DelBackup", "summary": "删除备份", "params": { "id": "备份 ID" } },
+          { "name": "InputSql", "summary": "导入 SQL", "params": { "id": "数据库 ID", "file": "服务器上的文件路径" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "操作类返回 StatusResponse",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/StatusResponse" } }
+            }
+          }
+        }
+      }
+    },
+    "/files": {
+      "post": {
+        "tags": ["files"],
+        "summary": "文件管理",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": { "$ref": "#/components/schemas/PanelAuth" }
+            }
+          }
+        },
+        "x-actions": [
+          { "name": "GetDir", "summary": "列目录", "params": { "path": "目录", "p": "页码", "pSize": "每页", "search": "搜索" } },
+          { "name": "GetFileBody", "summary": "读文件内容", "params": { "path": "文件路径" } },
+          { "name": "SaveFileBody", "summary": "写文件内容", "params": { "path": "文件路径", "body": "内容", "encoding": "编码" } },
+          { "name": "CreateDir", "summary": "建目录", "params": { "path": "目录" } },
+          { "name": "CreateFile", "summary": "建文件", "params": { "path": "文件" } },
+          { "name": "DeleteFile", "summary": "删文件 / 目录", "params": { "path": "路径" } },
+          { "name": "Zip", "summary": "压缩", "params": { "sfile": "源", "dfile": "目标", "z_type": "zip | tar.gz" } },
+          { "name": "UnZip", "summary": "解压", "params": { "sfile": "压缩包", "dfile": "目标目录", "password": "密码" } },
+          { "name": "GetDirSize", "summary": "目录大小", "params": { "path": "目录" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "操作类返回 StatusResponse，查询类返回数据",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/StatusResponse" } }
+            }
+          }
+        }
+      }
+    },
+    "/crontab": {
+      "post": {
+        "tags": ["crontab"],
+        "summary": "计划任务",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": { "$ref": "#/components/schemas/PanelAuth" }
+            }
+          }
+        },
+        "x-actions": [
+          { "name": "GetCrontab", "summary": "任务列表", "params": {} },
+          { "name": "AddCrontab", "summary": "添加任务", "params": { "name": "任务名", "type": "minute | hour | day | week | month", "sType": "任务类型，如 toShell", "sBody": "脚本内容", "where1": "周期值" } },
+          { "name": "DelCrontab", "summary": "删除任务", "params": { "id": "任务 ID" } },
+          { "name": "ModifyCrontab", "summary": "修改任务", "params": { "id": "任务 ID" } },
+          { "name": "StartTask", "summary": "立即执行一次", "params": { "id": "任务 ID" } },
+          { "name": "GetLogs", "summary": "任务日志", "params": { "id": "任务 ID" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "操作类返回 StatusResponse",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/StatusResponse" } }
+            }
+          }
+        }
+      }
+    },
+    "/plugin": {
+      "post": {
+        "tags": ["plugin"],
+        "summary": "软件商店 / 插件",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": { "$ref": "#/components/schemas/PanelAuth" }
+            }
+          }
+        },
+        "x-actions": [
+          { "name": "get_soft_list", "summary": "软件商店列表", "params": { "type": "分类", "page": "页码", "limit": "条数", "query": "按名查", "row": "行数" }, "note": "返回 {list:{data:[{name,title,version,status}]}}" },
+          { "name": "getPluginList", "summary": "已装插件列表", "params": { "page": "页码", "limit": "条数" } },
+          { "name": "getPluginInfo", "summary": "插件详情", "params": { "name": "插件名" } },
+          { "name": "install_plugin", "summary": "安装插件", "params": { "name": "插件名", "version": "版本" } },
+          { "name": "uninstall_plugin", "summary": "卸载插件", "params": { "name": "插件名" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "查询类返回数据",
+            "content": {
+              "application/json": { "schema": { "type": "object", "additionalProperties": true } }
+            }
+          }
+        }
+      }
+    },
+    "/ajax": {
+      "post": {
+        "tags": ["ajax"],
+        "summary": "进程与日志",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": { "$ref": "#/components/schemas/PanelAuth" }
+            }
+          }
+        },
+        "x-actions": [
+          { "name": "GetProcessList", "summary": "服务器进程表", "params": {}, "note": "直接返回一个**数组**（不是 JSON 对象），用于判断服务是否真的在跑" },
+          { "name": "GetErrorLog", "summary": "错误日志", "params": {} },
+          { "name": "GetOpeLog", "summary": "操作日志", "params": {} }
+        ],
+        "responses": {
+          "200": {
+            "description": "GetProcessList 返回数组，其余返回数据对象",
+            "content": {
+              "application/json": { "schema": { "type": "array", "items": { "type": "object", "additionalProperties": true } } }
+            }
+          }
+        }
+      }
+    },
+    "/ssl": {
+      "post": {
+        "tags": ["ssl"],
+        "summary": "商业 SSL 证书",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": { "$ref": "#/components/schemas/PanelAuth" }
+            }
+          }
+        },
+        "x-actions": [
+          { "name": "GetCertList", "summary": "证书列表", "params": {} },
+          { "name": "SaveCert", "summary": "保存证书", "params": { "csr": "证书", "key": "私钥" } },
+          { "name": "GetCert", "summary": "读取证书", "params": { "id": "证书 ID" } },
+          { "name": "SetCertToSite", "summary": "部署到网站", "params": { "siteName": "网站名", "certId": "证书 ID" } },
+          { "name": "RemoveCert", "summary": "删除证书", "params": { "id": "证书 ID" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "操作类返回 StatusResponse",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/StatusResponse" } }
+            }
+          }
+        }
+      }
+    },
+    "/acme": {
+      "post": {
+        "tags": ["acme"],
+        "summary": "Let's Encrypt 证书",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": { "$ref": "#/components/schemas/PanelAuth" }
+            }
+          }
+        },
+        "x-actions": [
+          { "name": "create_order", "summary": "创建订单", "params": { "domains": "域名列表" } },
+          { "name": "apply_cert", "summary": "申请证书", "params": { "order_id": "订单 ID" } },
+          { "name": "renew_cert", "summary": "续期", "params": { "order_id": "订单 ID" } },
+          { "name": "get_order_list", "summary": "订单列表", "params": {} },
+          { "name": "delete_order", "summary": "删除订单", "params": { "order_id": "订单 ID" } },
+          { "name": "SetCertToSite", "summary": "部署到网站", "params": { "siteName": "网站名" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "操作类返回 StatusResponse",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/StatusResponse" } }
+            }
+          }
+        }
+      }
+    },
+    "/firewall": {
+      "post": {
+        "tags": ["firewall"],
+        "summary": "系统防火墙",
+        "description": "列表不用 `GetList`（类中无 return，实际不可用），请用 `/data getData table=firewall`。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": { "$ref": "#/components/schemas/PanelAuth" }
+            }
+          }
+        },
+        "x-actions": [
+          { "name": "AddAcceptPort", "summary": "放行端口", "params": { "port": "端口或范围", "ps": "备注", "protocol": "tcp | udp" } },
+          { "name": "DelAcceptPort", "summary": "取消放行", "params": { "port": "端口", "protocol": "协议" } },
+          { "name": "AddDropAddress", "summary": "拉黑 IP", "params": { "address": "IP", "ps": "备注" } },
+          { "name": "DelDropAddress", "summary": "解除拉黑", "params": { "address": "IP" } },
+          { "name": "SetFirewallStatus", "summary": "防火墙开关", "params": { "status": "true/false" } },
+          { "name": "GetSshInfo", "summary": "SSH / ping / 防火墙状态", "params": {} }
+        ],
+        "responses": {
+          "200": {
+            "description": "操作类返回 StatusResponse",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/StatusResponse" } }
+            }
+          }
+        }
+      }
+    },
+    "/config": {
+      "post": {
+        "tags": ["config"],
+        "summary": "面板设置",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": { "$ref": "#/components/schemas/PanelAuth" }
+            }
+          }
+        },
+        "x-actions": [
+          { "name": "get_config", "summary": "面板核心配置", "params": {} },
+          { "name": "get_users", "summary": "面板用户列表", "params": {} },
+          { "name": "create_user", "summary": "新建面板用户", "params": { "username": "用户名", "password": "密码" } },
+          { "name": "setPassword", "summary": "修改面板密码", "params": { "password": "旧密码", "new_password": "新密码" } },
+          { "name": "setPanel", "summary": "修改面板端口", "params": { "port": "新端口" } },
+          { "name": "get_token", "summary": "查看 API 配置", "params": {}, "note": "返回解密后的明文密钥" },
+          { "name": "set_token", "summary": "配置 API", "params": { "t_type": "1 重新生成 / 2 开关 / 3 IP 限制", "limit_addr": "IP 白名单，0.0.0.0 表示不限制" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "返回面板配置数据",
+            "content": {
+              "application/json": { "schema": { "type": "object", "additionalProperties": true } }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,6 +1,27 @@
 import SwiftUI
 import AppKit
 
+// MARK: - 弹性滚动区
+
+/// 高度完全由父容器决定的垂直滚动区。
+///
+/// 普通 `ScrollView` 塞进 `VStack` / `HStack` 里时会**按内容要高度**：列表越长，
+/// 整页的「最小尺寸」就越大。配合 `App.swift` 里的 `.windowResizability(.contentMinSize)`，
+/// macOS 会把窗口撑到屏幕外，顶部内容直接被顶出窗口上沿。
+/// 这里用 `GeometryReader` 把高度钉在「父容器给多少就是多少」，内容再多也只在框里自己滚。
+struct FlexibleScroll<Content: View>: View {
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        GeometryReader { geo in
+            ScrollView {
+                content()
+            }
+            .frame(height: geo.size.height)
+        }
+    }
+}
+
 // MARK: - 状态点
 
 struct StatusDot: View {
@@ -57,8 +78,28 @@ struct InfoRow: View {
 struct ReadonlyText: View {
     var text: String
     var minHeight: CGFloat = 120
+    /// 放进「高度有限、且不许被内容顶大」的容器时打开。
+    ///
+    /// 默认（false）时 ScrollView 的高度会被内容撑开：放在整页 ScrollView 里没问题，
+    /// 但放进固定高度的 `VStack` 时，一段长 diff / 长日志会让整页的**最小高度**跟着涨，
+    /// 窗口被撑到屏幕外、顶部内容被顶出去。
+    /// 打开后高度变成纯弹性（最小 `minHeight`、最大跟随父容器），内容再多也只在框里自己滚。
+    var flexible: Bool = false
 
     var body: some View {
+        if flexible {
+            // 用 GeometryReader 把高度钉在「父容器给多少就是多少」上，
+            // 这样这个视图的最小尺寸不再包含文本长度（实测：内容再长也稳定在 minHeight）。
+            GeometryReader { geo in
+                box.frame(height: max(minHeight, geo.size.height))
+            }
+            .frame(minHeight: minHeight)
+        } else {
+            box.frame(minHeight: minHeight)
+        }
+    }
+
+    private var box: some View {
         ScrollView {
             Text(verbatim: text.isEmpty ? "（空）" : text)
                 .font(.system(size: 12, design: .monospaced))
@@ -66,7 +107,6 @@ struct ReadonlyText: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(8)
         }
-        .frame(minHeight: minHeight)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .textBackgroundColor)))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.2)))
     }
@@ -359,6 +399,15 @@ struct UsageBar: View {
                 .frame(width: 170, alignment: .leading)
         }
     }
+}
+
+// MARK: - 时间文本
+
+/// 统一的时间戳格式化（几个页面都在用）。
+func timeText(_ date: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    return formatter.string(from: date)
 }
 
 // MARK: - 空状态

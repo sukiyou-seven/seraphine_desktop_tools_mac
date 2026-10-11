@@ -2,31 +2,41 @@ import SwiftUI
 
 struct CertificateView: View {
     @EnvironmentObject var model: AppModel
+    var embedded = false
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                ACMEStatusCard()
-
-                if model.acmeStatus.installed {
-                    ACMEIssueCard()
-                    if model.acmeMode == "manual" {
-                        ACMManualCard()
-                    }
-                    ACMEDeployCard()
-                    ACMEICloudCard()
-                    ACMECertificatesCard()
-                }
+        Group {
+            if embedded {
+                content
+            } else {
+                FlexibleScroll { content }
             }
-            .padding(.bottom, 8)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .padding(16)
-        .navigationTitle("证书")
         .onAppear {
             model.refreshACMEStatus()
             model.loadCertificates()
         }
+        // 从解析记录挑证书域名
+        .sheet(isPresented: $model.acmePickerVisible) {
+            ACMEDomainPicker()
+                .environmentObject(model)
+        }
+    }
+
+    private var content: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            ACMEStatusCard()
+
+            if model.acmeStatus.installed {
+                ACMEIssueCard()
+                if model.acmeMode == "manual" {
+                    ACMManualCard()
+                }
+                ACMECertificatesCard()
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 }
 
@@ -48,6 +58,9 @@ private struct ACMEStatusCard: View {
                 }
                 Spacer()
                 Button("刷新") { model.refreshACMEStatus() }
+                if model.acmeStatus.installed {
+                    Button("安装自动续期任务") { model.installACMECron() }
+                }
             }
 
             if model.acmeStatus.installed {
@@ -97,10 +110,16 @@ private struct ACMEIssueCard: View {
                     TextField("example.com 或 example.com, *.example.com", text: $model.acmeDomains)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(.callout, design: .monospaced))
-                    Text(verbatim: "多个用逗号分隔；泛域名写 *.example.com")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    Button("从解析记录选…") { model.acmeOpenDomainPicker() }
+                        .disabled(!model.settings.dns.isConfigured)
+                        .help(model.settings.dns.isConfigured
+                              ? "从阿里云解析记录里挑一个已经有解析的域名"
+                              : "先在「域名解析」页填好阿里云 AccessKey，才能从解析记录里选")
                 }
+                Text(verbatim: "多个用逗号分隔；泛域名写 *.example.com（解析记录里没有，只能手打）")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 100)
                 HStack(spacing: 10) {
                     Text("邮箱")
                         .font(.callout)
@@ -127,22 +146,25 @@ private struct ACMEIssueCard: View {
                 .labelsHidden()
 
                 if model.acmeMode == "aliyun" {
-                    Text(verbatim: "填阿里云 AccessKey 后，工具会自动在 _acme-challenge 下添加 TXT 记录、等验证通过、再删掉记录，全程无需人工。")
+                    Text(verbatim: "工具会自动在 _acme-challenge 下添加 TXT 记录、等验证通过、再删掉记录，全程无需人工。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+
+                    // 阿里云账号由页面顶部的「配置」统一管理，这里只显示当前用的是哪个
                     HStack(spacing: 10) {
-                        Text("AccessKey ID")
+                        Text("阿里云账号")
                             .font(.callout)
                             .frame(width: 120, alignment: .leading)
-                        TextField("LTAI...", text: $model.settings.acme.aliKey)
-                            .textFieldStyle(.roundedBorder)
+                        Text(verbatim: model.dnsCredentialSummary)
                             .font(.system(.callout, design: .monospaced))
+                            .foregroundStyle(model.settings.dns.hasCredentials ? Color.secondary : Color.orange)
+                        Spacer(minLength: 0)
                     }
-                    SettingSecureField(label: "AccessKey Secret", text: $model.settings.acme.aliSecret)
-                    Text(verbatim: "提示：凭据保存在工具的设置文件里（明文），请用只有 DNS 权限的 RAM 子账号。")
+                    Text(verbatim: "使用当前配置的阿里云账号申请和手动续期；换账号请在页面顶部切换配置。")
                         .font(.caption)
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
 
                     HStack {
                         Button("申请证书") { model.issueCertificate() }
@@ -166,6 +188,123 @@ private struct ACMEIssueCard: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - 从解析记录里挑证书域名
+
+/// 证书要签给「能解析到服务器」的域名，所以从阿里云解析记录里挑比手打可靠：
+/// 列出主域名下已有的记录，勾中的拼成完整域名（`@` 就是主域名本身）填进输入框。
+///
+/// 手打入口**必须保留** —— 泛域名 `*.example.com` 在解析记录里是没有的。
+private struct ACMEDomainPicker: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Text(verbatim: "从解析记录里选域名").font(.headline)
+                if model.busy != nil {
+                    ProgressView().controlSize(.small)
+                    Text(verbatim: model.busy ?? "").font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+            }
+
+            HStack(spacing: 8) {
+                Text(verbatim: "域名").font(.callout)
+                Picker("", selection: Binding(
+                    get: { model.acmePickerDomain ?? "" },
+                    set: { model.acmePickDomain($0) })) {
+                        ForEach(model.acmePickerDomains) { domain in
+                            Text(verbatim: domain.name).tag(domain.name)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 280)
+                Button("刷新") { model.acmeOpenDomainPicker() }
+                    .disabled(model.busy != nil)
+                Spacer(minLength: 0)
+            }
+
+            if !model.acmePickerError.isEmpty {
+                Text(verbatim: model.acmePickerError)
+                    .font(.caption).foregroundStyle(.orange)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    // 限宽：长报错不许把弹窗的最小宽度撑大
+                    .frame(maxWidth: 560, alignment: .leading)
+            }
+
+            FlexibleScroll {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(model.acmePickerRecords) { record in
+                        pickerRow(record)
+                    }
+                }
+            }
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .textBackgroundColor)))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.18)))
+
+            HStack(spacing: 8) {
+                Text(verbatim: pickedSummary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: 420, alignment: .leading)
+                Spacer(minLength: 0)
+                Button("取消") { model.acmeClosePicker() }
+                Button("添加选中的") { model.acmeConfirmPick() }
+                    .disabled(model.acmePickerSelected.isEmpty)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(16)
+        .frame(width: 660, height: 540)
+    }
+
+    private var pickedSummary: String {
+        let picked = model.acmePickerPicked
+        if picked.isEmpty {
+            return "勾选要签进证书的域名（@ 表示主域名本身）；已有的不会重复添加"
+        }
+        return "将添加：" + picked.joined(separator: "、")
+    }
+
+    private func pickerRow(_ record: DNSRecord) -> some View {
+        let checked = model.acmePickerSelected.contains(record.recordId)
+        return Button {
+            model.acmeTogglePick(record)
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: checked ? "checkmark.square.fill" : "square")
+                    .foregroundStyle(checked ? Color.accentColor : Color.secondary)
+                Text(verbatim: record.fqdn)
+                    .font(.system(size: 12, design: .monospaced))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(verbatim: record.type)
+                    .font(.caption2)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(RoundedRectangle(cornerRadius: 4).fill(Color.secondary.opacity(0.15)))
+                Text(verbatim: record.value)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: 240, alignment: .leading)
+                    .help(record.value)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(checked ? Color.accentColor.opacity(0.10) : Color.clear)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -210,92 +349,6 @@ private struct ACMManualCard: View {
                         .foregroundStyle(.secondary)
                 }
             }
-        }
-    }
-}
-
-// MARK: - 部署
-
-private struct ACMEDeployCard: View {
-    @EnvironmentObject var model: AppModel
-
-    var body: some View {
-        Card(title: "把证书复制到指定位置（可选）") {
-            Text(verbatim: "申请好的证书在 acme.sh 的目录里；要让 Nginx 等直接读，可以复制一份过去，并在续期后自动重载。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            HStack(spacing: 10) {
-                Text("域名").font(.callout).frame(width: 90, alignment: .leading)
-                TextField("example.com", text: $model.acmeDeployDomain)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 220)
-                Text("重载命令").font(.callout)
-                TextField("可选，例如 nginx -s reload", text: $model.settings.acme.reloadCmd)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 260)
-            }
-            SettingField(label: "key 目标路径", placeholder: "/etc/nginx/ssl/example.com.key",
-                         text: $model.acmeDeployKeyPath)
-            SettingField(label: "fullchain 目标路径", placeholder: "/etc/nginx/ssl/example.com.fullchain.pem",
-                         text: $model.acmeDeployFullchainPath)
-            HStack {
-                Button("复制证书") { model.deployCertificate() }
-                    .disabled(model.acmeDeployDomain.trimmingCharacters(in: .whitespaces).isEmpty
-                              || model.acmeDeployKeyPath.trimmingCharacters(in: .whitespaces).isEmpty
-                              || model.acmeDeployFullchainPath.trimmingCharacters(in: .whitespaces).isEmpty)
-                Button("安装自动续期任务") { model.installACMECron() }
-                Text(verbatim: "续期任务由 acme.sh 的 cron 负责，装一次即可。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-}
-
-// MARK: - iCloud 备份
-
-private struct ACMEICloudCard: View {
-    @EnvironmentObject var model: AppModel
-
-    var body: some View {
-        Card(title: "备份到 iCloud Drive") {
-            Text(verbatim: "把证书复制一份到 iCloud 云盘，多台设备都能取用。"
-                 + "这里用的是 acme.sh 的「证书安装」能力，所以它会在每次续期后自动更新 iCloud 里的副本 —— 备份一次就够了。")
-                .font(.callout)
-                .fixedSize(horizontal: false, vertical: true)
-
-            HStack(spacing: 10) {
-                Text("iCloud 子目录").font(.callout).frame(width: 130, alignment: .leading)
-                TextField("DBManager/certs", text: $model.settings.acme.icloudSubdir)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(.callout, design: .monospaced))
-                    .frame(maxWidth: 300)
-                Text(verbatim: "证书会放在「iCloud 云盘 / <子目录> / <域名> /」下")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            if let iCloud = ACMEService.iCloudDrivePath {
-                InfoRow(label: "iCloud Drive", value: iCloud)
-            } else {
-                Text(verbatim: "没有检测到 iCloud Drive：请在「系统设置 → Apple 账户 → iCloud」里打开「iCloud 云盘」。")
-                    .font(.callout)
-                    .foregroundStyle(.orange)
-            }
-
-            HStack {
-                Button("备份所有证书到 iCloud") { model.backupAllCertificatesToICloud() }
-                    .disabled(!model.acmeStatus.installed || model.acmeCertificates.isEmpty)
-                Text(verbatim: "每张证书目录里会有 privkey.pem（私钥）和 fullchain.pem（证书链）")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Text(verbatim: "⚠️ 私钥会随 iCloud 同步到你所有 Apple 设备。证书本身是公开信息，私钥才是要害 —— 不放心就别用这个功能。")
-                .font(.caption)
-                .foregroundStyle(.orange)
-                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }

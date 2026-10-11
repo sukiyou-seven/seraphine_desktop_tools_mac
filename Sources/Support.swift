@@ -71,6 +71,8 @@ enum Paths {
     static var logDir: URL { ensure(appSupport.appendingPathComponent("log", isDirectory: true)) }
     static var runDir: URL { ensure(appSupport.appendingPathComponent("run", isDirectory: true)) }
     static var settingsFile: URL { appSupport.appendingPathComponent("settings.json") }
+    /// 剪贴板历史的固化文件（只存文本，上限 2 MB，见 `ClipboardHistory`）。
+    static var clipboardFile: URL { appSupport.appendingPathComponent("clipboard.json") }
 
     @discardableResult
     static func ensure(_ url: URL) -> URL {
@@ -147,7 +149,7 @@ enum Shell {
     /// 把要写进日志的命令/输出里的敏感值遮掉。
     /// 覆盖三类：URL 里的 `user:pass@`、环境变量式赋值（`VPN_IPSEC_PSK=…`、`VPN_PASSWORD=…`、
     /// `DBM_SSH_PASSWORD=…`）、以及 JSON 里的 password 一类字段。
-    /// 装 VPN 时凭据是以 `env VAR='…'` 形式出现在命令行里的，所以这几条规则是必需的。
+    /// 保留旧版环境变量凭据的遮罩规则，避免历史命令中的敏感值泄漏。
     static func redactSecrets(_ text: String) -> String {
         var result = text
         let rules: [(pattern: String, template: String)] = [
@@ -485,4 +487,11 @@ enum Outcome<T> {
     case success(T)
     case failure(String)
 
+    /// 只映射成功值，失败原样透传（`Result` 那套 map 的等价物）。
+    func map<U>(_ transform: (T) -> U) -> Outcome<U> {
+        switch self {
+        case .success(let value): return .success(transform(value))
+        case .failure(let message): return .failure(message)
+        }
+    }
 }

@@ -318,7 +318,7 @@ final class MySQLService: @unchecked Sendable {
         if FileTools.exists(path) { return (path, false) }
         Paths.ensureDirectory(forFile: path)
         let text = """
-        # 由 DBManager 生成的最小可用配置
+        # 由 Seraphim 生成的最小可用配置
         [mysqld]
         port = \(port)
         bind-address = \(host)
@@ -339,7 +339,7 @@ final class MySQLService: @unchecked Sendable {
 
     func configText() -> String {
         let (path, generated) = ensureConf()
-        return "# 文件：\(path)\(generated ? "（由 DBManager 生成）" : "")\n" + FileTools.read(path)
+        return "# 文件：\(path)\(generated ? "（由 Seraphim 生成）" : "")\n" + FileTools.read(path)
     }
 
     func confParams() -> [(spec: ConfStore.KeySpec, value: String)] {

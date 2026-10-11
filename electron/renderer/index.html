@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Seraphim</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="brand.css">
+  <link rel="stylesheet" href="picker.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand"><img class="brand-mark" src="../assets/icon.png" alt=""><div><strong>Seraphim</strong><small>服务器管理</small></div></div>
+      <nav id="navigation"></nav>
+      <div class="sidebar-footer">Electron · <span id="platform"></span></div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar">
+        <div class="server-switch"><span class="eyebrow">当前连接</span><select id="connection-select" aria-label="服务器连接"></select></div>
+        <div class="top-actions"><button id="connection-edit" class="secondary">连接设置</button><button id="connection-add" class="secondary">添加服务器</button><button id="refresh" class="secondary">刷新</button></div>
+      </header>
+      <main>
+        <div class="page-heading"><div><span class="eyebrow" id="section-group"></span><h1 id="section-title"></h1><p id="section-subtitle"></p></div><div id="page-actions"></div></div>
+        <div id="notice" role="status"></div>
+        <div id="content"></div>
+      </main>
+    </div>
+  </div>
+  <dialog id="modal"><form id="modal-form" method="dialog"><div id="modal-content"></div><div class="dialog-actions"><button type="button" id="modal-cancel" class="secondary">取消</button><button type="submit" id="modal-submit">保存</button></div></form></dialog>
+  <dialog id="path-modal"><div id="path-content"></div></dialog>
+  <script src="app.js"></script>
+</body>
+</html>

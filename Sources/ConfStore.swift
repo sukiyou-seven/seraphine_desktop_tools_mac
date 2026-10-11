@@ -95,7 +95,7 @@ enum ConfStore {
     static func generateMongodConf(dbPath: String, logPath: String, port: Int,
                                    bindIp: String, auth: Bool) -> String {
         """
-        # 由 DBManager 生成的最小可用配置
+        # 由 Seraphim 生成的最小可用配置
         storage:
           dbPath: \(dbPath)
         systemLog:
@@ -198,7 +198,7 @@ enum ConfStore {
     static func generateRedisConf(port: Int, bind: String, dir: String, logFile: String,
                                   pidFile: String, password: String) -> String {
         var lines = [
-            "# 由 DBManager 生成的最小可用配置",
+            "# 由 Seraphim 生成的最小可用配置",
             "bind \(bind)",
             "port \(port)",
             "daemonize yes",

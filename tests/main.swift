@@ -22,6 +22,256 @@ func check(_ name: String, _ condition: Bool, _ detail: String = "") {
 let workRoot = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : NSTemporaryDirectory() + "dbm-selftest"
 try? FileManager.default.createDirectory(atPath: workRoot, withIntermediateDirectories: true)
 
+print("== 家目录开发日志：严格识别与变更保护 ==")
+let cleanupRoot = URL(fileURLWithPath: workRoot + "/home-log-fixtures", isDirectory: true)
+try? FileManager.default.createDirectory(at: cleanupRoot, withIntermediateDirectories: true)
+let oldDate = Date().addingTimeInterval(-48 * 3600)
+func fixtureLog(_ name: String, _ content: String) -> URL {
+    let url = cleanupRoot.appendingPathComponent(name)
+    try? Data(content.utf8).write(to: url)
+    try? FileManager.default.setAttributes([.modificationDate: oldDate], ofItemAtPath: url.path)
+    return url
+}
+let buildLog = fixtureLog("_sample_build.log", "Command line invocation:\n    /Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild -project LoveApp.xcodeproj -scheme LoveApp build\n")
+let installLog = fixtureLog("_sample_install.log", "ERROR: Failed to install (com.apple.dt.CoreDeviceError error 3002)\n")
+let unrelatedLog = fixtureLog("database.log", "database startup complete\n")
+let freshLog = fixtureLog("_fresh_build.log", "Command line invocation:\n    /Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild -project Demo.xcodeproj -scheme Demo build\n")
+try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: freshLog.path)
+let linkedLog = cleanupRoot.appendingPathComponent("_linked_build.log")
+try? FileManager.default.createSymbolicLink(at: linkedLog, withDestinationURL: buildLog)
+let cleanupCandidates = HomeLogCleanup.scan(home: cleanupRoot)
+check("只识别旧 Xcode 构建与设备日志", Set(cleanupCandidates.map { $0.url.lastPathComponent }) == ["_sample_build.log", "_sample_install.log"])
+check("忽略普通日志、新日志和符号链接", cleanupCandidates.count == 2 && FileManager.default.fileExists(atPath: unrelatedLog.path))
+try? Data("changed\n".utf8).write(to: installLog)
+let changedCleanup = HomeLogCleanup.moveToTrash(cleanupCandidates.filter { $0.url == installLog }, home: cleanupRoot)
+check("清理前文件改变则跳过", changedCleanup.moved == 0 && changedCleanup.skipped == 1 && FileManager.default.fileExists(atPath: installLog.path))
+
+print("== 项目管理：多子工程发现与解释器选择 ==")
+let projectsRoot = workRoot + "/project-fixtures"
+let frontend = projectsRoot + "/apps/frontend"
+let backend = projectsRoot + "/services/backend"
+let ignoredNode = frontend + "/node_modules/hidden"
+let ignoredVenv = backend + "/.venv/bin"
+for directory in [frontend, backend, ignoredNode, ignoredVenv] {
+    try? FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+}
+try? Data(#"{"scripts":{"dev":"vite","build":"vite build"},"private":true}"#.utf8)
+    .write(to: URL(fileURLWithPath: frontend + "/package.json"))
+try? Data(#"{"scripts":{"secret":"echo hidden"}}"#.utf8)
+    .write(to: URL(fileURLWithPath: ignoredNode + "/package.json"))
+try? Data("print('hello')".utf8).write(to: URL(fileURLWithPath: backend + "/main.py"))
+let fakePython = ignoredVenv + "/python"
+try? Data("#!/bin/sh\npwd\nprintf '%s\\n' \"$1\"\n".utf8).write(to: URL(fileURLWithPath: fakePython))
+try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakePython)
+let secondRoot = workRoot + "/second-project"
+try? FileManager.default.createDirectory(atPath: secondRoot, withIntermediateDirectories: true)
+try? Data("print('second')".utf8).write(to: URL(fileURLWithPath: secondRoot + "/main.py"))
+try? Data(#"{"appid":"wx-test"}"#.utf8).write(to: URL(fileURLWithPath: secondRoot + "/project.config.json"))
+let projectScan = ProjectDiscovery.scan(root: projectsRoot)
+check("扫描出两个子工程", projectScan.components.count == 2)
+check("Node 脚本从 package.json 获取并排序",
+      projectScan.components.first(where: { $0.directory == frontend })?.scripts == ["build", "dev"])
+check("Python 工程单独列出",
+      projectScan.components.first(where: { $0.directory == backend })?.hasPython == true)
+check("忽略 node_modules 中的 package.json",
+      !projectScan.components.contains(where: { $0.directory == ignoredNode }))
+check("使用对应子工程的 venv",
+      ProjectDiscovery.preferredPython(for: backend, root: projectsRoot,
+                                       interpreters: projectScan.interpreters) == fakePython)
+check("识别微信小程序工程", ProjectDiscovery.scan(root: secondRoot).components.first?.hasWeChat == true)
+let miniOnly = workRoot + "/mini-only"
+try? FileManager.default.createDirectory(atPath: miniOnly, withIntermediateDirectories: true)
+try? Data("{}".utf8).write(to: URL(fileURLWithPath: miniOnly + "/project.config.json"))
+check("只有小程序配置也能作为子工程列出",
+      ProjectDiscovery.scan(root: miniOnly).components.first?.hasWeChat == true)
+let uniApp = workRoot + "/uniapp"
+try? FileManager.default.createDirectory(atPath: uniApp, withIntermediateDirectories: true)
+try? Data(#"{"scripts":{"dev:mp-weixin":"uni -p mp-weixin"}}"#.utf8)
+    .write(to: URL(fileURLWithPath: uniApp + "/package.json"))
+check("uni-app 项目在构建前也显示微信入口",
+      ProjectDiscovery.scan(root: uniApp).components.first?.hasWeChat == true)
+let generatedMini = uniApp + "/dist/dev/mp-weixin"
+try? FileManager.default.createDirectory(atPath: generatedMini, withIntermediateDirectories: true)
+try? Data("{}".utf8).write(to: URL(fileURLWithPath: generatedMini + "/project.config.json"))
+check("微信入口指向 uni-app 生成目录",
+      ProjectDiscovery.weChatProjectDirectory(in: uniApp) == generatedMini)
+check("从 npm 输出识别本地网页地址",
+      ProjectRunner.localURL(in: "Local: http://localhost:5173/\nNetwork: http://192.168.1.2:5173")?.absoluteString
+      == "http://localhost:5173/")
+check("网页地址只接受 HTTP(S)", ProjectRunner.validWebsiteURL("javascript:alert(1)") == nil)
+if let pythonComponent = projectScan.components.first(where: { $0.directory == backend }) {
+    let runner = MainActor.assumeIsolated {
+        ProjectRunner(catalogURL: URL(fileURLWithPath: workRoot + "/projects.json"))
+    }
+    MainActor.assumeIsolated {
+        runner.add(projectsRoot)
+        runner.add(secondRoot)
+        runner.setPythonOverride(fakePython, for: backend)
+    }
+    let scanDeadline = Date().addingTimeInterval(3)
+    while Date() < scanDeadline {
+        let scanned = MainActor.assumeIsolated {
+            runner.scans[projectsRoot] != nil && runner.scans[secondRoot] != nil
+        }
+        if scanned { break }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+    }
+    check("多个工程同时保留在列表",
+          MainActor.assumeIsolated { runner.roots.count == 2 })
+    check("两个工程的扫描结果同时可见",
+          MainActor.assumeIsolated {
+              runner.scans[projectsRoot]?.components.count == 2
+              && runner.scans[secondRoot]?.components.count == 1
+          })
+    MainActor.assumeIsolated { runner.startPython(pythonComponent, in: projectsRoot) }
+    let runDeadline = Date().addingTimeInterval(3)
+    while Date() < runDeadline {
+        let finished = MainActor.assumeIsolated {
+            runner.runs[runner.pythonID(pythonComponent)]?.running == false
+        }
+        if finished { break }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+    }
+    let state = MainActor.assumeIsolated { runner.runs[runner.pythonID(pythonComponent)] }
+    let launchError = MainActor.assumeIsolated { runner.error }
+    check("Python 从对应子工程目录启动", state?.output.contains(backend) == true,
+          launchError + " / " + (state?.output ?? "无运行状态"))
+    check("Python 收到默认 main.py 入口", state?.output.contains(backend + "/main.py") == true,
+          launchError + " / " + (state?.output ?? "无运行状态"))
+    check("短任务结束后状态更新", state?.running == false && state?.exitCode == 0,
+          launchError + " / " + (state?.message ?? "无运行状态"))
+    let reloaded = MainActor.assumeIsolated {
+        ProjectRunner(catalogURL: URL(fileURLWithPath: workRoot + "/projects.json"))
+    }
+    check("重启后仍保留全部工程", MainActor.assumeIsolated { reloaded.roots.count == 2 })
+    check("手动添加的 Python 解释器会保存", MainActor.assumeIsolated {
+        reloaded.pythonOverrides[backend] == fakePython
+    })
+    MainActor.assumeIsolated { reloaded.toggleCollapsed(projectsRoot) }
+    MainActor.assumeIsolated { reloaded.setWebURL("http://localhost:3000", for: frontend) }
+    let withURL = MainActor.assumeIsolated {
+        ProjectRunner(catalogURL: URL(fileURLWithPath: workRoot + "/projects.json"))
+    }
+    check("网页地址按子工程保存", MainActor.assumeIsolated {
+        withURL.webURLs[frontend] == "http://localhost:3000" && withURL.roots.count == 2
+    })
+    check("工程折叠状态会保存", MainActor.assumeIsolated {
+        withURL.collapsedRoots.contains(projectsRoot)
+    })
+    let legacyPath = URL(fileURLWithPath: workRoot + "/legacy-projects.json")
+    try? JSONEncoder().encode([projectsRoot]).write(to: legacyPath)
+    let legacy = MainActor.assumeIsolated { ProjectRunner(catalogURL: legacyPath) }
+    check("兼容旧版工程目录列表", MainActor.assumeIsolated { legacy.roots == [projectsRoot] })
+}
+
+print("== Python 环境：发现、安装与删除 ==")
+let environmentRoot = workRoot + "/python-environment-fixtures"
+let virtualRoot = environmentRoot + "/.venv"
+let virtualBin = virtualRoot + "/bin"
+try? FileManager.default.createDirectory(atPath: virtualBin, withIntermediateDirectories: true)
+try? Data("home = /usr/bin\n".utf8).write(to: URL(fileURLWithPath: virtualRoot + "/pyvenv.cfg"))
+let virtualPython = virtualBin + "/python"
+let fakeEnvironmentPython = """
+#!/bin/sh
+if [ "$2" = "pip" ] && [ "$3" = "list" ]; then
+  printf '[{"name":"pip","version":"1.0"}]\\n'
+else
+  printf '%s\\n' "$*"
+fi
+"""
+try? Data(fakeEnvironmentPython.utf8).write(to: URL(fileURLWithPath: virtualPython))
+try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: virtualPython)
+check("能从环境目录找到解释器", PythonEnvironmentDiscovery.pythonPath(at: virtualRoot) == virtualPython)
+check("虚拟环境需有 pyvenv.cfg 才可删除",
+      PythonEnvironmentDiscovery.deletableDirectory(for: virtualPython) == virtualRoot
+      && PythonEnvironmentDiscovery.deletableDirectory(for: "/usr/bin/python3") == nil)
+check("工程目录中的环境被发现",
+      PythonEnvironmentDiscovery.discover(projectRoots: [environmentRoot], addedPaths: [], createdPaths: [])
+          .contains(where: { $0.pythonPath == virtualPython }))
+check("pip 源地址验证", PythonEnvironmentManager.validIndexURL("https://example.test/simple")
+      && !PythonEnvironmentManager.validIndexURL("javascript:alert(1)"))
+let environmentCatalog = URL(fileURLWithPath: workRoot + "/python-environments.json")
+let environmentManager = MainActor.assumeIsolated { PythonEnvironmentManager(catalogURL: environmentCatalog) }
+MainActor.assumeIsolated {
+    environmentManager.add(virtualRoot, projectRoots: [])
+    environmentManager.setIndexURL("https://example.test/simple")
+}
+let environmentDeadline = Date().addingTimeInterval(5)
+while Date() < environmentDeadline {
+    if MainActor.assumeIsolated({ !environmentManager.environments.isEmpty }) { break }
+    RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+}
+check("手动添加的环境显示在列表", MainActor.assumeIsolated {
+    environmentManager.environments.contains(where: { $0.pythonPath == virtualPython })
+})
+MainActor.assumeIsolated {
+    environmentManager.packageInput = "requests==2.31.0"
+    environmentManager.installPackages()
+}
+let installDeadline = Date().addingTimeInterval(5)
+while Date() < installDeadline {
+    if MainActor.assumeIsolated({ environmentManager.busy == nil }) { break }
+    RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+}
+check("pip install 使用所选源和包版本", MainActor.assumeIsolated {
+    environmentManager.output.contains("--index-url https://example.test/simple requests==2.31.0")
+})
+let savedEnvironmentManager = MainActor.assumeIsolated {
+    PythonEnvironmentManager(catalogURL: environmentCatalog)
+}
+check("环境与 pip 源保存后可恢复", MainActor.assumeIsolated {
+    savedEnvironmentManager.selectedPath == virtualPython
+        && savedEnvironmentManager.indexURL == "https://example.test/simple"
+})
+let deletingEnvironment = MainActor.assumeIsolated {
+    environmentManager.environments.first(where: { $0.pythonPath == virtualPython })
+}
+if let deletingEnvironment {
+    MainActor.assumeIsolated {
+        environmentManager.removeFromList(deletingEnvironment, projectRoots: [environmentRoot])
+    }
+    let hiddenDeadline = Date().addingTimeInterval(5)
+    while Date() < hiddenDeadline {
+        if MainActor.assumeIsolated({ !environmentManager.scanning }) { break }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+    }
+    check("从列表移除后不会被工程扫描重新加回", MainActor.assumeIsolated {
+        !environmentManager.environments.contains(where: { $0.pythonPath == virtualPython })
+    })
+    MainActor.assumeIsolated { environmentManager.add(virtualRoot, projectRoots: []) }
+    MainActor.assumeIsolated { environmentManager.delete(deletingEnvironment, projectRoots: []) }
+    let deleteDeadline = Date().addingTimeInterval(5)
+    while Date() < deleteDeadline {
+        if MainActor.assumeIsolated({ environmentManager.busy == nil }) { break }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+    }
+    check("删除虚拟环境会移除目录", !FileManager.default.fileExists(atPath: virtualRoot))
+}
+let fakeBasePython = environmentRoot + "/base-python"
+let fakeVenvCreator = """
+#!/bin/sh
+if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
+  /bin/mkdir -p "$3/bin"
+  /bin/cp "$0" "$3/bin/python"
+  printf 'home = /usr/bin\\n' > "$3/pyvenv.cfg"
+fi
+"""
+try? Data(fakeVenvCreator.utf8).write(to: URL(fileURLWithPath: fakeBasePython))
+try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeBasePython)
+MainActor.assumeIsolated {
+    environmentManager.create(parent: environmentRoot, name: "new-venv",
+                              basePython: fakeBasePython, projectRoots: [])
+}
+let createDeadline = Date().addingTimeInterval(5)
+while Date() < createDeadline {
+    if MainActor.assumeIsolated({ environmentManager.busy == nil }) { break }
+    RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+}
+let createdEnvironment = environmentRoot + "/new-venv"
+check("新建环境调用 Python -m venv 并记录解释器",
+      FileManager.default.fileExists(atPath: createdEnvironment + "/pyvenv.cfg")
+      && MainActor.assumeIsolated({ environmentManager.selectedPath == createdEnvironment + "/bin/python" }))
+
 // MARK: ConfStore —— mongod.conf
 
 print("== ConfStore: mongod.conf ==")
@@ -363,324 +613,8 @@ check("证书路径拼接正确",
       parsedCerts.first?.fullchainPath ?? "")
 check("空输出不崩", ACMEService.parseList("", home: "/tmp").isEmpty)
 
-print("== 证书：iCloud 备份路径 ==")
-check("iCloud 证书目录拼接",
-      ACMEService.iCloudCertDirectory(
-        base: "/Users/x/Library/Mobile Documents/com~apple~CloudDocs",
-        subdir: "DBManager/certs", domain: "example.com")
-      == "/Users/x/Library/Mobile Documents/com~apple~CloudDocs/DBManager/certs/example.com",
-      ACMEService.iCloudCertDirectory(base: "/b", subdir: "DBManager/certs", domain: "example.com"))
-check("子目录留空时回退到默认值",
-      ACMEService.iCloudCertDirectory(base: "/base", subdir: "   ", domain: "a.com")
-      == "/base/DBManager/certs/a.com")
-check("域名两侧空格被去掉",
-      ACMEService.iCloudCertDirectory(base: "/base", subdir: "d", domain: " a.com ")
-      == "/base/d/a.com")
 
-print("== 宝塔面板：签名算法与响应解析 ==")
-check("MD5 实现正确（已知向量）",
-      BTPanelService.md5("hello") == "5d41402abc4b2a76b9719d911017c592",
-      BTPanelService.md5("hello"))
-check("MD5 空串", BTPanelService.md5("") == "d41d8cd98f00b204e9800998ecf8427e")
-let btToken = BTPanelService.requestToken(apiKey: "test-key", requestTime: "1700000000")
-check("签名 = md5(request_time + md5(api_sk))",
-      btToken == BTPanelService.md5("1700000000" + BTPanelService.md5("test-key")), btToken)
-check("签名是 32 位小写十六进制",
-      btToken.count == 32 && btToken == btToken.lowercased(), btToken)
-check("备选签名与标准签名不同",
-      btToken != BTPanelService.requestTokenVariant(apiKey: "test-key", requestTime: "1700000000"))
-check("成功响应：status=true", BTPanelService.isSuccess(["status": true]))
-check("成功响应：status=1（Int）", BTPanelService.isSuccess(["status": 1]))
-check("失败响应：status=false", !BTPanelService.isSuccess(["status": false]))
-check("失败响应：有 error 字段", !BTPanelService.isSuccess(["error": "签名错误"]))
-check("成功响应：有 data", BTPanelService.isSuccess(["data": []]))
-check("提示文案优先取 msg",
-      BTPanelService.describe(["msg": "指定网站不存在", "status": false]) == "指定网站不存在",
-      BTPanelService.describe(["msg": "指定网站不存在", "status": false]))
-check("纯文本 true 视为成功", BTPanelService.interpret("true").ok)
-check("纯文本错误视为失败", !BTPanelService.interpret("签名错误").ok)
-check("空响应给出可读提示",
-      BTPanelService.interpret("").message.contains("没有返回内容"),
-      BTPanelService.interpret("").message)
 
-let btJSON = #"{"status":true,"data":[{"id":"1","name":"a.com","path":"/www/wwwroot/a.com","domain":"a.com www.a.com","status":"1"},{"id":"2","name":"b.com","path":"/www/wwwroot/b.com","domain":"b.com","status":"0"}]}"#
-let btParsed = BTPanelService.interpret(btJSON)
-check("网站列表 JSON 解析成功", btParsed.ok && btParsed.dataRows.count == 2,
-      "rows=\(btParsed.dataRows.count)")
-let btSites = BTPanelService.parseSites(btParsed)
-check("网站解析出 2 条", btSites.count == 2, "实际 \(btSites.count)")
-check("网站名与主域名正确",
-      btSites.first?.name == "a.com" && btSites.first?.primaryDomain == "a.com",
-      btSites.first?.primaryDomain ?? "nil")
-check("多个域名时取第一个", btSites.first?.domains == "a.com www.a.com")
-check("运行状态识别", btSites.first?.running == true && btSites.last?.running == false)
-check("状态文案", btSites.last?.statusLabel == "已停止", btSites.last?.statusLabel ?? "")
-check("数据库列表解析", BTPanelService.parseDatabases(
-        BTPanelService.interpret(#"{"status":true,"data":[{"id":"1","name":"db1","type":"MySQL","size":"2 MB"}]}"#),
-        type: BTDatabaseType.find("mysql")
-      ).first?.name == "db1")
-
-print("== 宝塔面板：IP 白名单提示 ==")
-let ipBlockedRaw = #"{"status": false, "msg": "IP校验失败,您的访问IP为[203.0.113.45]"}"#
-let ipBlockedResult = BTPanelService.interpret(ipBlockedRaw)
-check("IP 校验失败被判为失败", !ipBlockedResult.ok)
-check("提取出被拦截的出口 IP",
-      BTPanelService.blockedIP(from: ipBlockedRaw) == "203.0.113.45",
-      BTPanelService.blockedIP(from: ipBlockedRaw) ?? "nil")
-check("识别出这是 IP 白名单问题", BTPanelService.isIPBlocked(ipBlockedRaw))
-check("提示里带了处理办法", ipBlockedResult.message.contains("IP 白名单"), ipBlockedResult.message)
-check("提示里带了那个 IP", ipBlockedResult.message.contains("203.0.113.45"))
-check("签名错误不会被误判成 IP 问题",
-      !BTPanelService.isIPBlocked(#"{"status":false,"msg":"签名错误"}"#))
-check("没有 IP 时解析返回 nil", BTPanelService.blockedIP(from: "{}") == nil)
-check("带空格的写法也能解析",
-      BTPanelService.blockedIP(from: #"{"msg":"IP校验失败,您的访问 IP 为[1.2.3.4]"}"#) == "1.2.3.4",
-      BTPanelService.blockedIP(from: #"{"msg":"IP校验失败,您的访问 IP 为[1.2.3.4]"}"#) ?? "nil")
-
-print("== 宝塔面板：真实响应回归 ==")
-// 真实面板 /system?action=GetSystemTotal 的返回：既没有 status 也没有 data
-let realSystemTotal = #"{"memTotal": 1870, "memFree": 854, "memBuffers": 15, "memCached": 287, "memAvailable": 1007, "memShared": 1, "memRealUsed": 714, "memNewTotalList": ["1.8", "GB"], "memNewRealUsedList": ["714.0", "MB"], "memNewRealUsed": "714.0MB", "memNewTotal": "1.8GB", "cpuNum": 2, "cpuRealUsed": 2.0, "time": "21天", "system": "Alibaba Cloud  3 (OpenAnolis Edition) x86_64(Py3.13.14)", "isuser": 0, "isport": true, "version": "13.1.0"}"#
-let realResult = BTPanelService.interpret(realSystemTotal)
-check("无 status/data 的数据响应应判为成功（真实响应回归）", realResult.ok, realResult.message)
-check("能读出面板版本", (realResult.json?["version"] as? String) == "13.1.0")
-check("能读出 CPU 核心数", (realResult.json?["cpuNum"] as? Int) == 2)
-check("能读出可读内存串", (realResult.json?["memNewRealUsed"] as? String) == "714.0MB")
-check("只有 msg 的响应仍判为失败",
-      !BTPanelService.interpret(#"{"msg":"指定网站不存在"}"#).ok)
-check("status=false 优先于其它字段",
-      !BTPanelService.interpret(#"{"status":false,"version":"1.0"}"#).ok)
-check("空对象判为失败", !BTPanelService.interpret("{}").ok)
-
-print("== 宝塔面板：网站类型 / SSL 状态 ==")
-let sitesJSON = #"{"status":true,"data":[{"id":"1","name":"a.com","path":"/www/wwwroot/a","domain":"a.com","status":"1","project_type":"PHP"},{"id":"2","name":"b.com","path":"/www/wwwroot/b","domain":"b.com","status":"0","project_type":"Python","ssl":"1"},{"id":"3","name":"c.com","path":"/www/wwwroot/c","domain":"c.com","status":"1","project_type":"Proxy","ssl":"0"},{"id":"4","name":"d.com","path":"/www/wwwroot/d","domain":"d.com","status":"1","type_id":"1"},{"id":"5","name":"e.com","path":"/www/wwwroot/e","domain":"e.com","status":"1"}]}"#
-let parsedSites = BTPanelService.parseSites(BTPanelService.interpret(sitesJSON))
-check("解析出 5 个网站", parsedSites.count == 5, "实际 \(parsedSites.count)")
-check("PHP 类型识别", parsedSites[0].typeLabel == "PHP", parsedSites[0].typeLabel)
-check("Python 类型识别", parsedSites[1].typeLabel == "Python", parsedSites[1].typeLabel)
-check("反向代理识别", parsedSites[2].typeLabel == "反向代理", parsedSites[2].typeLabel)
-check("老版本 type_id 回退为静态 HTML", parsedSites[3].typeLabel == "静态 HTML", parsedSites[3].typeLabel)
-check("没有类型字段时显示 —", parsedSites[4].typeLabel == "—", parsedSites[4].typeLabel)
-check("SSL 开启识别", parsedSites[1].sslState == "已开启", parsedSites[1].sslState)
-check("SSL 未开启识别", parsedSites[2].sslState == "未开启", parsedSites[2].sslState)
-check("SSL 字段缺失显示未知", parsedSites[0].sslState == "未知", parsedSites[0].sslState)
-check("列表文案：已部署", parsedSites[1].sslLabel == "已部署", parsedSites[1].sslLabel)
-check("列表文案：未部署", parsedSites[2].sslLabel == "未部署", parsedSites[2].sslLabel)
-check("读不到时列表显示 —", parsedSites[0].sslLabel == "—", parsedSites[0].sslLabel)
-check("其它字段不受影响", parsedSites[2].running && parsedSites[2].name == "c.com")
-check("ssl_enabled 这类别名也能识别",
-      BTPanelService.sslValue(in: ["ssl_enabled": "true"]) == "true")
-
-print("== 宝塔面板：13.x 真实字段（ssl / project_type）==")
-let realFieldsJSON = BTPanelService.interpret("""
-{"data": [
-  {"id": "1", "name": "no-ssl", "ssl": "-1", "project_type": "html", "status": "1"},
-  {"id": "2", "name": "has-ssl", "project_type": "Python", "status": "1",
-   "ssl": "{'issuer': 'YE1', 'issuer_O': \\"Let's Encrypt\\", 'notAfter': '2026-11-30', 'endtime': 67}"},
-  {"id": "3", "name": "no-field", "project_type": "proxy", "status": "1"}
-]}
-""")
-let realSites = BTPanelService.parseSites(realFieldsJSON)
-check("网站数解析正确", realSites.count == 3, "\(realSites.count)")
-check("ssl=-1 → 未部署", realSites[0].sslLabel == "未部署", realSites[0].sslLabel)
-check("ssl 是证书字典 → 已部署", realSites[1].sslLabel == "已部署", realSites[1].sslLabel)
-check("从 ssl 字段取出到期日", realSites[1].sslNotAfter == "2026-11-30", realSites[1].sslNotAfter)
-check("ssl 字段缺失 → —", realSites[2].sslLabel == "—", realSites[2].sslLabel)
-check("project_type=html → 静态 HTML", realSites[0].typeLabel == "静态 HTML", realSites[0].typeLabel)
-check("project_type=Python → 项目类", realSites[1].isProjectSite)
-// 实测：Python 项目有专用接口 /project/python/StopProject，能真正停掉 uwsgi 进程
-// （F12 抓包 + API 验证：uwsgi 进程数 12 → 6）。
-check("Python 项目被单独认出来（走专用启停接口）", realSites[1].isPythonProject)
-check("PHP / 静态站不算 Python 项目", !realSites[0].isPythonProject)
-check("proxy 站不算 Python 项目", !realSites[2].isPythonProject)
-check("Python 的进程名候选含 uwsgi", realSites[1].processNameHints.contains("uwsgi"),
-      realSites[1].processNameHints.joined(separator: ","))
-check("PHP 站没有应用进程候选", realSites[0].processNameHints.isEmpty)
-check("proxy 站没有应用进程候选", realSites[2].processNameHints.isEmpty)
-check("Python 的启停说明点明会连进程一起停",
-      realSites[1].restartNote.contains("uwsgi 应用进程一起停掉"), realSites[1].restartNote)
-check("非 Python 的项目类站点不夸大（说明进程可能要另外停）",
-      !realSites[1].restartNote.contains("需要到宝塔面板"))
-
-print("== 宝塔面板：用项目真实状态校正网站列表 ==")
-// 实测：面板的 Python 项目启停只调 /project/python/...，不改 sites 表，
-// 所以 sites.status 会错位；项目接口的 status 才是真的。
-let corrected = BTPanelService.applyProjectStatus(
-    realSites,
-    projects: [
-        ["name": "has-ssl", "status": 0],      // 对应 realSites[1]（Python，sites 表里是 1）
-        ["name": "no-field", "status": 1],     // proxy 站，不该被项目状态覆盖
-    ])
-check("Python 项目的状态被项目接口校正（1 → 0）",
-      !corrected[1].running, corrected[1].statusLabel)
-check("校正后显示为已停止", corrected[1].statusLabel == "已停止", corrected[1].statusLabel)
-check("非 Python 站点不受项目状态影响",
-      corrected[2].running == realSites[2].running, corrected[2].statusLabel)
-check("项目里没有的站点保持原值", corrected[0].running == realSites[0].running)
-check("项目列表为空时原样返回",
-      BTPanelService.applyProjectStatus(realSites, projects: []).count == realSites.count)
-
-print("== 宝塔面板：多类型数据库（实测每种类型各有接口）==")
-let wantKeys: Set<String> = ["mysql", "mongodb", "redis", "pgsql", "sqlserver", "sqlite"]
-check("类型列表覆盖用户要的几种",
-      wantKeys.isSubset(of: Set(BTDatabaseType.all.map { $0.key })),
-      BTDatabaseType.all.map { $0.key }.joined(separator: ","))
-check("MySQL 不是裸数组（它走 /data）", !BTDatabaseType.find("mysql").arrayStyle)
-check("Redis 是裸数组结构", BTDatabaseType.find("redis").arrayStyle)
-check("SQLite 是裸数组结构", BTDatabaseType.find("sqlite").arrayStyle)
-check("MongoDB / PostgreSQL 是 {data:[…]} 结构",
-      !BTDatabaseType.find("mongodb").arrayStyle && !BTDatabaseType.find("pgsql").arrayStyle)
-check("未知类型回落到 MongoDB", BTDatabaseType.find("nope").key == "mongodb")
-// Redis 返回裸数组，字段只有 id/name/keynum
-let redisJSON = BTPanelService.interpret(
-    #"[{"id":0,"name":"DB0","keynum":3},{"id":1,"name":"DB1","keynum":0}]"#)
-let redisDBs = BTPanelService.parseDatabases(redisJSON, type: BTDatabaseType.find("redis"))
-check("Redis 裸数组解析出 2 个 DB", redisDBs.count == 2, "\(redisDBs.count)")
-check("Redis 库名 / 键数解析", redisDBs[0].name == "DB0" && redisDBs[0].keynum == 3)
-check("Redis 条目标注了类型", redisDBs[0].type == "Redis", redisDBs[0].type)
-check("Redis 没有密码字段时留空", redisDBs[0].password.isEmpty)
-check("PostgreSQL 的空 data 不崩",
-      BTPanelService.parseDatabases(BTPanelService.interpret(#"{"data":[]}"#),
-                                    type: BTDatabaseType.find("pgsql")).isEmpty)
-check("SQLite 空数组不崩",
-      BTPanelService.parseDatabases(BTPanelService.interpret("[]"),
-                                    type: BTDatabaseType.find("sqlite")).isEmpty)
-
-print("== 宝塔面板：MongoDB 数据库列表解析 ==")
-// 用假密码（真实值不写进仓库）
-let dbJSON = BTPanelService.interpret("""
-{"where":"lower(type) = lower('mongodb')","data":[
-  {"id":2,"name":"ai_tool_db","username":"ai_tool_db","password":"pwd-1",
-   "accept":"127.0.0.1","type":"MongoDB","addtime":"2026-09-02 05:53:20"},
-  {"id":1,"name":"demo_db","username":"demo_db","password":"pwd-2",
-   "accept":"127.0.0.1","type":"MongoDB","addtime":"2026-09-02 00:22:26"}
-]}
-""")
-let dbs = BTPanelService.parseDatabases(dbJSON, type: BTDatabaseType.find("mongodb"))
-check("解析出 2 个数据库", dbs.count == 2, "\(dbs.count)")
-check("库名正确", dbs[0].name == "ai_tool_db", dbs[0].name)
-check("用户名解析", dbs[1].username == "demo_db", dbs[1].username)
-check("类型按所选类型标注", dbs[0].type == "MongoDB", dbs[0].type)
-check("访问来源解析", dbs[0].accept == "127.0.0.1", dbs[0].accept)
-check("添加时间解析", dbs[1].addtime == "2026-09-02 00:22:26", dbs[1].addtime)
-check("密码字段读到了（展示时走 SecretCell 打码）", dbs[0].password == "pwd-1")
-check("空 data 不崩",
-      BTPanelService.parseDatabases(BTPanelService.interpret(#"{"data":[]}"#),
-                                    type: BTDatabaseType.find("mongodb")).isEmpty)
-check("无 data 字段也不崩",
-      BTPanelService.parseDatabases(BTPanelService.interpret(#"{"status":true}"#),
-                                    type: BTDatabaseType.find("mongodb")).isEmpty)
-
-print("== 宝塔面板：敏感字段脱敏（MongoDB 接口会明文返回密码）==")
-let leaky = #"{"data":[{"name":"demo_db","username":"demo_db","password":"sample-pwd-xyz"}]}"#
-let cleaned = BTPanelService.redactSensitive(leaky)
-check("password 被脱敏", !cleaned.contains("sample-pwd-xyz"), cleaned)
-check("库名/用户名不受影响（不是敏感字段）", cleaned.contains("demo_db"))
-check("证书类字段仍然脱敏",
-      !BTPanelService.redactSensitive(#"{"private_key":"abc123","cert":"def456"}"#).contains("abc123"))
-check("api_sk / secret 也脱敏",
-      !BTPanelService.redactSensitive(#"{"api_sk":"sk-value","secret":"sec-value"}"#).contains("sk-value"))
-check("连接串里的密码也遮掉",
-      !BTPanelService.redactSensitive("mongodb://user:secret@127.0.0.1:27017").contains("secret"))
-
-print("== 宝塔面板：磁盘 / 资源占用（用于画占用条）==")
-// 实测结构：GetDiskInfo 的 size = [总量, 已用, 可用, 使用率, 保留]
-let diskSample = BTDiskUsage(path: "/", filesystem: "/dev/vda3",
-                             totalText: "39.0 GB", usedText: "11.5 GB",
-                             availText: "25.7 GB", percentText: "30.99%")
-check("磁盘使用率解析（30.99% → 0.3099）",
-      abs(diskSample.fraction - 0.3099) < 0.0001, "\(diskSample.fraction)")
-check("缺百分比字段时归零不崩",
-      BTDiskUsage(path: "/", filesystem: "x", totalText: "1", usedText: "1",
-                  availText: "0", percentText: "").fraction == 0)
-check("使用率被夹在 0…1 之间",
-      BTDiskUsage(path: "/", filesystem: "x", totalText: "1", usedText: "1",
-                  availText: "0", percentText: "150%").fraction == 1)
-check("资源占用结构可用",
-      BTResourceUsage(label: "内存", detail: "550MB / 1.87GB", fraction: 0.294).fraction == 0.294)
-check("数字解析：Int", BTPanelService.doubleValue(550) == 550)
-check("数字解析：Double", BTPanelService.doubleValue(1.5) == 1.5)
-check("数字解析：String", BTPanelService.doubleValue("30.99") == 30.99)
-check("数字解析：nil", BTPanelService.doubleValue(nil) == nil)
-check("project_type=proxy → 反向代理", realSites[2].typeLabel == "反向代理", realSites[2].typeLabel)
-check("proxy 站不算项目类", !realSites[2].isProjectSite)
-
-print("== 宝塔面板：服务状态解析（13.x 真实结构 list.data[]）==")
-let softJSON = BTPanelService.interpret("""
-{"list": {"page": "<div>共288条</div>", "data": [
-  {"name": "nginx", "title": "Nginx", "status": true, "version": "1.28.3"},
-  {"name": "redis", "title": "Redis", "status": false, "version": "8.0.5"},
-  {"name": "btwaf", "title": "Nginx防火墙", "status": false, "version": ""}
-]}}
-""")
-let nginxStatus = BTPanelService.parseService(name: "nginx", from: softJSON)
-check("服务名精确匹配", nginxStatus.name == "nginx")
-check("商店里的版本能读到", nginxStatus.version == "1.28.3", nginxStatus.version)
-let wafStatus = BTPanelService.parseService(name: "btwaf", from: softJSON)
-check("商店没登记版本 → 未安装", wafStatus.statusLabel == "未安装", wafStatus.statusLabel)
-// 关键回归：查不到的名字绝不能拿列表第一项顶上
-let missing = BTPanelService.parseService(name: "php-fpm-74", from: softJSON)
-check("查不到的服务不会拿别人的状态顶上",
-      missing.name == "php-fpm-74" && !missing.installed, "\(missing.name)/\(missing.statusLabel)")
-check("非 JSON 响应不崩",
-      BTPanelService.parseService(name: "x", from: BTAPIResult.failure("boom")).installed == false)
-check("空 list 也不崩",
-      BTPanelService.parseService(name: "x", from: BTPanelService.interpret(#"{"list":{}}"#)).installed == false)
-
-print("== 宝塔面板：运行状态以进程表为准（实测 redis 被商店误判成未运行）==")
-func svc(_ n: String, _ v: String, _ running: Bool?, _ procs: Int) -> BTServiceStatus {
-    BTServiceStatus(name: n, title: n, version: v, running: running, processCount: procs)
-}
-check("有进程 → 运行中", svc("redis", "8.0.5", false, 1).statusLabel == "运行中",
-      svc("redis", "8.0.5", false, 1).statusLabel)
-check("进程数压过商店的 status 字段（redis 实测场景）",
-      svc("redis", "8.0.5", false, 2).statusLabel == "运行中")
-check("无进程但商店有版本 → 已停止", svc("x", "1.0", false, 0).statusLabel == "已停止")
-check("无进程无版本 → 未安装", svc("y", "", nil, 0).statusLabel == "未安装")
-check("进程数展示", svc("nginx", "1.28.3", true, 4).detailLabel == "4 个进程",
-      svc("nginx", "1.28.3", true, 4).detailLabel)
-check("无进程时展示商店登记信息", svc("x", "1.0", false, 0).detailLabel == "商店已登记")
-check("PHP 站不算项目类", !parsedSites[0].isProjectSite)
-check("Python 站算项目类", parsedSites[1].isProjectSite)
-check("反向代理站不算项目类", !parsedSites[2].isProjectSite)
-check("项目类的启停说明点出应用进程",
-      parsedSites[1].restartNote.contains("应用进程"), parsedSites[1].restartNote)
-check("反向代理的说明说明后端不受影响",
-      parsedSites[2].restartNote.contains("后端服务本身不受影响"), parsedSites[2].restartNote)
-check("PHP 的说明点出 nginx 配置",
-      parsedSites[0].restartNote.contains("nginx 配置"), parsedSites[0].restartNote)
-
-print("== 宝塔面板：服务状态 ==")
-check("布尔兼容：字符串 \"1\"", BTPanelService.parseBool("1") == true)
-check("布尔兼容：\"stopped\"", BTPanelService.parseBool("stopped") == false)
-check("布尔兼容：int 0", BTPanelService.parseBool(0) == false)
-check("布尔兼容：nil", BTPanelService.parseBool(nil) == nil)
-
-print("== 宝塔面板：敏感字段脱敏 ==")
-let sslRaw = #"{"status":true,"key":"-----BEGIN PRIVATE KEY-----\nSECRET","csr":"-----BEGIN CERTIFICATE-----\nCERT","siteName":"a.com"}"#
-let redacted = BTPanelService.redactSensitive(sslRaw)
-check("私钥内容被抹掉", !redacted.contains("SECRET"), redacted)
-check("证书内容被抹掉", !redacted.contains("BEGIN CERTIFICATE"))
-check("非敏感字段保留", redacted.contains("a.com"))
-check("空串不崩", BTPanelService.redactSensitive("") == "")
-
-print("== 宝塔面板：接口不存在（404）的处理 ==")
-let notFoundHTML = "<html><head><title>404 Not Found</title></head><body><center><h1>404 Not Found</h1></center><hr><center>nginx</center></body></html>"
-check("识别 nginx 的 404 页面", BTPanelService.looksLikeNotFound(notFoundHTML))
-check("404 响应判为失败", !BTPanelService.interpret(notFoundHTML).ok)
-check("404 被解析成可读提示",
-      BTPanelService.interpret(notFoundHTML).message.contains("不存在"),
-      BTPanelService.interpret(notFoundHTML).message)
-check("「参数无效」被识别为参数问题（应继续试别的组合）",
-      BTPanelService.looksLikeBadParams(#"{"status": false, "msg": "指定参数无效!"}"#))
-check("参数错误的中文别名也能识别",
-      BTPanelService.looksLikeBadParams(#"{"status":false,"msg":"参数有误"}"#))
-check("正常响应不算参数问题", !BTPanelService.looksLikeBadParams(#"{"status":true}"#))
-check("404 不算参数问题",
-      !BTPanelService.looksLikeBadParams("<html>404 Not Found nginx</html>"))
-check("普通 HTML 不误判", !BTPanelService.looksLikeNotFound("<html><body>hello</body></html>"))
-check("正常 JSON 不受影响", BTPanelService.interpret(#"{"status":true}"#).ok)
-check("真实面板版本号这类响应仍算成功",
-      BTPanelService.interpret(#"{"version":"13.1.0"}"#).ok)
 
 print("== Redis 客户端：SHUTDOWN 这类会断连的命令 ==")
 // 之前"停止失败"的根因：客户端只把「关闭了连接」这一种错误当成功，
@@ -706,29 +640,15 @@ check("空输出不匹配", !ProcUtil.processNameMatches("", "redis-server"))
 check("有前后空白也能匹配",
       ProcUtil.processNameMatches("  /opt/homebrew/bin/redis-server\n", "redis-server"))
 
-print("== 网络代理：设置与随机凭据 ==")
-var vpnSettings = VPNSettings()
-check("默认客户端名", vpnSettings.clientName == "seraphine", vpnSettings.clientName)
-check("默认远端描述文件以 .mobileconfig 结尾",
-      vpnSettings.remoteProfilePath.hasSuffix(".mobileconfig"), vpnSettings.remoteProfilePath)
-check("默认备份到 iCloud", vpnSettings.icloudBackup)
-check("默认 SSH 端口 22", vpnSettings.sshPort == 22)
-// 随机串只含字母数字：安装脚本对特殊字符有忌讳，会破坏它生成的配置
-let vpnSecret = VPNService.randomSecret(32)
-check("随机串长度正确", vpnSecret.count == 32, "\(vpnSecret.count)")
-check("随机串只含字母数字",
-      vpnSecret.allSatisfy { $0.isLetter || $0.isNumber }, vpnSecret)
-check("两次生成不相同", VPNService.randomSecret(32) != VPNService.randomSecret(32))
-// 新增 vpn 段后：老设置文件（没有该段 / 只有部分字段）仍要能解码
-let vpnSettingsJSON = Data(#"{"vpn":{"host":"1.2.3.4"}}"#.utf8)
-check("只有部分字段的 vpn 段也能解码",
-      (try? JSONDecoder().decode(AppSettings.self, from: vpnSettingsJSON))?.vpn.host == "1.2.3.4")
-check("未给的字段回落到默认值",
-      (try? JSONDecoder().decode(AppSettings.self, from: vpnSettingsJSON))?.vpn.sshPort == 22)
-check("完全没有 vpn 段时用默认值",
-      (try? JSONDecoder().decode(AppSettings.self, from: Data("{}".utf8)))?.vpn.clientName == "seraphine")
+print("== 旧版设置兼容 ==")
+let legacySettingsJSON = Data(#"{"mongo":{"adminUser":"existing-user"},"vpn":{"host":"1.2.3.4","sshPassword":"legacy-secret"}}"#.utf8)
+let legacySettings = try? JSONDecoder().decode(AppSettings.self, from: legacySettingsJSON)
+check("忽略旧版 VPN 配置并保留数据库设置", legacySettings?.mongo.adminUser == "existing-user")
+let migratedSettings = legacySettings.flatMap { try? JSONEncoder().encode($0) }
+let migratedObject = migratedSettings.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+check("重新保存时移除旧版 VPN 配置", migratedObject != nil && migratedObject?["vpn"] == nil)
 
-print("== 网络代理：日志脱敏（VPN 凭据绝不能落盘）==")
+print("== 通用日志脱敏 ==")
 check("VPN_IPSEC_PSK 被遮掉",
       !Shell.redactSecrets("env VPN_IPSEC_PSK='abc123secret' bash x").contains("abc123secret"))
 check("VPN_PASSWORD 被遮掉",
@@ -750,10 +670,6 @@ check("读到了给的字段", decodedSettings?.mongo.adminUser == "u1", decoded
 check("没给的字段用默认值", decodedSettings?.mongo.port == 27017 && decodedSettings?.redis.port == 6379)
 check("连 mongo 段都没有时也能解码",
       (try? JSONDecoder().decode(AppSettings.self, from: Data("{}".utf8))) != nil)
-check("新增的 bt 段缺字段也能解码",
-      (try? JSONDecoder().decode(AppSettings.self,
-                                 from: Data("{\"bt\":{\"baseURL\":\"http://x:8888\"}}".utf8)))?.bt.baseURL
-      == "http://x:8888")
 
 print("== 日志脱敏 ==")
 check("连接串里的密码被替换成 ***",
@@ -874,6 +790,1041 @@ if let mongosh = Paths.which("mongosh") {
 }
 
 fake.stop()
+
+// MARK: AI 开发（codex 无人值守看门狗）
+
+print("== AI：本机代理（scutil --proxy）==")
+let scutilSample = """
+<dictionary> {
+  ExceptionsList : <array> {
+    0 : localhost
+    1 : 127.0.0.0/8
+    2 : ::1
+  }
+  FTPPassive : 1
+  HTTPEnable : 1
+  HTTPPort : 10808
+  HTTPProxy : 127.0.0.1
+  HTTPSEnable : 1
+  HTTPSPort : 10808
+  HTTPSProxy : 127.0.0.1
+  SOCKSEnable : 1
+  SOCKSPort : 10808
+  SOCKSProxy : 127.0.0.1
+}
+"""
+let aiProxy = AIProxyConfig.parse(scutilOutput: scutilSample)
+check("解析出 HTTP 代理", aiProxy.http.url == "http://127.0.0.1:10808", aiProxy.summary)
+check("解析出 HTTPS 代理", aiProxy.https.url == "http://127.0.0.1:10808")
+check("解析出 SOCKS 代理", aiProxy.socks.url == "http://127.0.0.1:10808")
+check("解析出例外列表", aiProxy.exceptions == ["localhost", "127.0.0.0/8", "::1"],
+      aiProxy.exceptions.joined(separator: ","))
+check("摘要里三类都列出来",
+      aiProxy.summary.contains("HTTP 127.0.0.1:10808") && aiProxy.summary.contains("SOCKS 127.0.0.1:10808"),
+      aiProxy.summary)
+check("空的 scutil 输出 = 没有代理", AIProxyConfig.parse(scutilOutput: "").isEmpty)
+let aiProxyOff = AIProxyConfig.parse(scutilOutput: "HTTPEnable : 0\nHTTPProxy : 127.0.0.1\nHTTPPort : 10808")
+check("开关为 0 时不算开启", aiProxyOff.isEmpty)
+let aiProxyIPv6 = AIProxyConfig.parse(scutilOutput: "HTTPEnable : 1\nHTTPProxy : ::1\nHTTPPort : 10808")
+check("IPv6 地址里的冒号不当分隔符", aiProxyIPv6.http.host == "::1", aiProxyIPv6.http.display)
+
+let aiProxyEnv = aiProxy.environment(override: "")
+check("注入 HTTP_PROXY", aiProxyEnv["HTTP_PROXY"] == "http://127.0.0.1:10808", aiProxyEnv["HTTP_PROXY"] ?? "")
+check("注入 HTTPS_PROXY", aiProxyEnv["HTTPS_PROXY"] == "http://127.0.0.1:10808")
+check("SOCKS 走 ALL_PROXY", aiProxyEnv["ALL_PROXY"] == "socks5://127.0.0.1:10808", aiProxyEnv["ALL_PROXY"] ?? "")
+check("大小写各写一份（不同客户端认的名字不一样）",
+      aiProxyEnv["https_proxy"] == aiProxyEnv["HTTPS_PROXY"] && aiProxyEnv["no_proxy"] == aiProxyEnv["NO_PROXY"])
+check("NO_PROXY 带上系统例外", (aiProxyEnv["NO_PROXY"] ?? "").contains("127.0.0.0/8"))
+check("NO_PROXY 带上本地地址", (aiProxyEnv["NO_PROXY"] ?? "").contains("localhost"))
+check("NO_PROXY 去重（系统例外里已有 localhost 时不重复写）",
+      (aiProxyEnv["NO_PROXY"] ?? "").split(separator: ",").filter { $0 == "localhost" }.count == 1,
+      aiProxyEnv["NO_PROXY"] ?? "")
+
+let aiProxyOverride = aiProxy.environment(override: "127.0.0.1:10809")
+check("手动覆盖优先于自动探测", aiProxyOverride["HTTP_PROXY"] == "http://127.0.0.1:10809",
+      aiProxyOverride["HTTP_PROXY"] ?? "")
+check("覆盖时 ALL_PROXY 同指一个", aiProxyOverride["ALL_PROXY"] == "http://127.0.0.1:10809")
+check("带 scheme 的覆盖原样保留", AIProxyConfig.normalize("socks5://127.0.0.1:1080") == "socks5://127.0.0.1:1080")
+check("空覆盖返回 nil（回落到自动探测）", AIProxyConfig.normalize("   ") == nil)
+check("不像地址的覆盖忽略", AIProxyConfig.normalize("abcdef") == nil)
+
+print("== AI：限额识别与恢复时间解析 ==")
+check("识别 usage limit", AIUsageLimit.looksLikeLimit("You've hit your usage limit for GPT-6."))
+check("识别 429", AIUsageLimit.looksLikeLimit("HTTP 429 Too Many Requests"))
+check("普通输出不算限额", !AIUsageLimit.looksLikeLimit("tests passed, 12 files changed"))
+check("限额文本不算登录致命错误",
+      !AIUsageLimit.looksFatal("You've hit your usage limit. Try again at 9:30 PM."))
+check("登录类错误算致命", AIUsageLimit.looksFatal("error: not logged in, please run codex login"))
+check("非 Git 目录算致命（重试也没用）",
+      AIUsageLimit.looksFatal("Error: not inside a git repository, pass --skip-git-repo-check"))
+check("普通报错不算致命", !AIUsageLimit.looksFatal("network error: connection reset"))
+check("识别「没有可续跑的会话」", AIUsageLimit.looksLikeNoSession("error: no sessions found in this directory"))
+check("限额文案不会被当成没有会话",
+      !AIUsageLimit.looksLikeNoSession("You've hit your usage limit. Try again at 9:30 PM."))
+check("普通输出不会被当成没有会话", !AIUsageLimit.looksLikeNoSession("做了 3 处修改，测试通过"))
+
+var aiCalendar = Calendar(identifier: .gregorian)
+aiCalendar.timeZone = TimeZone(identifier: "Asia/Shanghai")!
+let aiNow = aiCalendar.date(from: DateComponents(year: 2026, month: 9, day: 26, hour: 12, minute: 0, second: 0))!
+
+// ISO 带时区：按绝对时间解析（不受本机时区影响）
+let isoExpected = ISO8601DateFormatter().date(from: "2026-09-26T21:30:00Z")!
+let aiISO = AIUsageLimit.parseResetDate(in: "You've hit your usage limit. Try again at 2026-09-26T21:30:00Z",
+                                        now: aiNow, calendar: aiCalendar)
+check("解析 ISO 时间", aiISO != nil && abs((aiISO ?? .distantPast).timeIntervalSince(isoExpected)) < 1,
+      aiISO.map { "\($0)" } ?? "nil")
+
+// 不带时区：按本地时区理解
+let localExpected = aiCalendar.date(from: DateComponents(year: 2026, month: 9, day: 26, hour: 21, minute: 30))!
+let aiLocal = AIUsageLimit.parseResetDate(in: "resets at 2026-09-26 21:30", now: aiNow, calendar: aiCalendar)
+check("解析本地日期时间", aiLocal != nil && abs((aiLocal ?? .distantPast).timeIntervalSince(localExpected)) < 1,
+      aiLocal.map { "\($0)" } ?? "nil")
+
+// 只有时间：今天还没到 → 今天；已经过了 → 明天
+let todayExpected = aiCalendar.date(from: DateComponents(year: 2026, month: 9, day: 26, hour: 21, minute: 30))!
+let aiClock = AIUsageLimit.parseResetDate(in: "usage limit reached, try again at 9:30 PM",
+                                          now: aiNow, calendar: aiCalendar)
+check("只有时间时按今天算", aiClock != nil && abs((aiClock ?? .distantPast).timeIntervalSince(todayExpected)) < 1,
+      aiClock.map { "\($0)" } ?? "nil")
+let lateNow = aiCalendar.date(from: DateComponents(year: 2026, month: 9, day: 26, hour: 22, minute: 0))!
+let tomorrowExpected = aiCalendar.date(from: DateComponents(year: 2026, month: 9, day: 27, hour: 21, minute: 30))!
+let aiClockTomorrow = AIUsageLimit.parseResetDate(in: "try again at 9:30 PM", now: lateNow, calendar: aiCalendar)
+check("时间已过则算明天",
+      aiClockTomorrow != nil && abs((aiClockTomorrow ?? .distantPast).timeIntervalSince(tomorrowExpected)) < 1,
+      aiClockTomorrow.map { "\($0)" } ?? "nil")
+
+let monthExpected = aiCalendar.date(from: DateComponents(year: 2026, month: 9, day: 26, hour: 21, minute: 30))!
+let aiMonth = AIUsageLimit.parseResetDate(in: "limit resets at Sep 26, 9:30 PM", now: aiNow, calendar: aiCalendar)
+check("解析 Sep 26, 9:30 PM", aiMonth != nil && abs((aiMonth ?? .distantPast).timeIntervalSince(monthExpected)) < 1,
+      aiMonth.map { "\($0)" } ?? "nil")
+check("没有任何时间信息时返回 nil",
+      AIUsageLimit.parseResetDate(in: "you hit your usage limit. upgrade to continue.", now: aiNow, calendar: aiCalendar) == nil)
+check("无关文本返回 nil", AIUsageLimit.parseResetDate(in: "all good", now: aiNow, calendar: aiCalendar) == nil)
+
+check("指数退避 300→600→1200→封顶 3600",
+      AIUsageLimit.backoffWait(attempt: 1) == 300 && AIUsageLimit.backoffWait(attempt: 2) == 600
+      && AIUsageLimit.backoffWait(attempt: 3) == 1200 && AIUsageLimit.backoffWait(attempt: 9) == 3600)
+let aiWaitKnown = AIUsageLimit.waitSeconds(resetAt: aiNow.addingTimeInterval(100), now: aiNow, attempt: 1)
+check("解析到恢复时间就等到那时（+60 秒缓冲）", aiWaitKnown == 160, "\(aiWaitKnown)")
+let aiWaitFar = AIUsageLimit.waitSeconds(resetAt: aiNow.addingTimeInterval(10 * 3600), now: aiNow, attempt: 1)
+check("恢复时间太远时封顶 1 小时", aiWaitFar == 3600, "\(aiWaitFar)")
+let aiWaitPast = AIUsageLimit.waitSeconds(resetAt: aiNow.addingTimeInterval(-600), now: aiNow, attempt: 2)
+check("恢复时间已过则退回指数退避", aiWaitPast == 600, "\(aiWaitPast)")
+check("没有恢复时间时用首次退避", AIUsageLimit.waitSeconds(resetAt: nil, now: aiNow, attempt: 1) == 300)
+let aiWaitNear = AIUsageLimit.waitSeconds(resetAt: aiNow.addingTimeInterval(5), now: aiNow, attempt: 1)
+check("恢复时间马上到也有 60 秒下限（5 秒 + 60 秒缓冲）", aiWaitNear == 65, "\(aiWaitNear)")
+
+print("== AI：codex 命令构造 ==")
+var aiSettings = AIDevSettings()
+aiSettings.workDir = workRoot + "/ai-work"
+aiSettings.model = "gpt-6-astra"
+aiSettings.effort = "high"
+let aiFirst = AICodexCommand.firstArguments(settings: aiSettings, prompt: "把 README 里的错别字改掉")
+check("首轮是 codex exec", aiFirst.first == "exec")
+check("首轮带模型", aiFirst.contains("-m") && aiFirst.contains("gpt-6-astra"))
+check("首轮带推理强度", aiFirst.contains("model_reasoning_effort=\"high\""))
+check("首轮用 workspace-write + 自动审批",
+      aiFirst.contains("-s") && aiFirst.contains("workspace-write") && aiFirst.contains("--approve-for-me"))
+check("首轮放行非 Git 目录", aiFirst.contains("--skip-git-repo-check"))
+check("首轮带工作目录", aiFirst.contains("-C") && aiFirst.contains(aiSettings.workDir))
+check("任务描述是最后一个参数", aiFirst.last == "把 README 里的错别字改掉")
+check("首轮不是 resume", !aiFirst.contains("resume"))
+
+let aiResume = AICodexCommand.resumeArguments(settings: aiSettings)
+check("续跑是 exec resume --last", Array(aiResume.prefix(3)) == ["exec", "resume", "--last"], aiResume.joined(separator: " "))
+check("续跑不带 -s（resume 子命令没有这个选项）", !aiResume.contains("-s"))
+check("续跑用 -c 传沙箱", aiResume.contains("sandbox_mode=\"workspace-write\""))
+check("续跑仍带模型与推理强度",
+      aiResume.contains("gpt-6-astra") && aiResume.contains("model_reasoning_effort=\"high\""))
+check("续跑下发的是「接着干」指令", (aiResume.last ?? "").contains("继续之前的工作"))
+
+aiSettings.sandbox = AISandbox.bypass.rawValue
+check("完全放开：两轮都带 bypass 参数",
+      AICodexCommand.firstArguments(settings: aiSettings, prompt: "x").contains("--dangerously-bypass-approvals-and-sandbox")
+      && AICodexCommand.resumeArguments(settings: aiSettings).contains("--dangerously-bypass-approvals-and-sandbox"))
+aiSettings.sandbox = AISandbox.readOnly.rawValue
+check("只读档：首轮 -s read-only",
+      AICodexCommand.firstArguments(settings: aiSettings, prompt: "x").contains("read-only"))
+aiSettings.sandbox = AISandbox.workspaceWrite.rawValue
+aiSettings.model = ""
+aiSettings.effort = ""
+aiSettings.allowNonGit = false
+let aiMinimal = AICodexCommand.firstArguments(settings: aiSettings, prompt: "x")
+check("跟随配置时不传 -m", !aiMinimal.contains("-m"))
+check("跟随默认时不传推理强度", !aiMinimal.contains { $0.contains("model_reasoning_effort") })
+check("关掉后不传非 Git 放行", !aiMinimal.contains("--skip-git-repo-check"))
+check("预览命令可直接贴进终端（每个参数带引号）",
+      AICodexCommand.previewCommand(settings: aiSettings, resuming: false).hasPrefix("codex 'exec'"))
+check("工作目录留空时回落到 HOME", AICodexCommand.workDirectory(AIDevSettings()) == NSHomeDirectory())
+check("没填目录时 hasWorkDir 为假", !AIDevSettings().hasWorkDir)
+var aiPathSettings = AIDevSettings()
+aiPathSettings.workDir = "  ~/proj/../proj2  "
+check("填了目录时 hasWorkDir 为真", aiPathSettings.hasWorkDir)
+check("任务目录会展开 ~ 并消掉 ..",
+      AICodexCommand.workDirectory(aiPathSettings) == NSHomeDirectory() + "/proj2",
+      AICodexCommand.workDirectory(aiPathSettings))
+check("未知沙箱值回退工作目录档", AISandbox.from("something-else") == .workspaceWrite)
+check("沙箱取值稳定（传给 codex 的字符串不能变）",
+      AISandbox.workspaceWrite.rawValue == "workspace-write" && AISandbox.readOnly.rawValue == "read-only")
+
+print("== AI：codex 事件流（--json 进度探测）==")
+// 样本按 codex 0.157 的真实事件结构手写：顶层 thread/turn/item 事件 + item 的各类别
+let aiJSONL = """
+{"type":"thread.started","thread_id":"0199abcd-1234-7890-abcd-ef0123456789"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"i1","type":"reasoning","text":"先看看仓库结构"}}
+{"type":"item.completed","item":{"id":"i1","type":"reasoning","text":"先看看仓库结构"}}
+{"type":"item.started","item":{"id":"i2","type":"command_execution","command":"rg --files -g '*.swift'"}}
+{"type":"item.completed","item":{"id":"i2","type":"command_execution","command":"rg --files -g '*.swift'","aggregated_output":"Sources/App.swift\\nSources/Support.swift","exit_code":0}}
+{"type":"item.updated","item":{"id":"i2","type":"command_execution","command":"rg --files","aggregated_output":"Sources/App.swift"}}
+{"type":"item.completed","item":{"id":"i3","type":"file_change","changes":[{"path":"Sources/Support.swift","kind":"update"},{"path":"README.md","kind":"add"}]}}
+{"type":"item.completed","item":{"id":"i4","type":"todo_list","items":[{"text":"改 Support.swift","completed":true},{"text":"补测试","completed":false}]}}
+{"type":"item.completed","item":{"id":"i5","type":"agent_message","text":"改好了：Support.swift 换掉了旧写法，测试待补。"}}
+{"type":"turn.completed","usage":{"input_tokens":12345,"cached_input_tokens":1000,"output_tokens":678}}
+"""
+let aiEvents = aiJSONL.split(separator: "\n").compactMap { CodexEventParser.parse(String($0)) }
+check("一行一个事件都能解出来", aiEvents.count == 11, "\(aiEvents.count)")
+check("thread.started 带 thread_id",
+      aiEvents.first?.kind == .threadStarted && (aiEvents.first?.threadID ?? "").hasPrefix("0199abcd"))
+let aiSummary = CodexRoundSummary.merged(from: aiEvents)
+check("统计到 1 次命令执行", aiSummary.commands == 1, "\(aiSummary.commands)")
+check("统计到 2 个改动文件（含顺序）",
+      aiSummary.changedFiles == ["Sources/Support.swift", "README.md"],
+      aiSummary.changedFiles.joined(separator: ","))
+check("todo 完成度 1/2", aiSummary.completedTodoCount == 1 && aiSummary.todos.count == 2)
+check("todo 文案", aiSummary.todoText == "1/2", aiSummary.todoText)
+check("取到最后一条 agent 消息", aiSummary.lastMessage.contains("测试待补"), aiSummary.lastMessage)
+check("turn.completed 标记与 tokens",
+      aiSummary.turnCompleted && aiSummary.inputTokens == 12345 && aiSummary.outputTokens == 678)
+check("这一轮算有实质动作（有命令/有改动）", aiSummary.hasSubstantiveAction)
+check("事件计数不含未知类型", aiSummary.eventCount == 11, "\(aiSummary.eventCount)")
+
+// 只有消息、没有任何动作的轮次 —— autoContinue 下靠它判断「没活可干了」
+let aiIdleJSONL = """
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"当前仓库没有需要改动的地方。"}}
+{"type":"turn.completed","usage":{"input_tokens":900,"output_tokens":20}}
+"""
+let aiIdle = CodexRoundSummary.merged(from: aiIdleJSONL.split(separator: "\n").compactMap { CodexEventParser.parse(String($0)) })
+check("只有消息的轮次没有实质动作", !aiIdle.hasSubstantiveAction && aiIdle.eventCount == 3)
+check("空转轮次仍记录消息与 tokens",
+      aiIdle.lastMessage.contains("没有需要改动") && aiIdle.outputTokens == 20)
+
+// 渲染成日志行
+func aiHuman(_ json: String) -> String { CodexEventParser.parse(json).flatMap { CodexEventParser.humanLine($0) } ?? "" }
+check("命令开始渲染成 $ 开头",
+      aiHuman(#"{"type":"item.started","item":{"type":"command_execution","command":"swift build"}}"#).hasPrefix("$ swift build"))
+let aiCommandLine = aiHuman(#"{"type":"item.completed","item":{"type":"command_execution","command":"swift build","aggregated_output":"error: no such file or directory","exit_code":1}}"#)
+check("命令结束渲染退出码", aiCommandLine.contains("退出码 1"), aiCommandLine)
+check("命令失败时附上输出尾部", aiCommandLine.contains("no such file"), aiCommandLine)
+let aiFileChangeLine = aiHuman(#"{"type":"item.completed","item":{"type":"file_change","changes":[{"path":"a/b.swift","kind":"update"}]}}"#)
+check("文件改动渲染成人话", aiFileChangeLine.contains("改动文件") && aiFileChangeLine.contains("a/b.swift"), aiFileChangeLine)
+let aiTodoLine = aiHuman(#"{"type":"item.completed","item":{"type":"todo_list","items":[{"text":"步骤一","completed":true},{"text":"步骤二","completed":false}]}}"#)
+check("todo 渲染出完成度与未完成项",
+      aiTodoLine.contains("计划 1/2") && aiTodoLine.contains("步骤二"), aiTodoLine)
+check("agent 消息原样写进日志",
+      aiHuman(#"{"type":"item.completed","item":{"type":"agent_message","text":"做完了，共改 3 个文件"}}"#) == "做完了，共改 3 个文件")
+check("turn.completed 渲染出 tokens",
+      aiHuman(#"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":20}}"#).contains("输入 10"))
+check("turn.failed 渲染出失败原因",
+      aiHuman(#"{"type":"turn.failed","error":{"message":"stream error"}}"#).contains("stream error"))
+check("item.updated 不写日志（流式中间态，避免刷屏）",
+      aiHuman(#"{"type":"item.updated","item":{"type":"command_execution","aggregated_output":"部分输出"}}"#).isEmpty)
+check("web_search 渲染出来",
+      aiHuman(#"{"type":"item.completed","item":{"type":"web_search","query":"swiftui timelineview"}}"#).contains("swiftui timelineview"))
+
+// 宽松性：codex 换字段/加类型时不能把看门狗搞崩
+check("非 JSON 行返回 nil（stderr 混进来的告警）", CodexEventParser.parse("WARNING: proceeding anyway") == nil)
+check("坏 JSON 返回 nil", CodexEventParser.parse("{oops") == nil)
+check("未知事件类型不崩（kind = unknown）",
+      CodexEventParser.parse(#"{"type":"something.new"}"#)?.kind == .unknown)
+check("缺字段的 item 不崩", CodexEventParser.parse(#"{"type":"item.completed","item":{}}"#) != nil)
+check("exit_code 是字符串也能读",
+      CodexEventParser.parse(#"{"type":"item.completed","item":{"type":"command_execution","exit_code":"2"}}"#)?.exitCode == 2)
+check("没有 changes 时改动为空",
+      CodexEventParser.parse(#"{"type":"item.completed","item":{"type":"file_change"}}"#)?.changedFiles.isEmpty == true)
+check("未知类型的事件不进汇总", CodexRoundSummary.merged(from: [
+    CodexEvent(kind: .unknown), CodexEvent(kind: .turnStarted),
+]).eventCount == 1)
+
+check("默认开启事件流", AIDevSettings().jsonEvents)
+check("首轮命令带上 --json", aiMinimal.contains("--json"), aiMinimal.joined(separator: " "))
+var aiNoJSON = aiSettings
+aiNoJSON.jsonEvents = false
+check("关掉事件流后不带 --json",
+      !AICodexCommand.firstArguments(settings: aiNoJSON, prompt: "x").contains("--json"))
+
+print("== AI：审查者（DeepSeek）与修复队列 ==")
+let reviewSettingsDefault = AIReviewSettings()
+check("默认模型是 deepseek-v4-flash", reviewSettingsDefault.model == "deepseek-v4-flash")
+check("默认接口地址是 DeepSeek 官方", reviewSettingsDefault.baseURL == "https://api.deepseek.com")
+check("没填密钥时算未配置", !reviewSettingsDefault.isConfigured)
+check("请求地址归一化：裸域名补 /v1/chat/completions",
+      reviewSettingsDefault.chatCompletionsURL == "https://api.deepseek.com/v1/chat/completions",
+      reviewSettingsDefault.chatCompletionsURL)
+var reviewWithV1 = AIReviewSettings()
+reviewWithV1.baseURL = "https://api.deepseek.com/v1/"
+check("请求地址归一化：已带 /v1 不重复",
+      reviewWithV1.chatCompletionsURL == "https://api.deepseek.com/v1/chat/completions",
+      reviewWithV1.chatCompletionsURL)
+var reviewFullPath = AIReviewSettings()
+reviewFullPath.baseURL = "https://example.com/v1/chat/completions"
+check("请求地址归一化：完整路径原样",
+      reviewFullPath.chatCompletionsURL == "https://example.com/v1/chat/completions")
+var reviewConfigured = AIReviewSettings()
+reviewConfigured.apiKey = "sk-test"
+check("填了密钥就算配置好了", reviewConfigured.isConfigured)
+
+print("== AI：验收命令判定 ==")
+check("解析多行验收命令（忽略空行与注释）",
+      Acceptance.commands("""
+      # 先跑测试
+      ./tests/run.sh
+
+      swift build
+      """) == ["./tests/run.sh", "swift build"])
+check("空文本没有验收命令", Acceptance.commands("   \n\n").isEmpty)
+check("全部退出码 0 才算通过",
+      Acceptance.allPassed([AcceptanceResult(command: "a", status: 0, outputTail: ""),
+                            AcceptanceResult(command: "b", status: 0, outputTail: "")]))
+check("有一条失败就不算通过",
+      !Acceptance.allPassed([AcceptanceResult(command: "a", status: 0, outputTail: ""),
+                             AcceptanceResult(command: "b", status: 1, outputTail: "boom")]))
+check("空列表不算通过（没有验收标准 ≠ 通过）", !Acceptance.allPassed([]))
+let acceptanceFailure = Acceptance.failureText([
+    AcceptanceResult(command: "ok", status: 0, outputTail: ""),
+    AcceptanceResult(command: "fail", status: 1, outputTail: "assertion failed at line 12"),
+])
+check("失败摘要只列失败的那条", acceptanceFailure.contains("fail") && !acceptanceFailure.contains("ok →"))
+check("失败摘要带输出尾部", acceptanceFailure.contains("assertion failed"))
+
+print("== AI：审查请求打包 ==")
+var sampleRequest = ReviewRequest()
+sampleRequest.requirement = "给 Redis 页加一个「导出所有 key」按钮"
+sampleRequest.plan = "1. 加按钮 2. 调用 SCAN"
+sampleRequest.roundNotes = ["- 第 1 轮：先看现有 UI 代码", "- 第 2 轮：加了按钮"]
+sampleRequest.diff = "diff --git a/Foo.swift b/Foo.swift\n+let x = 1"
+sampleRequest.diffStat = " Foo.swift | 2 +-"
+sampleRequest.acceptance = [AcceptanceResult(command: "./tests/run.sh", status: 1, outputTail: "1 项失败")]
+sampleRequest.materialNotes = "diff 太长已截断"
+let reviewUser = ReviewRequestBuilder.userPrompt(sampleRequest)
+check("审查请求带需求原文", reviewUser.contains("给 Redis 页加一个「导出所有 key」按钮"))
+check("审查请求带每轮自我说明", reviewUser.contains("- 第 2 轮：加了按钮"))
+check("审查请求带 diff", reviewUser.contains("+let x = 1"))
+check("审查请求带验收结果与失败", reviewUser.contains("./tests/run.sh") && reviewUser.contains("失败"))
+check("审查请求带材料说明", reviewUser.contains("diff 太长已截断"))
+check("审查请求带计划", reviewUser.contains("1. 加按钮 2. 调用 SCAN"))
+check("系统提示要求固定 Markdown 结构",
+      ReviewRequestBuilder.systemPrompt().contains("## 必修") && ReviewRequestBuilder.systemPrompt().contains("## 存疑"))
+check("系统提示强调「只依据材料判断」",
+      ReviewRequestBuilder.systemPrompt().contains("不要臆测"))
+var noAcceptanceRequest = ReviewRequest()
+noAcceptanceRequest.requirement = "改点什么"
+check("没配验收命令时明确警告完成判定不可靠",
+      ReviewRequestBuilder.userPrompt(noAcceptanceRequest).contains("完成判定不可靠"))
+var checkpointRequest = sampleRequest
+checkpointRequest.checkpoint = true
+check("中途检查模式写明只回答方向问题",
+      ReviewRequestBuilder.userPrompt(checkpointRequest).contains("改动方向还在朝需求走吗"))
+let truncated = ReviewRequestBuilder.truncatedDiff(String(repeating: "x", count: 5000), limit: 1000)
+check("超长 diff 会被截断并标注", truncated.truncated && truncated.text.count == 1000)
+check("不超长时不截断", !ReviewRequestBuilder.truncatedDiff("abc", limit: 1000).truncated)
+
+print("== AI：审查报告解析 ==")
+let reportMarkdown = """
+## 结论
+需要修复 2 处
+
+## 必修
+### 1. 空指针风险
+- 位置：Sources/Foo.swift:120
+- 问题：这里 force unwrap 了可选值
+- 证据：diff 里 `let x = y!`
+- 建议改法：改成 if let 绑定
+- 验收方式：./tests/run.sh 全绿
+
+### 2. 改了需求之外的文件
+- 位置：Resources/Info.plist
+- 问题：需求没要求动这个文件
+- 建议改法：还原该文件
+- 验收方式：git diff 里不再出现这个文件
+
+## 建议
+- 变量名可以更清楚
+- 补一条注释
+
+## 存疑
+- 要不要兼容旧格式？
+"""
+let parsedReport = ReviewReportParser.parse(reportMarkdown)
+check("报告被识别", parsedReport.parsed)
+check("结论行解析正确", parsedReport.verdict == "需要修复 2 处", parsedReport.verdict)
+check("必修项 2 条", parsedReport.mustFix.count == 2, "\(parsedReport.mustFix.count)")
+check("必修项标题去掉了编号前缀", parsedReport.mustFix.first?.title == "空指针风险", parsedReport.mustFix.first?.title ?? "")
+check("抽出「位置」字段", parsedReport.mustFix.first?.location == "Sources/Foo.swift:120")
+check("抽出「验收方式」字段", parsedReport.mustFix.first?.verification.contains("./tests/run.sh") == true)
+check("第二条必修也解析到了", parsedReport.mustFix.last?.location == "Resources/Info.plist")
+check("建议 2 条", parsedReport.suggestions.count == 2, "\(parsedReport.suggestions.count)")
+check("存疑 1 条", parsedReport.questions.count == 1)
+check("摘要文案", parsedReport.summary == "必修 2 项 · 建议 2 条 · 存疑 1 条", parsedReport.summary)
+let emptyMustFixReport = ReviewReportParser.parse("## 结论\n可以交付\n\n## 必修\n\n## 建议\n- 没有\n")
+check("没有必修项时也算解析成功", emptyMustFixReport.parsed && emptyMustFixReport.mustFix.isEmpty)
+check("结论为「可以交付」", emptyMustFixReport.verdict == "可以交付")
+let unparsable = ReviewReportParser.parse("我想了想，这个代码还行吧。")
+check("认不出的格式 parsed=false（由人读原文）", !unparsable.parsed && unparsable.mustFix.isEmpty)
+check("认不出时保留原文", unparsable.raw.contains("还行吧"))
+
+let fixPrompt = ReviewFinding.fixPrompt(ReviewFinding(index: 2, title: "越界改文件",
+                                                      body: "- 位置：X.swift\n- 问题：不该改",
+                                                      location: "X.swift", verification: ""),
+                                        acceptance: ["./tests/run.sh"])
+check("修复指令强调只修这一条", fixPrompt.contains("只修这一条"))
+check("修复指令带上条目编号与标题", fixPrompt.contains("2. 越界改文件"))
+check("修复指令带上验收命令", fixPrompt.contains("./tests/run.sh"))
+check("修复指令要求 DONE / BLOCKED 信号", fixPrompt.contains("DONE") && fixPrompt.contains("BLOCKED"))
+
+print("== AI：审查者接口 ==")
+let reviewBody = ReviewClient.requestBody(settings: reviewConfigured, system: "sys", user: "usr")
+let reviewBodyJSON = reviewBody.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+let reviewMessages = reviewBodyJSON?["messages"] as? [[String: String]]
+check("请求体用配置里的模型名", reviewBodyJSON?["model"] as? String == "deepseek-v4-flash")
+check("请求体是 system + user 两条消息",
+      reviewMessages?.count == 2 && reviewMessages?.first?["role"] == "system"
+      && reviewMessages?.last?["role"] == "user")
+check("请求体关掉流式", reviewBodyJSON?["stream"] as? Bool == false)
+let okReply = Data(#"{"choices":[{"message":{"role":"assistant","content":"结论：可以交付"}}]}"#.utf8)
+switch ReviewClient.parseReply(okReply) {
+case .success(let content): check("解析正常响应", content.contains("可以交付"))
+case .failure(let message): check("解析正常响应", false, message)
+}
+let errorReply = Data(#"{"error":{"message":"Invalid API key"}}"#.utf8)
+switch ReviewClient.parseReply(errorReply) {
+case .success: check("接口报错要当失败", false)
+case .failure(let message): check("接口报错要当失败", message.contains("Invalid API key"), message)
+}
+switch ReviewClient.parseReply(Data("not json".utf8)) {
+case .success: check("非 JSON 响应要当失败", false)
+case .failure(let message): check("非 JSON 响应要当失败", message.contains("不是 JSON"), message)
+}
+switch ReviewClient.parseReply(Data(#"{"choices":[]}"#.utf8)) {
+case .success: check("缺 content 要当失败", false)
+case .failure: check("缺 content 要当失败", true)
+}
+
+print("== AI：中间产物与 git 材料 ==")
+let artifactsRoot = workRoot + "/ai-artifacts"
+try? FileManager.default.createDirectory(atPath: artifactsRoot, withIntermediateDirectories: true)
+_ = FileTools.write(AIArtifacts.roundsPath(artifactsRoot), "")
+AIArtifacts.appendRoundNote(artifactsRoot, round: 1, note: "先读代码")
+AIArtifacts.appendRoundNote(artifactsRoot, round: 2, note: "")
+AIArtifacts.appendRoundNote(artifactsRoot, round: 3, note: "改完了 a 和 b")
+let notesBack = AIArtifacts.roundNotes(artifactsRoot)
+check("每轮自我说明只记非空的", notesBack.count == 2, "\(notesBack.count)")
+check("自我说明带轮次前缀", notesBack.first?.hasPrefix("- 第 1 轮：") == true, notesBack.first ?? "")
+check("中间产物都在 .ai 目录下",
+      AIArtifacts.roundsPath("/x").hasSuffix("/.ai/rounds.md")
+      && AIArtifacts.reviewReportPath("/x").hasSuffix("/.ai/review-report.md"))
+AIArtifacts.reset(artifactsRoot)
+check("reset 清掉每轮记录", AIArtifacts.roundNotes(artifactsRoot).isEmpty)
+
+let missingGit = GitDiff.collect(workDir: workRoot + "/no-such-dir-xyz", maxChars: 1000)
+check("目录不存在时给出明确错误", missingGit.error.contains("不存在"), missingGit.error)
+check("拿不到材料时 diff 为空", missingGit.diff.isEmpty)
+// 注意不能用 workRoot：它在 db-manager 仓库里，git 会认得（那样测不到「不是仓库」这条）
+let notRepo = GitDiff.collect(workDir: NSTemporaryDirectory(), maxChars: 1000)
+check("不是 git 仓库时给出明确错误", notRepo.error.contains("不是 git 仓库"), notRepo.error)
+
+let reviewSettingsLegacy = Data(#"{"ai":{"model":"gpt-6-astra"}}"#.utf8)
+let decodedReviewLegacy = try? JSONDecoder().decode(AppSettings.self, from: reviewSettingsLegacy)
+check("旧设置文件没有 review 字段也能解出默认值",
+      decodedReviewLegacy?.review.model == "deepseek-v4-flash"
+      && decodedReviewLegacy?.review.isConfigured == false)
+let partialReview = Data(#"{"review":{"apiKey":"sk-x"}}"#.utf8)
+let decodedPartialReview = try? JSONDecoder().decode(AppSettings.self, from: partialReview)
+check("review 只写了密钥时其余用默认",
+      decodedPartialReview?.review.isConfigured == true
+      && decodedPartialReview?.review.model == "deepseek-v4-flash")
+
+print("== AI：验收命令自动探测 ==")
+let detectRoot = workRoot + "/detect-project"
+try? FileManager.default.createDirectory(atPath: detectRoot + "/tests", withIntermediateDirectories: true)
+_ = FileTools.write(detectRoot + "/tests/run.sh", "#!/bin/sh\nexit 0\n")
+let detectedScript = Acceptance.detect(workDir: detectRoot)
+check("探测到项目自己的测试脚本", detectedScript.first?.command == "./tests/run.sh",
+      detectedScript.first?.command ?? "（空）")
+check("候选带「为什么推荐」的理由", detectedScript.first?.reason.contains("tests/run.sh") == true,
+      detectedScript.first?.reason ?? "")
+
+let npmRoot = workRoot + "/detect-npm"
+try? FileManager.default.createDirectory(atPath: npmRoot, withIntermediateDirectories: true)
+_ = FileTools.write(npmRoot + "/package.json", #"{"name":"x","scripts":{"test":"jest --ci","build":"tsc","lint":"eslint ."}}"#)
+let detectedNpm = Acceptance.detect(workDir: npmRoot)
+check("npm 项目推荐 npm test", detectedNpm.contains { $0.command == "npm test" },
+      detectedNpm.map(\.command).joined(separator: ","))
+check("npm test 的理由里带上脚本内容", detectedNpm.first?.reason.contains("jest") == true,
+      detectedNpm.first?.reason ?? "")
+check("也推荐 build 与 lint", detectedNpm.contains { $0.command == "npm run build" }
+      && detectedNpm.contains { $0.command == "npm run lint" })
+
+let npmPlaceholderRoot = workRoot + "/detect-npm-placeholder"
+try? FileManager.default.createDirectory(atPath: npmPlaceholderRoot, withIntermediateDirectories: true)
+_ = FileTools.write(npmPlaceholderRoot + "/package.json",
+                    #"{"scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#)
+let detectedPlaceholder = Acceptance.detect(workDir: npmPlaceholderRoot)
+check("npm 默认的假 test 脚本不被推荐（它永远失败）",
+      !detectedPlaceholder.contains { $0.command == "npm test" },
+      detectedPlaceholder.map(\.command).joined(separator: ","))
+
+let swiftRoot = workRoot + "/detect-swift"
+try? FileManager.default.createDirectory(atPath: swiftRoot + "/Tests", withIntermediateDirectories: true)
+_ = FileTools.write(swiftRoot + "/Package.swift", "// swift-tools-version:5.9\n")
+let detectedSwift = Acceptance.detect(workDir: swiftRoot)
+check("Swift Package 有 Tests/ 时推荐 swift test",
+      detectedSwift.contains { $0.command == "swift test" }, detectedSwift.map(\.command).joined(separator: ","))
+check("同时给出保底的 swift build", detectedSwift.contains { $0.command == "swift build" })
+
+let emptyRoot = workRoot + "/detect-empty"
+try? FileManager.default.createDirectory(atPath: emptyRoot, withIntermediateDirectories: true)
+let detectedEmpty = Acceptance.detect(workDir: emptyRoot)
+check("空目录只给一条兜底（并要求有实际改动）",
+      detectedEmpty.count == 1 && detectedEmpty.first?.command == "git diff --exit-code",
+      detectedEmpty.map(\.command).joined(separator: ","))
+check("不存在的目录返回空", Acceptance.detect(workDir: workRoot + "/nope-xyz").isEmpty)
+check("通用例子不为空", !Acceptance.commonExamples().isEmpty)
+
+let parsedScripts = Acceptance.packageScripts(#"{"scripts":{"test":"jest","build":"tsc"}}"#)
+check("解析 package.json 的 scripts", parsedScripts["test"] == "jest" && parsedScripts["build"] == "tsc")
+check("坏 JSON 返回空字典", Acceptance.packageScripts("{oops").isEmpty)
+check("没有 scripts 字段返回空字典", Acceptance.packageScripts(#"{"name":"x"}"#).isEmpty)
+check("识别 npm 默认占位 test 脚本",
+      Acceptance.isPlaceholderTestScript(#"echo "Error: no test specified" && exit 1"#))
+check("真的 test 脚本不算占位", !Acceptance.isPlaceholderTestScript("jest --coverage"))
+
+print("== AI：云端任务（codex cloud）==")
+let cloudJSON = #"""
+{"tasks":[
+ {"task_id":"4f9a1c2e-1111-2222-3333-444455556666","instructions":"给 Redis 页加导出按钮",
+  "task_status":"completed","created_at":1790347065,"environment_id":"env_abc",
+  "head_branch":"main","attempts":2},
+ {"taskId":"aaaabbbb-cccc-dddd-eeee-ffff00001111","query":"修一下登录跳转",
+  "status":"running","createdAt":1790350000}
+],"cursor":null}
+"""#
+let cloudTasks = AICloud.parseTasks(json: cloudJSON)
+check("解析出两条云端任务", cloudTasks.count == 2, "\(cloudTasks.count)")
+check("首条字段都对", cloudTasks.first?.id.hasPrefix("4f9a1c2e") == true
+      && cloudTasks.first?.title == "给 Redis 页加导出按钮"
+      && cloudTasks.first?.status == .completed
+      && cloudTasks.first?.environmentID == "env_abc"
+      && cloudTasks.first?.branch == "main"
+      && cloudTasks.first?.attempts == 2,
+      cloudTasks.first?.rawJSON.prefix(80).description ?? "")
+check("字段名变体也认（taskId / query / status / createdAt）",
+      cloudTasks.last?.title == "修一下登录跳转" && cloudTasks.last?.status == .running)
+check("短 ID 取前 8 位", cloudTasks.first?.shortID == "4f9a1c2e", cloudTasks.first?.shortID ?? "")
+check("unix 时间戳转成可读时间", cloudTasks.first?.displayCreatedAt.contains("-") == true,
+      cloudTasks.first?.displayCreatedAt ?? "")
+check("空 tasks 返回空数组", AICloud.parseTasks(json: #"{"tasks":[],"cursor":null}"#).isEmpty)
+check("坏 JSON 返回空数组", AICloud.parseTasks(json: "{oops").isEmpty)
+check("tasks 不是数组时返回空", AICloud.parseTasks(json: #"{"tasks":"x"}"#).isEmpty)
+check("没有 id 的任务被跳过",
+      AICloud.parseTasks(json: #"{"tasks":[{"instructions":"没有 id"}]}"#).isEmpty)
+check("多行需求被压成一行",
+      AICloud.parseTasks(json: #"{"tasks":[{"task_id":"a1","instructions":"第一行\n第二行"}]}"#).first?.title == "第一行 第二行")
+
+check("状态归一：completed / succeeded / finished",
+      AICloudStatus.from("completed") == .completed && AICloudStatus.from("SUCCEEDED") == .completed
+      && AICloudStatus.from("finished") == .completed)
+check("状态归一：failed / error", AICloudStatus.from("failed") == .failed && AICloudStatus.from("error") == .failed)
+check("状态归一：running / in_progress",
+      AICloudStatus.from("running") == .running && AICloudStatus.from("in_progress") == .running)
+check("状态归一：pending / queued",
+      AICloudStatus.from("pending") == .pending && AICloudStatus.from("queued") == .pending)
+check("状态归一：cancelled", AICloudStatus.from("cancelled") == .cancelled)
+check("认不出的状态是 unknown", AICloudStatus.from("whatever") == .unknown && AICloudStatus.from("") == .unknown)
+check("结束状态判定", AICloudStatus.completed.isTerminal && AICloudStatus.failed.isTerminal
+      && !AICloudStatus.running.isTerminal)
+
+check("从输出里提取任务 ID",
+      AICloud.extractTaskID(from: "Created task 4f9a1c2e-1111-2222-3333-444455556666 ok")
+      == "4f9a1c2e-1111-2222-3333-444455556666")
+check("没有 UUID 时返回 nil", AICloud.extractTaskID(from: "submitted successfully") == nil)
+
+var cloudSettings = AICloudSettings()
+check("没填环境 ID 时算未配置", !cloudSettings.isConfigured)
+cloudSettings.environmentID = "env_x"
+check("填了环境 ID 就算配好了", cloudSettings.isConfigured)
+cloudSettings.listLimit = 999
+cloudSettings.attempts = 99
+check("列表条数被夹到 1–20（接口限制）", cloudSettings.clampedLimit == 20, "\(cloudSettings.clampedLimit)")
+check("best-of-N 被夹到 1–5", cloudSettings.clampedAttempts == 5, "\(cloudSettings.clampedAttempts)")
+cloudSettings.listLimit = 0
+cloudSettings.attempts = 0
+check("下界也夹住", cloudSettings.clampedLimit == 1 && cloudSettings.clampedAttempts == 1)
+check("本地仓库留空时回落 HOME", cloudSettings.resolvedWorkDir == NSHomeDirectory())
+check("云端命令的工作目录切到工具自己的日志目录（躲开 codex 的 error.log 污染）",
+      FileTools.isDirectory(AICloudClient.cloudWorkingDirectory))
+check("那个目录不在工作区里（不会往仓库里丢垃圾）",
+      !AICloudClient.cloudWorkingDirectory.hasPrefix(FileManager.default.currentDirectoryPath + "/"),
+      AICloudClient.cloudWorkingDirectory)
+
+let cloudLegacy = try? JSONDecoder().decode(AppSettings.self, from: Data(#"{"ai":{"model":"x"}}"#.utf8))
+check("旧设置文件没有 cloud 字段也能解出默认值",
+      cloudLegacy?.cloud.environmentID == "" && cloudLegacy?.cloud.attempts == 1
+      && cloudLegacy?.cloud.listLimit == 20)
+let cloudPartial = try? JSONDecoder().decode(AppSettings.self, from: Data(#"{"cloud":{"environmentID":"env_y"}}"#.utf8))
+check("cloud 只写了环境 ID 时其余用默认",
+      cloudPartial?.cloud.isConfigured == true && cloudPartial?.cloud.clampedLimit == 20)
+
+print("== AI：模型列表 ==")
+let aiCatalogJSON = """
+{"models":[
+ {"slug":"gpt-6-astra","display_name":"GPT-6-Astra","default_reasoning_level":"low",
+  "supported_reasoning_levels":[{"effort":"low","description":"快"},{"effort":"high","description":"深"}],
+  "visibility":"list"},
+ {"slug":"codex-auto-review","display_name":"Codex Auto Review","default_reasoning_level":"medium",
+  "supported_reasoning_levels":[{"effort":"medium","description":"内部"}],"visibility":"hide"},
+ {"slug":"gpt-5.5","display_name":"GPT-5.5","default_reasoning_level":"medium",
+  "supported_reasoning_levels":[{"effort":"medium","description":"均衡"}],"visibility":"list"}
+]}
+"""
+let aiModels = AIModelCatalog.parse(aiCatalogJSON)
+check("解析出两个可见模型", aiModels.count == 2, "\(aiModels.count)")
+check("隐藏模型不摆给用户选", !aiModels.contains { $0.slug == "codex-auto-review" })
+check("读到推理档位", aiModels.first?.efforts.map(\.effort) == ["low", "high"])
+check("读到档位说明", aiModels.first?.efforts.first?.detail == "快")
+check("读到默认档", aiModels.first?.resolvedDefaultEffort == "low")
+check("标签带展示名和 slug", aiModels.first?.label.contains("GPT-6-Astra") == true
+      && aiModels.first?.label.contains("gpt-6-astra") == true)
+check("坏 JSON 返回空", AIModelCatalog.parse("{oops").isEmpty)
+check("没有 models 字段返回空", AIModelCatalog.parse("{}").isEmpty)
+check("缺 display_name 时用 slug 当标签",
+      AIModelCatalog.parse(#"{"models":[{"slug":"x"}]}"#).first?.label == "x")
+
+let aiConfigSample = """
+model = "gpt-6-astra"
+model_reasoning_effort = "high"
+
+[mcp_servers.node_repl]
+model = "不该取这个"
+"""
+check("解析 config.toml 的模型", AIModelCatalog.configuredModel(configText: aiConfigSample) == "gpt-6-astra")
+check("解析 config.toml 的推理强度", AIModelCatalog.configuredEffort(configText: aiConfigSample) == "high")
+check("只有 section 时解析出空", AIModelCatalog.configuredModel(configText: "[desktop]\nmodel = \"x\"") == "")
+check("注释掉的 model 不算", AIModelCatalog.configuredModel(configText: "# model = \"x\"") == "")
+check("内置兜底模型列表非空", AIModelCatalog.fallback().count >= 5)
+
+print("== AI：设置兼容与时长文案 ==")
+let aiLegacySettings = Data(#"{"mongo":{"adminUser":"u"},"redis":{"port":6380}}"#.utf8)
+let aiDecodedLegacy = try? JSONDecoder().decode(AppSettings.self, from: aiLegacySettings)
+check("旧设置文件没有 ai 字段也能解出默认值",
+      aiDecodedLegacy?.ai.sandbox == AISandbox.workspaceWrite.rawValue && aiDecodedLegacy?.ai.useProxy == true)
+check("旧设置里的其它字段不受影响", aiDecodedLegacy?.redis.port == 6380)
+let aiPartial = Data(#"{"ai":{"model":"gpt-5.5","useProxy":false}}"#.utf8)
+let aiDecodedPartial = try? JSONDecoder().decode(AppSettings.self, from: aiPartial)
+check("ai 只写了部分字段时其余用默认",
+      aiDecodedPartial?.ai.model == "gpt-5.5" && aiDecodedPartial?.ai.useProxy == false
+      && aiDecodedPartial?.ai.sandbox == AISandbox.workspaceWrite.rawValue
+      && aiDecodedPartial?.ai.continueDelay == 30)
+let aiRoundTrip = AppSettings()
+let aiEncoded = try? JSONEncoder().encode(aiRoundTrip)
+let aiDecoded = aiEncoded.flatMap { try? JSONDecoder().decode(AppSettings.self, from: $0) }
+check("设置能原样往返", aiDecoded?.ai.allowNonGit == aiRoundTrip.ai.allowNonGit)
+
+print("== 快捷启动：设置兼容与保存 ==")
+check("旧设置没有快捷启动方案时建立默认方案",
+      aiDecodedLegacy?.quickLaunchWorkspaces.count == 1
+      && aiDecodedLegacy?.quickLaunchWorkspaces[0].appPaths.isEmpty == true)
+let legacyLaunchData = Data(#"{"quickLaunchApps":["/Applications/Safari.app","/Applications/Utilities/Terminal.app"]}"#.utf8)
+let migratedLaunch = try? JSONDecoder().decode(AppSettings.self, from: legacyLaunchData)
+check("旧版应用列表迁移到默认方案",
+      migratedLaunch?.quickLaunchWorkspaces[0].appPaths.count == 2
+      && migratedLaunch?.selectedQuickLaunchWorkspaceID == migratedLaunch?.quickLaunchWorkspaces[0].id)
+var launchSettings = AppSettings()
+launchSettings.quickLaunchWorkspaces[0].appPaths = ["/Applications/Safari.app"]
+launchSettings.quickLaunchWorkspaces.append(
+    QuickLaunchWorkspace(name: "开发", appPaths: ["/Applications/Utilities/Terminal.app"]))
+launchSettings.selectedQuickLaunchWorkspaceID = launchSettings.quickLaunchWorkspaces[1].id
+let launchEncoded = try? JSONEncoder().encode(launchSettings)
+let launchDecoded = launchEncoded.flatMap { try? JSONDecoder().decode(AppSettings.self, from: $0) }
+check("多个方案及各自应用可保存并恢复",
+      launchDecoded?.quickLaunchWorkspaces == launchSettings.quickLaunchWorkspaces)
+check("重启后仍选择上次方案",
+      launchDecoded?.selectedQuickLaunchWorkspaceID == launchSettings.selectedQuickLaunchWorkspaceID)
+check("新设置不再写旧版单组应用字段",
+      launchEncoded.flatMap { String(data: $0, encoding: .utf8) }?.contains("quickLaunchApps") == false)
+
+print("== 顶部小组件：设置兼容与保存 ==")
+check("默认在屏幕顶部显示小组件", AppSettings().docklet.enabled)
+check("默认没有添加任何图标", AppSettings().docklet.appPaths.isEmpty)
+check("默认完全不透明",
+      AppSettings().docklet.collapsedOpacity == 1 && AppSettings().docklet.expandedOpacity == 1)
+check("默认展开宽度 80%、左栏 80%",
+      AppSettings().docklet.expandedWidthRatio == 0.8 && AppSettings().docklet.appColumnRatio == 0.8)
+check("默认折叠宽度、展开高度与液态玻璃",
+      AppSettings().docklet.collapsedWidth == 100
+      && AppSettings().docklet.collapsedHeight == 0
+      && AppSettings().docklet.expandedHeight == 420
+      && AppSettings().docklet.expandedTopGap == 0
+      && AppSettings().docklet.collapsedLiquidGlassEnabled
+      && AppSettings().docklet.expandedLiquidGlassEnabled)
+check("旧设置缺 docklet 字段时用默认值",
+      aiDecodedLegacy?.docklet.enabled == true && aiDecodedLegacy?.docklet.appPaths.isEmpty == true)
+check("旧设置缺不透明度字段时用默认值",
+      aiDecodedLegacy?.docklet.collapsedOpacity == 1 && aiDecodedLegacy?.docklet.expandedOpacity == 1)
+check("旧设置缺尺寸字段时用默认值",
+      aiDecodedLegacy?.docklet.expandedWidthRatio == 0.8
+      && aiDecodedLegacy?.docklet.appColumnRatio == 0.8
+      && aiDecodedLegacy?.docklet.collapsedWidth == 100
+      && aiDecodedLegacy?.docklet.collapsedHeight == 0
+      && aiDecodedLegacy?.docklet.expandedHeight == 420
+      && aiDecodedLegacy?.docklet.expandedTopGap == 0
+      && aiDecodedLegacy?.docklet.collapsedLiquidGlassEnabled == true
+      && aiDecodedLegacy?.docklet.expandedLiquidGlassEnabled == true)
+let oldGlassSettings = try? JSONDecoder().decode(
+    AppSettings.self, from: Data(#"{"docklet":{"liquidGlassEnabled":false}}"#.utf8))
+check("旧版玻璃开关迁移到两种状态",
+      oldGlassSettings?.docklet.collapsedLiquidGlassEnabled == false
+      && oldGlassSettings?.docklet.expandedLiquidGlassEnabled == false)
+let mixedGlassSettings = try? JSONDecoder().decode(
+    AppSettings.self,
+    from: Data(#"{"docklet":{"liquidGlassEnabled":false,"collapsedLiquidGlassEnabled":true}}"#.utf8))
+check("新玻璃设置优先于旧开关", mixedGlassSettings?.docklet.collapsedLiquidGlassEnabled == true
+      && mixedGlassSettings?.docklet.expandedLiquidGlassEnabled == false)
+var dockletSettings = AppSettings()
+dockletSettings.docklet.enabled = false
+dockletSettings.docklet.collapsedOpacity = 0.35
+dockletSettings.docklet.expandedOpacity = 0.7
+dockletSettings.docklet.expandedWidthRatio = 0.55
+dockletSettings.docklet.appColumnRatio = 0.45
+dockletSettings.docklet.collapsedWidth = 180
+dockletSettings.docklet.collapsedHeight = 52
+dockletSettings.docklet.expandedHeight = 560
+dockletSettings.docklet.expandedTopGap = 36
+dockletSettings.docklet.collapsedLiquidGlassEnabled = false
+dockletSettings.docklet.expandedLiquidGlassEnabled = true
+dockletSettings.docklet.appPaths = ["/Applications/Safari.app", "/Applications/Utilities/Terminal.app"]
+let dockletEncoded = try? JSONEncoder().encode(dockletSettings)
+let dockletDecoded = dockletEncoded.flatMap { try? JSONDecoder().decode(AppSettings.self, from: $0) }
+check("图标列表与开关可保存并恢复", dockletDecoded?.docklet == dockletSettings.docklet)
+check("图标顺序原样保留", dockletDecoded?.docklet.appPaths.first == "/Applications/Safari.app")
+check("不透明度可保存并恢复",
+      dockletDecoded?.docklet.collapsedOpacity == 0.35 && dockletDecoded?.docklet.expandedOpacity == 0.7)
+check("展开宽度与分栏比例可保存并恢复",
+      dockletDecoded?.docklet.expandedWidthRatio == 0.55 && dockletDecoded?.docklet.appColumnRatio == 0.45)
+check("折叠宽度、展开高度和玻璃开关可保存并恢复",
+      dockletDecoded?.docklet.collapsedWidth == 180
+      && dockletDecoded?.docklet.collapsedHeight == 52
+      && dockletDecoded?.docklet.expandedHeight == 560
+      && dockletDecoded?.docklet.expandedTopGap == 36
+      && dockletDecoded?.docklet.collapsedLiquidGlassEnabled == false
+      && dockletDecoded?.docklet.expandedLiquidGlassEnabled == true)
+check("新设置不再写旧玻璃开关字段",
+      dockletEncoded.flatMap { String(data: $0, encoding: .utf8) }?
+        .contains("\"liquidGlassEnabled\"") == false)
+check("docklet 会写进设置文件",
+      dockletEncoded.flatMap { String(data: $0, encoding: .utf8) }?.contains("\"docklet\"") == true)
+check("越界的不透明度被夹回区间",
+      DockletSettings.clampOpacity(9) == 1
+      && DockletSettings.clampOpacity(0) == DockletSettings.minOpacity
+      && DockletSettings.clampOpacity(-3) == DockletSettings.minOpacity
+      && DockletSettings.clampOpacity(.nan) == 1)
+check("越界的尺寸比例被夹回区间",
+      DockletSettings.clamp(2, to: DockletSettings.widthRatioRange) == 1
+      && DockletSettings.clamp(0.1, to: DockletSettings.widthRatioRange) == 0.4
+      && DockletSettings.clamp(0.9, to: DockletSettings.appColumnRatioRange) == 0.8
+      && DockletSettings.clamp(0, to: DockletSettings.appColumnRatioRange) == 0.2
+      && DockletSettings.clamp(.nan, to: DockletSettings.widthRatioRange) == 1)
+let columnWidths = dockletSettings.docklet.columnWidths(totalWidth: 600)
+check("左右分栏宽度始终填满展开面板并留出分隔线",
+      abs(columnWidths.left + columnWidths.right - 599) < 0.001
+      && columnWidths.left >= 160 && columnWidths.right >= 100)
+var narrowDocklet = DockletSettings()
+narrowDocklet.appColumnRatio = 0.8
+let narrowColumns = narrowDocklet.columnWidths(totalWidth: 320)
+check("窄面板不会把右栏挤没", narrowColumns.right >= 100)
+check("展开宽度与左右边缘间隙对应",
+      AppSettings().docklet.expandedWidth(for: 1000) == 800
+      && AppSettings().docklet.expandedSideGap(for: 1000) == 100)
+var fullWidthDocklet = DockletSettings()
+fullWidthDocklet.expandedWidthRatio = 1
+check("展开占满屏幕时左右间隙为零", fullWidthDocklet.expandedSideGap(for: 1000) == 0)
+let handEditedDocklet = try? JSONDecoder().decode(
+    AppSettings.self,
+    from: Data(#"{"docklet":{"collapsedOpacity":9.5,"expandedOpacity":-2,"expandedWidthRatio":9,"appColumnRatio":0.01,"collapsedWidth":900,"collapsedHeight":300,"expandedHeight":80,"expandedTopGap":300}}"#.utf8))
+check("手改设置文件里的越界值也能夹回来",
+      handEditedDocklet?.docklet.collapsedOpacity == 1
+      && handEditedDocklet?.docklet.expandedOpacity == DockletSettings.minOpacity
+      && handEditedDocklet?.docklet.expandedWidthRatio == 1
+      && handEditedDocklet?.docklet.appColumnRatio == 0.2
+      && handEditedDocklet?.docklet.collapsedWidth == DockletSettings.collapsedWidthRange.upperBound
+      && handEditedDocklet?.docklet.collapsedHeight == DockletSettings.collapsedHeightRange.upperBound
+      && handEditedDocklet?.docklet.expandedHeight == DockletSettings.expandedHeightRange.lowerBound
+      && handEditedDocklet?.docklet.expandedTopGap == DockletSettings.expandedTopGapRange.upperBound)
+
+check("时长文案：59 秒", AIDevRunner.durationText(59) == "59 秒")
+check("时长文案：1 分钟", AIDevRunner.durationText(60) == "1 分钟")
+check("时长文案：1 小时", AIDevRunner.durationText(3600) == "1 小时")
+check("时长文案：1 小时 1 分", AIDevRunner.durationText(3660) == "1 小时 1 分")
+check("时长文案不出现负数", AIDevRunner.durationText(-5) == "0 秒")
+check("看门狗用固定文件名（豆包脚本的完成标记沿用）",
+      AIDevRunner.doneFlagName == ".codex_done" && AIDevRunner.logFileName.hasSuffix(".log"))
+
+print("== 域名解析：阿里云签名 ==")
+// 官方「签名方法」文档里的那个例子。参数要按**字典序**排，而且要**编码两次**
+// —— 时间戳里的 `:` 第一次变 `%3A`、第二次变 `%253A`，这是最容易搞错的地方。
+let signParams = [
+    "Format": "XML",
+    "AccessKeyId": "testid",
+    "Action": "DescribeDomainRecords",
+    "SignatureMethod": "HMAC-SHA1",
+    "DomainName": "example.com",
+    "SignatureNonce": "f59ed6a9-83fc-473b-9cc6-99c95df3856e",
+    "SignatureVersion": "1.0",
+    "Version": "2015-01-09",
+    "Timestamp": "2016-03-24T16:41:54Z",
+]
+check("percentEncode：空格编成 %20，~ 不动，/ 编成 %2F",
+      AliyunDNS.percentEncode("a b~c/d") == "a%20b~c%2Fd")
+check("percentEncode：中文按 UTF-8 逐字节编码",
+      AliyunDNS.percentEncode("证书") == "%E8%AF%81%E4%B9%A6")
+check("规范化查询串按参数名字典序",
+      AliyunDNS.canonicalQuery(["b": "2", "a": "1"]) == "a=1&b=2")
+check("StringToSign 与官方文档示例完全一致",
+      AliyunDNS.stringToSign(params: signParams)
+      == "GET&%2F&AccessKeyId%3Dtestid%26Action%3DDescribeDomainRecords%26DomainName%3Dexample.com"
+      + "%26Format%3DXML%26SignatureMethod%3DHMAC-SHA1"
+      + "%26SignatureNonce%3Df59ed6a9-83fc-473b-9cc6-99c95df3856e%26SignatureVersion%3D1.0"
+      + "%26Timestamp%3D2016-03-24T16%253A41%253A54Z%26Version%3D2015-01-09")
+// 期望值由 openssl / python 独立算出来，不是拿自己的实现对自己
+check("签名 = Base64(HMAC-SHA1(secret + \"&\", StringToSign))",
+      AliyunDNS.signature(secret: "testsecret", params: signParams) == "uRpHwaSEt3J+6KQD//svCh/x+pI=")
+check("时间戳是 UTC 的 ISO8601",
+      AliyunDNS.timestamp(Date(timeIntervalSince1970: 0)) == "1970-01-01T00:00:00Z")
+
+print("== 域名解析：响应解析与本地校验 ==")
+let dnsDomainsJSON = Data(#"{"TotalCount":1,"Domains":{"Domain":[{"DomainName":"example.com","DomainId":"123","RecordCount":7,"VersionName":"免费版"}]}}"#.utf8)
+let dnsDomainsObject = (try? JSONSerialization.jsonObject(with: dnsDomainsJSON)) as? [String: Any] ?? [:]
+let dnsDomains = AliyunDNS.parseDomains(dnsDomainsObject)
+check("解析域名列表", dnsDomains.first?.name == "example.com")
+check("域名带记录条数与版本名",
+      dnsDomains.first?.recordCount == 7 && dnsDomains.first?.versionName == "免费版")
+
+let dnsRecordsJSON = Data(#"{"TotalCount":2,"DomainRecords":{"Record":[{"RecordId":"1","RR":"www","Type":"A","Value":"1.2.3.4","TTL":600,"Line":"default","Status":"ENABLE"},{"RecordId":"2","RR":"_acme-challenge","Type":"TXT","Value":"token-abc","TTL":"600","Line":"default","Status":"DISABLE"}]}}"#.utf8)
+let dnsRecordsObject = (try? JSONSerialization.jsonObject(with: dnsRecordsJSON)) as? [String: Any] ?? [:]
+let dnsRecords = AliyunDNS.parseRecords(dnsRecordsObject)
+check("解析解析记录", dnsRecords.count == 2)
+check("字符串型的 TTL 也吃得下", dnsRecords.last?.ttl == 600)
+check("DISABLE 算已暂停", dnsRecords.last?.enabled == false)
+check("ENABLE 的记录带出类型与值",
+      dnsRecords.first?.type == "A" && dnsRecords.first?.value == "1.2.3.4")
+check("fqdn 把 @ 还原成主域名",
+      DNSRecord(recordId: "1", domainName: "example.com", rr: "@").fqdn == "example.com"
+      && DNSRecord(recordId: "1", domainName: "example.com", rr: "ww").fqdn == "ww.example.com")
+// 只给了单个对象（不是数组）也要认
+let singleRecordJSON = Data(#"{"DomainRecords":{"Record":{"RecordId":"9","RR":"a","Type":"A","Value":"1.1.1.1"}}}"#.utf8)
+let singleRecordObject = (try? JSONSerialization.jsonObject(with: singleRecordJSON)) as? [String: Any] ?? [:]
+check("只有一条记录（对象而非数组）也能解析",
+      AliyunDNS.parseRecords(singleRecordObject).first?.recordId == "9")
+
+let dnsService = DNSService(settings: DNSSettings())
+check("A 记录必须是 IPv4",
+      dnsService.validate(rr: "www", type: "A", value: "not-an-ip", priority: "") != nil)
+check("A 记录的合法值通过",
+      dnsService.validate(rr: "www", type: "A", value: "1.2.3.4", priority: "") == nil)
+check("A 记录拒绝越界的 IPv4",
+      dnsService.validate(rr: "www", type: "A", value: "1.2.3.999", priority: "") != nil)
+check("主机记录不能为空",
+      dnsService.validate(rr: "   ", type: "A", value: "1.2.3.4", priority: "") != nil)
+check("主机记录不许写全域名（只填最左边一段）",
+      dnsService.validate(rr: "www.example.com", type: "A", value: "1.2.3.4", priority: "") != nil)
+check("下划线开头的验证记录放行",
+      dnsService.validate(rr: "_acme-challenge", type: "TXT", value: "token", priority: "") == nil)
+check("MX 必须填优先级",
+      dnsService.validate(rr: "@", type: "MX", value: "mail.example.com", priority: "") != nil)
+check("MX 优先级合法就通过",
+      dnsService.validate(rr: "@", type: "MX", value: "mail.example.com", priority: "10") == nil)
+check("MX 优先级越界也拦住",
+      dnsService.validate(rr: "@", type: "MX", value: "mail.example.com", priority: "99") != nil)
+check("TXT 的值可以是任意文本",
+      dnsService.validate(rr: "_acme-challenge", type: "TXT", value: "任意 token", priority: "") == nil)
+
+check("只在 MX / SRV 上要优先级",
+      DNSRecordTypes.needsPriority("MX") && DNSRecordTypes.needsPriority("SRV")
+      && !DNSRecordTypes.needsPriority("A"))
+
+check("签名错误的提示点出 Secret",
+      AliyunDNS.describeError(code: "SignatureDoesNotMatch", message: "x").contains("Secret"))
+check("权限错误提示挂 DNS 策略",
+      AliyunDNS.describeError(code: "Forbidden.RAM", message: "x").contains("AliyunDNSFullAccess"))
+let unknownError = AliyunDNS.describeError(code: "SomethingBrandNew", message: "原始细节")
+check("认不出的错误码连原始信息一起带上",
+      unknownError.contains("SomethingBrandNew") && unknownError.contains("原始细节"))
+
+print("== 服务器管理：旧设置合并成「配置」 ==")
+// 很老的版本把阿里云 Key 存在 acme 下（那时它只给证书的 DNS-01 用）
+let legacyACMEKey = Data(#"{"acme":{"email":"a@b.c","aliKey":"LTAIold","aliSecret":"secretold"}}"#.utf8)
+let acmeMigrated = try? JSONDecoder().decode(AppSettings.self, from: legacyACMEKey)
+check("证书页的老 AccessKey 进入配置的阿里云账号",
+      acmeMigrated?.dns.aliKey == "LTAIold" && acmeMigrated?.dns.aliSecret == "secretold")
+check("搬家不影响证书页其它字段", acmeMigrated?.acme.email == "a@b.c")
+check("acme 里已经删掉的字段不再出现（解码不再报错）",
+      acmeMigrated?.acme.bin == "" && acmeMigrated?.acme.keylength == "ec-256")
+
+// 旧版多账号 → 每个阿里云账号一份配置（旧设置里的 bt / 宝塔字段直接忽略）
+let legacyMulti = Data(#"""
+{"dns":{"credentials":[{"id":"d1","name":"金口译言","aliKey":"LTAI-jk","aliSecret":"s-jk"},{"id":"d2","name":"其他","aliKey":"LTAI-other","aliSecret":"s-other"}]},
+ "bt":{"panels":[{"id":"p1","name":"金口译言","baseURL":"https://jk","apiKey":"k-jk"}],"selectedPanelID":"p1"},
+ "acme":{"email":"ops@example.com"}}
+"""#.utf8)
+let migrated = try? JSONDecoder().decode(AppSettings.self, from: legacyMulti)
+check("旧版多账号 → 每个账号一份配置",
+      migrated?.opsProfiles.count == 2
+      && migrated?.opsProfiles.first?.dns.aliKey == "LTAI-jk"
+      && migrated?.opsProfiles.last?.dns.aliKey == "LTAI-other",
+      "\(migrated?.opsProfiles.map { $0.dns.aliKey } ?? [])")
+check("账号名沿用为配置名", migrated?.opsProfiles.first?.name == "金口译言",
+      migrated?.opsProfiles.first?.name ?? "nil")
+check("证书设置复制到每份配置",
+      migrated?.opsProfiles.allSatisfy { $0.acme.email == "ops@example.com" } == true)
+check("迁移后选中的配置一定存在",
+      migrated.map { profiles in
+          profiles.opsProfiles.contains(where: { $0.id == profiles.selectedOpsProfileID })
+      } == true)
+
+// 老的单账号也能读进来
+let legacySingle = Data(#"{"dns":{"aliKey":"old-dns","aliSecret":"old-secret"},"bt":{"baseURL":"https://old-panel","apiKey":"old-api","allowInsecure":false}}"#.utf8)
+let single = try? JSONDecoder().decode(AppSettings.self, from: legacySingle)
+check("旧单账号进入默认配置",
+      single?.dns.aliKey == "old-dns" && single?.dns.aliSecret == "old-secret")
+
+print("== 服务器管理：多配置切换与保存 ==")
+var multi = AppSettings()
+multi.dns.aliKey = "ali-a"
+multi.dns.aliSecret = "sec-a"
+multi.addOpsProfile()
+multi.dns.aliKey = "ali-b"
+multi.dns.aliSecret = "sec-b"
+let encodedMulti = try? JSONEncoder().encode(multi)
+let restoredMulti = encodedMulti.flatMap { try? JSONDecoder().decode(AppSettings.self, from: $0) }
+check("多份配置能往返保存", restoredMulti?.opsProfiles.count == 2)
+check("每份配置各记着自己的账号",
+      restoredMulti?.opsProfiles.first?.dns.aliKey == "ali-a"
+          && restoredMulti?.opsProfiles.last?.dns.aliKey == "ali-b")
+check("激活的配置也存得下来",
+      restoredMulti?.selectedOpsProfileID == restoredMulti?.opsProfiles.last?.id)
+var switched = restoredMulti
+switched?.selectedOpsProfileID = restoredMulti?.opsProfiles.first?.id ?? ""
+check("切配置时域名解析跟着切", switched?.dns.aliKey == "ali-a")
+switched?.selectedOpsProfileID = restoredMulti?.opsProfiles.last?.id ?? ""
+check("切到另一份又换回来", switched?.dns.aliKey == "ali-b")
+switched?.removeSelectedOpsProfile()
+check("删掉当前配置后自动选剩下的",
+      switched?.opsProfiles.count == 1 && switched?.dns.aliKey == "ali-a")
+switched?.removeSelectedOpsProfile()
+check("最后一份配置删不掉", switched?.opsProfiles.count == 1)
+
+// 旧格式里失效的 selectedCredentialID、以及旧 bt（宝塔）段，都不再影响解码
+let incompleteAccounts = Data(#"{"dns":{"credentials":[{"id":"dns-1","aliKey":"partial"}],"selectedCredentialID":"gone"},"bt":{"panels":[{"id":"bt-1","baseURL":"https://panel"}],"selectedPanelID":"gone"}}"#.utf8)
+let incompleteLoaded = try? JSONDecoder().decode(AppSettings.self, from: incompleteAccounts)
+check("缺少可选字段的账号仍可加载", incompleteLoaded?.dns.aliKey == "partial")
+check("旧 bt（宝塔）段被忽略，只按阿里云账号生成配置",
+      incompleteLoaded?.opsProfiles.count == 1)
+
+// MARK: 剪贴板历史
+
+print("== 剪贴板历史：2 MB 裁剪、文本截断与 Redis 固化 ==")
+
+// 单条截断：按 UTF-8 字节切，不会把中文切成半个字
+let clipLong = String(repeating: "剪贴板", count: 200)      // 每个字 3 字节
+let clipClamped = ClipboardHistory.clampText(clipLong, maxBytes: 10)
+check("单条按字节截断", clipClamped.truncated && clipClamped.text.utf8.count <= 10)
+check("截断处不切坏多字节字符", clipClamped.text == String(clipLong.prefix(3)))
+check("没超上限就不动它", ClipboardHistory.clampText("短文本", maxBytes: 100).text == "短文本")
+
+// 2 MB 上限：条目按「最新在前」，超了从最旧的开始丢
+var clipEntries: [ClipboardEntry] = []
+for index in 0..<60 {
+    clipEntries.append(ClipboardEntry(text: String(repeating: "x", count: 40000) + "#\(index)",
+                                      createdAt: Date().addingTimeInterval(Double(-index))))
+}
+let clipFitted = ClipboardHistory.fit(clipEntries, maxBytes: 1_000_000)
+check("超出上限时丢最旧的", clipFitted.count < clipEntries.count
+      && clipFitted.first?.id == clipEntries.first?.id, "保留 \(clipFitted.count) 条")
+check("裁剪后编码不超过上限",
+      ClipboardHistory.encode(clipFitted).utf8.count <= 1_000_000,
+      "\(ClipboardHistory.encode(clipFitted).utf8.count) 字节")
+check("被丢掉的是末尾那几条", !clipFitted.contains { $0.id == clipEntries.last?.id })
+check("默认上限就是 2 MB", ClipboardHistory.maxFileBytes == 2 * 1024 * 1024)
+
+// 去重与顺序
+let clipOlder = ClipboardEntry(text: "重复内容", createdAt: Date(timeIntervalSince1970: 100))
+let clipNewer = ClipboardEntry(text: "重复内容", createdAt: Date(timeIntervalSince1970: 200))
+let clipOther = ClipboardEntry(text: "别的", createdAt: Date(timeIntervalSince1970: 150))
+let clipMerged = ClipboardHistory.merge([[clipOlder, clipOther], [clipNewer]])
+check("同一段文本只留最新的那条", clipMerged.first?.id == clipNewer.id)
+check("合并后按时间倒序", clipMerged.map(\.text) == ["重复内容", "别的"])
+let clipAdded = ClipboardHistory.add("  hello  ", to: [ClipboardEntry(text: "hello", createdAt: clipOlder.createdAt)])
+check("重复内容顶到最前且不重复", clipAdded.count == 1 && clipAdded.first?.text == "hello")
+check("纯空白不记", ClipboardHistory.add("  \n\t ", to: []) == [])
+
+// 编解码与文件
+let clipRoundTrip = ClipboardHistory.decode(ClipboardHistory.encode(Array(clipEntries.prefix(3))))
+check("编码解码能往返", clipRoundTrip.count == 3 && clipRoundTrip.first?.text == clipEntries.first?.text)
+let clipDelta = abs((clipRoundTrip.first?.createdAt.timeIntervalSince1970 ?? 0)
+                    - (clipEntries.first?.createdAt.timeIntervalSince1970 ?? 0))
+check("时间戳精度到毫秒", clipDelta < 0.001, "\(clipDelta)")
+check("被截断/改成一行一条的文件也能救回来",
+      ClipboardHistory.decode("{\"text\":\"a\"}\n{\"text\":\"b\"}").count == 2)
+check("空文件读出空历史", ClipboardHistory.decode("").isEmpty)
+
+let clipPath = workRoot + "/clipboard.json"
+try? Data(ClipboardHistory.encode(Array(clipEntries.prefix(5))).utf8).write(to: URL(fileURLWithPath: clipPath))
+check("从固化文件读回 5 条", ClipboardHistory.readFile(clipPath).count == 5)
+
+// Redis：读写往返（读得快的那一层），以及「Redis 挂了只用文件」的兜底
+// 前面的假服务器在中途就 stop 掉了（它还要验证「停止后端口关闭」），这里另起一个。
+let clipFake = FakeRedisServer(port: 0)
+do {
+    try clipFake.start()
+} catch {
+    print("无法启动剪贴板用例的假 Redis：\(error.localizedDescription)")
+    exit(2)
+}
+let clipPort = clipFake.boundPort
+Thread.sleep(forTimeInterval: 0.3)
+let clipTarget = ClipboardRedisTarget(host: "127.0.0.1", port: clipPort, password: "")
+let clipRedisEntries = Array(clipEntries.prefix(5))
+let clipWriteNote = ClipboardHistory.writeRedis(clipTarget, entries: clipRedisEntries)
+check("整份历史写进 Redis", clipWriteNote.contains("已同步"), clipWriteNote)
+let clipFromRedis = ClipboardHistory.readRedis(clipTarget)
+check("从 Redis 读回（读得快就是读它）",
+      clipFromRedis?.count == 5 && clipFromRedis?.first?.id == clipRedisEntries.first?.id)
+let clipLoad = ClipboardHistory.load(filePath: clipPath, redis: clipTarget)
+check("载入时文件与 Redis 合并去重", clipLoad.entries.count == 5, clipLoad.note)
+let clipOffline = ClipboardHistory.load(filePath: clipPath,
+                                       redis: ClipboardRedisTarget(host: "127.0.0.1", port: 1, password: ""))
+check("Redis 连不上时只用本地文件", clipOffline.entries.count == 5 && clipOffline.note.contains("读不到"))
+check("没有历史时也能干净往返",
+      ClipboardHistory.writeRedis(clipTarget, entries: []).contains("已同步")
+      && ClipboardHistory.readRedis(clipTarget)?.isEmpty == true)
+clipFake.stop()
+
+// 设置项：旧配置文件（没有这两个键）要能读出来
+let clipLegacy = Data(#"{"mongo":{"port":27017}}"#.utf8)
+let clipLegacyLoaded = try? JSONDecoder().decode(AppSettings.self, from: clipLegacy)
+check("旧设置文件默认开启剪贴板记录", clipLegacyLoaded?.clipboard.enabled == true)
+check("旧设置文件默认不自动启动服务",
+      clipLegacyLoaded?.startup.autoStartMongo == false && clipLegacyLoaded?.startup.autoStartRedis == false)
+check("开关能往返保存", {
+    var settings = AppSettings()
+    settings.clipboard.enabled = false
+    settings.startup.autoStartRedis = true
+    guard let data = try? JSONEncoder().encode(settings),
+          let restored = try? JSONDecoder().decode(AppSettings.self, from: data) else { return false }
+    return restored.clipboard.enabled == false && restored.startup.autoStartRedis
+        && restored.startup.autoStartMongo == false
+}())
 
 print("")
 print(failures == 0 ? "全部通过：\(checks) 项" : "失败 \(failures)/\(checks) 项")

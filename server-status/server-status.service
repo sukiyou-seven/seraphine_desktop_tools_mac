@@ -1,0 +1,20 @@
+[Unit]
+Description=Seraphim server management API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/www/seraphim/server
+ExecStart=/www/seraphim/server/sera serve -listen 0.0.0.0:27520 -dir /www/seraphim/server/config -files-root /
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+UMask=0077
+StandardOutput=append:/www/seraphim/logs/sera.log
+StandardError=append:/www/seraphim/logs/sera.log
+
+[Install]
+WantedBy=multi-user.target

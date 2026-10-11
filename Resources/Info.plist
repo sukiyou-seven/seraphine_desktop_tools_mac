@@ -3,13 +3,20 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>DBManager</string>
+    <string>Seraphim</string>
     <key>CFBundleDisplayName</key>
-    <string>DBManager</string>
+    <string>Seraphim</string>
     <key>CFBundleExecutable</key>
-    <string>DBManager</string>
+    <string>sera</string>
     <key>CFBundleIdentifier</key>
     <string>local.dbmanager.app</string>
+    <!-- The server API accepts arbitrary user configured HTTPS hosts. URLSession still enforces
+         HTTPS and either a matching certificate fingerprint or macOS system trust. -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+    </dict>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundlePackageType</key>
@@ -29,6 +36,6 @@
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.developer-tools</string>
     <key>NSHumanReadableCopyright</key>
-    <string>本地小工具，仅监听本机数据库进程</string>
+    <string>Seraphim 服务器与本地服务管理工具</string>
 </dict>
 </plist>

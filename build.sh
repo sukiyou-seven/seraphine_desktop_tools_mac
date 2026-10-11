@@ -1,10 +1,10 @@
 #!/bin/bash
-# 编译 DBManager.app —— 双击 build/DBManager.app 即可运行
+# 编译 Seraphim.app —— 双击 build/Seraphim.app 即可运行
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BUILD="$ROOT/build"
-APP="$BUILD/DBManager.app"
+APP="$BUILD/Seraphim.app"
 
 export TMPDIR="$BUILD/tmp"
 mkdir -p "$TMPDIR" "$BUILD/mc"
@@ -21,10 +21,10 @@ echo "==> 编译 Swift 源码（$(echo "$SOURCES" | wc -l | tr -d ' ') 个文件
 # shellcheck disable=SC2086
 swiftc -O \
   -target "$ARCH-apple-macos13.0" \
-  -module-name DBManager \
+  -module-name Seraphim \
   -Xfrontend -disable-sandbox \
   -module-cache-path "$BUILD/mc" \
-  -o "$APP/Contents/MacOS/DBManager" \
+  -o "$APP/Contents/MacOS/sera" \
   $SOURCES
 
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
@@ -32,6 +32,16 @@ if [ -f "$ROOT/Resources/AppIcon.icns" ]; then
   cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
   echo "    已内置图标 AppIcon.icns"
 fi
+
+echo "==> 编译内置 Linux 服务端安装文件（amd64 / arm64）"
+if ! command -v go >/dev/null 2>&1; then
+  echo "错误：需要 Go 1.25 或更高版本来编译服务端安装文件" >&2
+  exit 1
+fi
+for SERVER_ARCH in amd64 arm64; do
+  (cd "$ROOT/server-status" && CGO_ENABLED=0 GOOS=linux GOARCH="$SERVER_ARCH" \
+    go build -trimpath -ldflags='-s -w' -o "$APP/Contents/Resources/sera-linux-$SERVER_ARCH" .)
+done
 
 echo "==> ad-hoc 签名"
 if codesign --force --sign - "$APP" 2>/dev/null; then

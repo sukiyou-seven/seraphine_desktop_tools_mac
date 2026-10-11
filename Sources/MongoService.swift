@@ -127,7 +127,7 @@ final class MongoService: @unchecked Sendable {
 
     func configText() -> String {
         let (path, generated) = ensureConf()
-        let header = "# 文件：\(path)\(generated ? "（由 DBManager 生成）" : "")\n"
+        let header = "# 文件：\(path)\(generated ? "（由 Seraphim 生成）" : "")\n"
         return header + FileTools.read(path)
     }
 

@@ -2,15 +2,13 @@ import Foundation
 
 // MARK: - 设置与数据结构
 
-struct ACMESettings: Codable {
+struct ACMESettings: Codable, Equatable {
     var bin = ""              // acme.sh 路径（留空自动探测）
     var email = ""            // 账户邮箱（到期提醒）
-    var aliKey = ""           // 阿里云 AccessKey ID
-    var aliSecret = ""        // 阿里云 AccessKey Secret
     var keylength = "ec-256"  // ec-256（ECC）或 2048（RSA）
-    var reloadCmd = ""        // 部署证书后要执行的命令（可选，例如重启 nginx）
-    var icloudBackup = false  // 申请/续期成功后自动备份到 iCloud Drive
-    var icloudSubdir = "DBManager/certs"
+
+    // 阿里云 AccessKey 曾经存在这里（aliKey / aliSecret），现在归 DNSSettings 管：
+    // SettingsStore.load() 会把老配置一次性搬过去，所以这里不再保留这两个字段。
 
     init() {}
 
@@ -18,12 +16,7 @@ struct ACMESettings: Codable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         bin = try container.decodeIfPresent(String.self, forKey: .bin) ?? bin
         email = try container.decodeIfPresent(String.self, forKey: .email) ?? email
-        aliKey = try container.decodeIfPresent(String.self, forKey: .aliKey) ?? aliKey
-        aliSecret = try container.decodeIfPresent(String.self, forKey: .aliSecret) ?? aliSecret
         keylength = try container.decodeIfPresent(String.self, forKey: .keylength) ?? keylength
-        reloadCmd = try container.decodeIfPresent(String.self, forKey: .reloadCmd) ?? reloadCmd
-        icloudBackup = try container.decodeIfPresent(Bool.self, forKey: .icloudBackup) ?? icloudBackup
-        icloudSubdir = try container.decodeIfPresent(String.self, forKey: .icloudSubdir) ?? icloudSubdir
     }
 }
 
@@ -167,17 +160,19 @@ final class ACMEService: @unchecked Sendable {
     }
 
     /// 阿里云 DNS 自动验证（DNS-01）：acme.sh 自动写 TXT 记录、验证、再删掉。
-    func issueWithAliyun(domains: [String], email: String) -> ActionResult {
+    /// 凭据来自「域名解析」页那份统一配置（不再用证书页自己的字段）。
+    func issueWithAliyun(domains: [String], email: String,
+                         accessKey: String, accessSecret: String) -> ActionResult {
         guard let bin else {
             return .failure("找不到 acme.sh。可以点上面的「安装 acme.sh」，或在「设置」里指定路径。")
         }
         let list = normalizedDomains(domains)
         guard !list.isEmpty else { return .failure("至少要填一个域名") }
-        let key = settings.aliKey.trimmingCharacters(in: .whitespaces)
-        let secret = settings.aliSecret.trimmingCharacters(in: .whitespaces)
+        let key = accessKey.trimmingCharacters(in: .whitespaces)
+        let secret = accessSecret.trimmingCharacters(in: .whitespaces)
         guard !key.isEmpty, !secret.isEmpty else {
-            return .failure("阿里云方式需要 AccessKey ID 和 AccessKey Secret"
-                            + "（阿里云控制台 → RAM 访问控制 → 创建 AccessKey）")
+            return .failure("阿里云方式需要 AccessKey —— 在「域名解析」页里填一次，"
+                            + "这里和那边共用同一份凭据。")
         }
 
         var args = baseArgs(list, email: email)
@@ -296,14 +291,15 @@ final class ACMEService: @unchecked Sendable {
         return result
     }
 
-    func renew(domain: String) -> ActionResult {
+    func renew(domain: String, accessKey: String = "", accessSecret: String = "") -> ActionResult {
         guard let bin else { return .failure("找不到 acme.sh") }
         let name = domain.trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty else { return .failure("域名不能为空") }
 
+        // 续期时如果 acme.sh 需要重新做 DNS-01，它得能自己写 TXT 记录，所以凭据一并带上
         var env: [String: String] = [:]
-        let key = settings.aliKey.trimmingCharacters(in: .whitespaces)
-        let secret = settings.aliSecret.trimmingCharacters(in: .whitespaces)
+        let key = accessKey.trimmingCharacters(in: .whitespaces)
+        let secret = accessSecret.trimmingCharacters(in: .whitespaces)
         if !key.isEmpty, !secret.isEmpty {
             env = ["Ali_Key": key, "Ali_Secret": secret, "Ali_Region": "cn-hangzhou"]
         }
@@ -315,84 +311,6 @@ final class ACMEService: @unchecked Sendable {
             return .failure("续期失败：\(result.message)", detail: String(result.stdout.suffix(700)))
         }
         return ActionResult(ok: true, message: "\(name) 已续期", detail: String(result.stdout.suffix(400)))
-    }
-
-    /// 把证书复制到指定位置（给 Nginx 等用），可选执行重载命令。
-    func installCert(domain: String, keyPath: String, fullchainPath: String) -> ActionResult {
-        guard let bin else { return .failure("找不到 acme.sh") }
-        let name = domain.trimmingCharacters(in: .whitespaces)
-        let key = keyPath.trimmingCharacters(in: .whitespaces)
-        let full = fullchainPath.trimmingCharacters(in: .whitespaces)
-        guard !name.isEmpty else { return .failure("域名不能为空") }
-        guard !key.isEmpty, !full.isEmpty else { return .failure("key 和 fullchain 的目标路径都要填") }
-
-        Paths.ensureDirectory(forFile: key)
-        Paths.ensureDirectory(forFile: full)
-
-        var args = [bin, "--install-cert", "-d", name, "--key-file", key, "--fullchain-file", full]
-        let reload = settings.reloadCmd.trimmingCharacters(in: .whitespaces)
-        if !reload.isEmpty { args += ["--reloadcmd", reload] }
-
-        let result = Shell.run(args, timeout: 120)
-        guard result.ok else {
-            return .failure("部署证书失败：\(result.message)", detail: String(result.stdout.suffix(500)))
-        }
-        return ActionResult(ok: true, message: "证书已复制到指定位置",
-                            detail: "key：\(key)\nfullchain：\(full)"
-                                  + (reload.isEmpty ? "" : "\n重载命令：\(reload)"))
-    }
-
-    // MARK: iCloud Drive 备份
-
-    /// iCloud Drive 的 CloudDocs 目录（系统里「iCloud 云盘」打开才有）
-    static var iCloudDrivePath: String? {
-        let path = NSHomeDirectory() + "/Library/Mobile Documents/com~apple~CloudDocs"
-        return FileTools.isDirectory(path) ? path : nil
-    }
-
-    /// iCloud 里放某域名证书的目录（纯函数，方便测试）
-    static func iCloudCertDirectory(base: String, subdir: String, domain: String) -> String {
-        let folder = subdir.trimmingCharacters(in: .whitespaces)
-        let useFolder = folder.isEmpty ? "DBManager/certs" : folder
-        return "\(base)/\(useFolder)/\(domain.trimmingCharacters(in: .whitespaces))"
-    }
-
-    /// 把证书备份到 iCloud Drive。
-    /// 走 `--install-cert`：acme.sh 会记住这个目标，**以后每次续期（含自动续期）都会自动重新复制**，
-    /// 所以「备份一次」等于「永久同步」。
-    func exportToICloud(domain: String, subdir: String) -> ActionResult {
-        guard let bin else { return .failure("找不到 acme.sh") }
-        let name = domain.trimmingCharacters(in: .whitespaces)
-        guard !name.isEmpty else { return .failure("域名不能为空") }
-        guard let base = Self.iCloudDrivePath else {
-            return .failure("没有找到 iCloud Drive 目录",
-                            detail: "请在「系统设置 → Apple 账户 → iCloud」里打开「iCloud 云盘」。")
-        }
-
-        let dir = Self.iCloudCertDirectory(base: base, subdir: subdir, domain: name)
-        do {
-            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        } catch {
-            return .failure("创建 iCloud 目录失败：\(error.localizedDescription)")
-        }
-
-        let keyPath = "\(dir)/privkey.pem"
-        let fullchainPath = "\(dir)/fullchain.pem"
-        var args = [bin, "--install-cert", "-d", name,
-                    "--key-file", keyPath, "--fullchain-file", fullchainPath]
-        let reload = settings.reloadCmd.trimmingCharacters(in: .whitespaces)
-        if !reload.isEmpty { args += ["--reloadcmd", reload] }
-
-        Diag.log("备份证书到 iCloud：\(name) → \(dir)")
-        let result = Shell.run(args, timeout: 120)
-        guard result.ok else {
-            return .failure("备份到 iCloud 失败：\(result.message)", detail: String(result.stdout.suffix(500)))
-        }
-        return ActionResult(ok: true,
-                            message: "证书已备份到 iCloud Drive",
-                            detail: "目录：\(dir)\n  privkey.pem —— 私钥\n  fullchain.pem —— 证书链\n\n"
-                                  + "acme.sh 已记住这个目标，以后续期（包括自动续期）会同步更新。\n"
-                                  + "⚠️ 私钥会随 iCloud 同步到你所有设备，请确保 Apple 账户已开双重认证。")
     }
 
     /// 让 acme.sh 装好自动续期的定时任务（幂等）

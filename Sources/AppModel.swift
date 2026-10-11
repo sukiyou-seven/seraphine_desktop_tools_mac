@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import AppKit
 
 struct ParamRow: Identifiable {
     var id: String
@@ -60,16 +61,15 @@ final class AppModel: ObservableObject {
     @Published var settings: AppSettings
     @Published var tab: String = "mongo"
     @Published var busy: String?
-    @Published var toast: Toast?
+    @Published var toast: Toast? {
+        didSet {
+            // 顺手发一条**系统级通知**（右上角横幅）；没授权就只留界面里的 toast
+            if let toast {
+                SystemNotice.post(title: toast.ok ? "完成" : "出错了", body: toast.text)
+            }
+        }
+    }
     @Published var settingsMessage = ""
-
-    // 网络代理（IKEv2 VPN）
-    @Published var vpnProbe: VPNProbe?
-    @Published var vpnStatus = VPNStatus()
-    @Published var vpnLog = ""
-    @Published var vpnInstallDone = false
-    /// 本机已取回的描述文件路径
-    @Published var vpnLocalProfile = ""
 
     // MongoDB
     @Published var mongoStatus = MongoStatus()
@@ -126,8 +126,15 @@ final class AppModel: ObservableObject {
     private var redis: RedisService
     private var mysql: MySQLService
     private var acme: ACMEService
-    private var bt: BTPanelService
-    private var vpn: VPNService
+    private var dns: DNSService
+    let projectRunner = ProjectRunner()
+    let pythonEnvironments = PythonEnvironmentManager()
+    /// 顶部「刘海」小组件（窗口 + 展开状态）。图标列表存在 `settings.docklet` 里。
+    let docklet = DockletController()
+    /// 剪贴板历史（轮询系统剪贴板 → 内存 + Redis + 本地文件，只记文本）。
+    let clipboard = ClipboardService()
+    /// 「AI 开发」的看门狗（跑在后台线程，状态经 onChange 回到主线程）
+    private let aiRunner = AIDevRunner()
 
     init() {
         Diag.log("AppModel 初始化")
@@ -137,8 +144,28 @@ final class AppModel: ObservableObject {
         redis = RedisService(settings: loaded.redis)
         mysql = MySQLService(settings: loaded.mysql)
         acme = ACMEService(settings: loaded.acme)
-        bt = BTPanelService(settings: loaded.bt)
-        vpn = VPNService(settings: loaded.vpn)
+        dns = DNSService(settings: loaded.dns)
+        pythonEnvironments.refresh(projectRoots: projectRunner.roots)
+        // 剪贴板历史：Redis 连接参数每次现取（设置里改了端口/密码立刻生效）。
+        clipboard.redisTarget = { [weak self] in self?.clipboardRedisTarget }
+        clipboard.start(recording: loaded.clipboard.enabled)
+        aiRunner.onChange = { [weak self] snapshot in
+            self?.aiDev = snapshot
+            if !snapshot.running, !snapshot.message.isEmpty {
+                self?.aiDevMessage = snapshot.message
+            }
+        }
+        // 「仅 App 内运行」的看门狗：App 一退出就把 codex 子进程收掉，
+        // 否则会留下一个没人管的进程在后台继续跑。
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            // 回调队列就是主队列，但编译器不知道，这里直接声明主 actor 上下文
+            MainActor.assumeIsolated {
+                self?.aiStopTask()
+                self?.projectRunner.stopAll()
+                self?.pythonEnvironments.stop()
+            }
+        }
     }
 
     // MARK: 服务与设置
@@ -148,8 +175,7 @@ final class AppModel: ObservableObject {
         redis = RedisService(settings: settings.redis)
         mysql = MySQLService(settings: settings.mysql)
         acme = ACMEService(settings: settings.acme)
-        bt = BTPanelService(settings: settings.bt)
-        vpn = VPNService(settings: settings.vpn)
+        dns = DNSService(settings: settings.dns)
     }
 
     func applySettings() {
@@ -167,7 +193,112 @@ final class AppModel: ObservableObject {
         refreshAll()
     }
 
+    /// 只落盘：开关类的小改动用它，别顺手把服务重建、状态刷新那一大串也带着跑。
+    func persistSettings() {
+        SettingsStore.save(settings)
+    }
+
     var discoveredRows: [(String, String)] { Discovered.summary }
+
+    // MARK: 打开软件后的自动启动
+
+    private var didAutoStart = false
+
+    /// 「打开本软件后自动启动」：按设置里的勾选，把 MongoDB / Redis 拉起来。
+    ///
+    /// 刻意不做系统级开机自启（不写 LaunchAgent）—— 只在 App 启动后跑一次，用本工具自己的启动逻辑，
+    /// 所以「页面里点启动」和「自动启动」走的是同一条路（同一份配置、同一套失败提示）。
+    func autoStartServicesIfNeeded() {
+        guard !didAutoStart else { return }
+        didAutoStart = true
+        if settings.startup.autoStartMongo { autoStart(mongo: true) }
+        if settings.startup.autoStartRedis { autoStart(mongo: false) }
+    }
+
+    /// 先探一次状态：已经在跑就不动它（不重启、不报错），没在跑才启动。
+    private func autoStart(mongo isMongo: Bool) {
+        Diag.log("自动启动：\(isMongo ? "MongoDB" : "Redis")（「设置」页的开关）")
+        if isMongo {
+            let service = mongo
+            DispatchQueue.global(qos: .userInitiated).async {
+                let status = service.status()
+                let auth = service.authorizationEnabled
+                DispatchQueue.main.async {
+                    self.mongoStatus = status
+                    self.mongoAuthEnabled = auth
+                    guard !status.running else {
+                        Diag.log("自动启动：MongoDB 已在运行，跳过")
+                        self.loadMongoDatabases()
+                        return
+                    }
+                    guard status.installed else {
+                        self.toast = Toast(text: "自动启动 MongoDB 失败：找不到 mongod", ok: false,
+                                           detail: "在「设置」里指定 mongod 路径，或先 brew install mongodb-community。")
+                        return
+                    }
+                    self.perform("正在自动启动 MongoDB…") { service.start() } after: {
+                        self.refreshMongoStatus()
+                    }
+                }
+            }
+            return
+        }
+        let service = redis
+        DispatchQueue.global(qos: .userInitiated).async {
+            let status = service.status()
+            DispatchQueue.main.async {
+                self.redisStatus = status
+                guard !status.running else {
+                    Diag.log("自动启动：Redis 已在运行，跳过")
+                    self.scanRedis(reset: true)
+                    self.loadRedisOverview()
+                    return
+                }
+                guard status.installed else {
+                    self.toast = Toast(text: "自动启动 Redis 失败：找不到 redis-server", ok: false,
+                                       detail: "在「设置」里指定路径，或先 brew install redis。")
+                    return
+                }
+                self.perform("正在自动启动 Redis…") { service.start() } after: {
+                    self.refreshRedisStatus()
+                }
+            }
+        }
+    }
+
+    /// 剪贴板同步用的 Redis 连接参数（值类型，可以安全地带进后台线程）。
+    var clipboardRedisTarget: ClipboardRedisTarget {
+        ClipboardRedisTarget(host: redis.host, port: redis.port, password: redis.password)
+    }
+
+    /// 剪贴板记录开关（同时落盘）。
+    func setClipboardRecording(_ on: Bool) {
+        settings.clipboard.enabled = on
+        persistSettings()
+        clipboard.setRecording(on)
+    }
+
+    // MARK: 顶部小组件
+
+    /// 往顶部小组件里添加图标：去重、保持添加顺序。面板里点「＋」或拖进来都走这里。
+    func addDockletApps(_ paths: [String]) {
+        var added = 0
+        for path in paths where !settings.docklet.appPaths.contains(path) {
+            settings.docklet.appPaths.append(path)
+            added += 1
+        }
+        guard added > 0 else { return }
+        SettingsStore.save(settings)
+        Diag.log("顶部小组件：新增 \(added) 个图标")
+    }
+
+    /// 从顶部小组件里移除图标（只是不再显示，不碰应用本身）。
+    func removeDockletApp(_ path: String) {
+        guard settings.docklet.appPaths.contains(path) else { return }
+        settings.docklet.appPaths.removeAll { $0 == path }
+        SettingsStore.save(settings)
+        Diag.log("顶部小组件：移除图标 \(path)")
+    }
 
     // MARK: 通用执行包装
 
@@ -1032,9 +1163,6 @@ final class AppModel: ObservableObject {
     @Published var acmeChallenges: [ACMEChallenge] = []
     @Published var acmeCertificates: [ACMECertificate] = []
     @Published var acmeCertError: String?
-    @Published var acmeDeployDomain = ""
-    @Published var acmeDeployKeyPath = ""
-    @Published var acmeDeployFullchainPath = ""
 
     /// 两个安装源都展示给用户（透明）
     var acmeGithubCommand: String { acme.githubInstallCommand }
@@ -1048,7 +1176,7 @@ final class AppModel: ObservableObject {
             .filter { !$0.isEmpty }
     }
 
-    /// 把界面上的输入（邮箱 / 阿里云凭据 / 重载命令）落盘，并让服务拿到最新配置
+    /// 把界面上的输入（邮箱 / 阿里云凭据）落盘，并让服务拿到最新配置
     private func syncACMESettings() {
         SettingsStore.save(settings)
         rebuildServices()
@@ -1074,6 +1202,9 @@ final class AppModel: ObservableObject {
         let service = acme
         let domains = acmeDomainList
         let email = settings.acme.email
+        // 凭据统一从「域名解析」那份配置里拿（先在主线程取出来，闭包跑在后台）
+        let accessKey = settings.dns.aliKey
+        let accessSecret = settings.dns.aliSecret
         guard !domains.isEmpty else {
             toast = Toast(text: "请先填域名", ok: false)
             return
@@ -1083,7 +1214,8 @@ final class AppModel: ObservableObject {
             return
         }
         perform("正在申请证书（DNS 自动验证，可能要 1 分钟）…") {
-            service.issueWithAliyun(domains: domains, email: email)
+            service.issueWithAliyun(domains: domains, email: email,
+                                    accessKey: accessKey, accessSecret: accessSecret)
         } after: {
             self.loadCertificates()
         }
@@ -1145,19 +1277,12 @@ final class AppModel: ObservableObject {
     func renewCertificate(_ domain: String) {
         syncACMESettings()
         let service = acme
-        perform("正在续期 \(domain)…") { service.renew(domain: domain) } after: {
+        let accessKey = settings.dns.aliKey
+        let accessSecret = settings.dns.aliSecret
+        perform("正在续期 \(domain)…") {
+            service.renew(domain: domain, accessKey: accessKey, accessSecret: accessSecret)
+        } after: {
             self.loadCertificates()
-        }
-    }
-
-    func deployCertificate() {
-        syncACMESettings()
-        let service = acme
-        let domain = acmeDeployDomain
-        let keyPath = acmeDeployKeyPath
-        let fullchainPath = acmeDeployFullchainPath
-        perform("正在部署证书…") {
-            service.installCert(domain: domain, keyPath: keyPath, fullchainPath: fullchainPath)
         }
     }
 
@@ -1166,581 +1291,693 @@ final class AppModel: ObservableObject {
         perform("正在安装自动续期任务…") { service.installCron() }
     }
 
-    /// 备份单张证书到 iCloud Drive（acme.sh 会记住目标，续期后自动同步）
-    func backupCertificateToICloud(_ domain: String) {
-        syncACMESettings()
-        let service = acme
-        let subdir = settings.acme.icloudSubdir
-        perform("正在备份 \(domain) 到 iCloud…") {
-            service.exportToICloud(domain: domain, subdir: subdir)
-        }
-    }
+    // MARK: 证书域名选择器（从阿里云解析记录里挑）
 
-    /// 把所有已签发的证书备份到 iCloud Drive
-    func backupAllCertificatesToICloud() {
-        syncACMESettings()
-        let service = acme
-        let subdir = settings.acme.icloudSubdir
-        let domains = acmeCertificates.map(\.domain)
-        guard !domains.isEmpty else {
-            toast = Toast(text: "还没有已签发的证书", ok: false)
+    @Published var acmePickerVisible = false
+    @Published var acmePickerDomains: [DNSDomain] = []
+    @Published var acmePickerDomain: String?
+    @Published var acmePickerRecords: [DNSRecord] = []
+    /// 勾中的记录的 RecordId
+    @Published var acmePickerSelected: Set<String> = []
+    @Published var acmePickerError = ""
+
+    /// 打开选择器：先拉域名列表，再自动选中第一个域名
+    func acmeOpenDomainPicker() {
+        acmePickerVisible = true
+        acmePickerSelected = []
+        acmePickerError = ""
+        guard settings.dns.isConfigured else {
+            acmePickerDomains = []
+            acmePickerRecords = []
+            acmePickerError = "先在「域名解析」页配好阿里云 AccessKey，才能从解析记录里选域名。"
             return
         }
-        perform("正在备份 \(domains.count) 张证书到 iCloud…") {
-            var lines: [String] = []
-            var allOK = true
-            for domain in domains {
-                let result = service.exportToICloud(domain: domain, subdir: subdir)
-                allOK = allOK && result.ok
-                lines.append("\(domain)：\(result.ok ? "已备份" : result.message)")
-            }
-            return ActionResult(ok: allOK,
-                                message: allOK ? "\(domains.count) 张证书都已备份到 iCloud Drive"
-                                               : "有证书备份失败，请看详情",
-                                detail: lines.joined(separator: "\n"))
-        } after: {
-            self.loadCertificates()
-        }
-    }
-
-    // MARK: 宝塔面板（API）
-
-    struct BTInfoRow: Identifiable {
-        var id: String { label }
-        var label: String
-        var value: String
-    }
-
-    @Published var btConnected = false
-    @Published var btStatusText = ""
-    @Published var btOverview: [BTInfoRow] = []
-    @Published var btSites: [BTSite] = []
-    @Published var btServices: [BTServiceStatus] = []
-    @Published var btDatabases: [BTDatabase] = []
-    /// 数据库页当前选中的类型（取值见 BTDatabaseType.all）
-    @Published var btDatabaseTypeKey: String = "mongodb"
-    @Published var btLastResponse = ""
-    @Published var btLastResponseOK = true
-    @Published var btDisks: [BTDiskUsage] = []
-    @Published var btResources: [BTResourceUsage] = []
-    @Published var btDeploySite = ""
-    @Published var btDeployDomain = ""
-
-    var btConfigured: Bool { bt.isConfigured }
-
-    /// 面板把请求拦在 IP 白名单之外时，这里能拿到被拦截的出口 IP
-    var btBlockedIP: String? { BTPanelService.blockedIP(from: btLastResponse) }
-
-    /// 面板地址/密钥改了就存盘，并让服务拿到最新配置
-    // MARK: 网络代理（IKEv2 VPN）
-
-    /// 保存 VPN 设置并重建服务
-    private func syncVPNSettings() {
-        settings.vpn.host = settings.vpn.host.trimmingCharacters(in: .whitespaces)
-        settings.vpn.sshUser = settings.vpn.sshUser.trimmingCharacters(in: .whitespaces)
-        SettingsStore.save(settings)
-        rebuildServices()
-    }
-
-    /// 记录 VPN 操作输出（写进界面与日志前一律脱敏）
-    private func recordVPN(_ label: String, _ output: String) {
-        let clean = Shell.redactSecrets(output)
-        vpnLog = "【\(label)】\n" + (clean.isEmpty ? "（无输出）" : clean)
-    }
-
-    /// 测试 SSH 连接并探测服务器环境（系统 / 架构 / 内存 / 是否已装 IKEv2）
-    func vpnProbeServer() {
-        syncVPNSettings()
-        let service = vpn
-        perform("正在连接 \(settings.vpn.host)…") {
-            let (probe, output) = service.probe()
-            self.vpnProbe = probe
-            self.recordVPN("探测服务器", output)
-            guard !probe.osName.isEmpty else {
-                return .failure("SSH 连接失败，请检查地址 / 端口 / 用户名 / 密码",
-                                detail: Shell.redactSecrets(output))
-            }
-            return ActionResult(ok: true,
-                                message: "已连上：\(probe.osName)（\(probe.arch)）",
-                                detail: Shell.redactSecrets(output))
-        }
-    }
-
-    /// 检查 UDP 500/4500 是否真的能到达服务器。
-    /// 这是区分「云安全组没放行」和「服务端配置问题」最快的一步 ——
-    /// 服务器抓不到包就一定是防火墙，不用再折腾服务端。
-    func vpnCheckUDP() {
-        syncVPNSettings()
-        let service = vpn
-        perform("正在验证 UDP 500/4500 连通性…") {
-            let (reachable, detail) = service.checkUDP()
-            self.recordVPN("UDP 连通性", detail)
-            if reachable {
-                return ActionResult(ok: true, message: "UDP 500/4500 通畅", detail: detail)
-            }
-            return .failure("UDP 500/4500 不通", detail: detail)
-        }
-    }
-
-    /// 在服务器上安装 IPsec + IKEv2
-    func vpnInstall() {
-        syncVPNSettings()
-        let service = vpn
-        vpnInstallDone = false
-        perform("正在服务器上启动 IKEv2 安装…") {
-            let result = service.install()
-            self.recordVPN("启动安装", result.detail)
-            return result
-        } after: {
-            // 安装要几分钟，自动轮询进度
-            self.vpnPollInstallProgress(rounds: 40)
-        }
-    }
-
-    /// 轮询安装进度（安装耗时几分钟，所以做成可重复调用的）
-    func vpnPollInstallProgress(rounds: Int) {
-        guard rounds > 0, !vpnInstallDone else { return }
-        let service = vpn
-        perform("正在安装…（剩余尝试 \(rounds) 次）") {
-            let (done, failed, output) = service.installProgress()
-            self.recordVPN("安装进度", output)
-            if done {
-                self.vpnInstallDone = true
-                return ActionResult(ok: true, message: "IKEv2 安装完成，可以取回配置了")
-            }
-            if failed {
-                return .failure("安装过程中出现错误", detail: Shell.redactSecrets(output))
-            }
-            return ActionResult(ok: true, message: "安装进行中…", detail: output)
-        } after: {
-            if self.vpnInstallDone { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
-                self.vpnPollInstallProgress(rounds: rounds - 1)
-            }
-        }
-    }
-
-    /// 从服务器取回描述文件（mobileconfig / p12 / sswan）
-    func vpnFetchProfile() {
-        syncVPNSettings()
-        let service = vpn
-        let directory = Paths.appSupport.appendingPathComponent("vpn").path
-        perform("正在取回描述文件…") {
-            let result = service.fetchProfile(into: directory)
-            self.vpnLocalProfile = result.backupPath
-            self.recordVPN("取回配置", result.detail)
-            return result
-        }
-    }
-
-    /// 打开描述文件 —— 交给系统弹安装向导。
-    /// macOS 27 起描述文件必须由用户点「安装」，命令行装不了（profiles install 已被移除）。
-    func vpnInstallProfile() {
-        guard !vpnLocalProfile.isEmpty, FileTools.exists(vpnLocalProfile) else {
-            toast = Toast(text: "还没有取回描述文件", ok: false, detail: "先点「取回配置」")
-            return
-        }
-        let service = vpn
-        let path = vpnLocalProfile
-        perform("正在打开描述文件…") {
-            service.openProfile(at: path)
-        } after: {
-            self.vpnRefreshStatus()
-        }
-    }
-
-    /// 把描述文件备份到 iCloud Drive（iPhone 直接取）
-    func vpnBackupToICloud() {
-        guard !vpnLocalProfile.isEmpty, FileTools.exists(vpnLocalProfile) else {
-            toast = Toast(text: "还没有取回描述文件", ok: false, detail: "先点「取回配置」")
-            return
-        }
-        let service = vpn
-        let path = vpnLocalProfile
-        perform("正在备份到 iCloud…") {
-            service.backupToICloud(from: path)
-        }
-    }
-
-    /// 刷新本机 VPN 状态（描述文件是否装了、有没有可用服务）
-    func vpnRefreshStatus() {
-        let service = vpn
-        load("正在读取本机 VPN 状态…", { .success(service.status()) },
-             into: { status in
-                 self.vpnStatus = status
-             },
-             onError: { message in
-                 self.toast = Toast(text: "读取 VPN 状态失败", ok: false, detail: message)
-             })
-    }
-
-    /// 连接 / 断开系统 VPN
-    func vpnSetConnected(_ connected: Bool) {
-        let service = vpn
-        perform(connected ? "正在连接 VPN…" : "正在断开 VPN…") {
-            service.setConnected(connected)
-        } after: {
-            self.vpnRefreshStatus()
-        }
-    }
-
-    private func syncBTSettings() {
-        SettingsStore.save(settings)
-        rebuildServices()
-    }
-
-    /// 把面板返回原样记下来（面板版本差异时最有用）
-    private func recordBT(_ result: BTAPIResult, label: String) {
-        // 面板某些接口（如 SSL）会返回私钥明文，展示与记录前统一抹掉
-        let raw = BTPanelService.redactSensitive(result.raw)
-        btLastResponse = "【\(label)】" + (raw.isEmpty ? result.message : "\n" + raw)
-        btLastResponseOK = result.ok
-        Diag.log("宝塔 API \(label)：\(result.ok ? "成功" : "失败")")
-    }
-
-    func testBTConnection() {
-        syncBTSettings()
-        let service = bt
-        load("正在连接宝塔面板…", { .success(service.ping()) },
-             into: { result in
-                 self.btConnected = result.ok
-                 self.btStatusText = result.ok ? "连接成功" : "连接失败：\(result.message)"
-                 self.recordBT(result, label: "测试连接")
-                 if result.ok { self.refreshBTOverview() }
-             },
-             onError: { message in
-                 self.btConnected = false
-                 self.btStatusText = "连接失败"
-                 self.toast = Toast(text: "宝塔面板连接失败", ok: false, detail: message)
-             })
-    }
-
-    func refreshBTOverview() {
-        loadBTResources()
-        let service = bt
-        load("正在读取面板信息…", { .success(service.systemTotal()) },
-             into: { result in
-                 self.recordBT(result, label: "系统信息")
-                 self.btConnected = result.ok
-                 guard let json = result.json else {
-                     self.btStatusText = result.message
-                     return
-                 }
-                 self.btStatusText = "连接成功"
-                 var rows: [BTInfoRow] = []
-                 func field(_ key: String) -> String? {
-                     guard let value = json[key], !(value is NSNull) else { return nil }
-                     let rendered = (value as? String) ?? String(describing: value)
-                     return rendered.isEmpty ? nil : rendered
-                 }
-                 func add(_ label: String, _ key: String, suffix: String = "") {
-                     if let value = field(key) { rows.append(BTInfoRow(label: label, value: value + suffix)) }
-                 }
-                 add("面板版本", "version")
-                 add("操作系统", "system")
-                 add("CPU 核心", "cpuNum")
-                 add("CPU 使用率", "cpuRealUsed", suffix: " %")
-                 // 宝塔 8+ 直接给了可读的内存串（1.8GB / 714.0MB）
-                 if let total = field("memNewTotal"), let used = field("memNewRealUsed") {
-                     rows.append(BTInfoRow(label: "内存占用", value: "\(used) / \(total)"))
+        syncDNSSettings()
+        let service = dns
+        load("正在拉取域名列表…", { service.domains() },
+             into: { domains in
+                 self.acmePickerDomains = domains
+                 // 之前选过的域名还在就刷新它，否则落到第一个
+                 if let current = self.acmePickerDomain,
+                    domains.contains(where: { $0.name == current }) {
+                     self.acmePickDomain(current)
+                 } else if let first = domains.first {
+                     self.acmePickDomain(first.name)
                  } else {
-                     add("内存总量", "memTotal", suffix: " MB")
-                     add("当前内存占用", "memRealUsed", suffix: " MB")
+                     self.acmePickerDomain = nil
+                     self.acmePickerRecords = []
+                     self.acmePickerError = "这个账号下没有域名"
                  }
-                 add("运行时长", "time")
-                 self.btOverview = rows
              },
              onError: { message in
-                 self.btConnected = false
-                 self.btStatusText = message
-                 self.btOverview = []
+                 self.acmePickerDomains = []
+                 self.acmePickerRecords = []
+                 self.acmePickerError = message
              })
     }
 
-    /// 磁盘信息（宝塔各版本返回格式不统一，这里原样展示，避免猜错字段）
-    /// 读取 CPU / 内存与磁盘占用，用于画占用条
-    func loadBTResources() {
-        let service = bt
-        load("正在读取资源占用…", {
-            .success((service.resourceUsage(), service.diskUsage()))
-        }, into: { bundle in
-            self.btResources = bundle.0
-            self.btDisks = bundle.1
-        }, onError: { message in
-            self.btResources = []
-            self.btDisks = []
-            self.toast = Toast(text: "读取资源占用失败", ok: false, detail: message)
-        })
+    func acmePickDomain(_ name: String) {
+        acmePickerDomain = name
+        acmePickerRecords = []
+        acmePickerError = ""
+        let service = dns
+        load("正在读取 \(name) 的解析记录…", { service.records(domain: name) },
+             into: { records in
+                 // `_` 开头的是验证记录（_acme-challenge 之类），不是能给证书用的主机名
+                 self.acmePickerRecords = records.filter { !$0.rr.hasPrefix("_") }
+                 if self.acmePickerRecords.isEmpty {
+                     self.acmePickerError = "\(name) 下没有可用的解析记录（只有验证记录）"
+                 }
+             },
+             onError: { message in
+                 self.acmePickerRecords = []
+                 self.acmePickerError = message
+             })
     }
 
-    /// 把一次动作的结果（已写进 toast）同步到「原始响应」区
-    private func recordBTFromToast(_ label: String) {
-        guard let last = toast else { return }
-        btLastResponse = "【\(label)】\n" + (last.detail.isEmpty ? last.text : last.detail)
-        btLastResponseOK = last.ok
+    func acmeTogglePick(_ record: DNSRecord) {
+        if acmePickerSelected.contains(record.recordId) {
+            acmePickerSelected.remove(record.recordId)
+        } else {
+            acmePickerSelected.insert(record.recordId)
+        }
     }
 
-    func btServiceAction(name: String, type: String) {
-        syncBTSettings()
-        let service = bt
-        let label = "\(btActionLabel(type)) \(name)"
-        perform("正在\(btActionLabel(type)) \(name)…") {
-            let outcome = service.serviceAdmin(name: name, type: type)
-            let raw = outcome.result.raw.isEmpty ? outcome.result.message : outcome.result.raw
-            // 面板对不存在的服务名也回「执行成功」，所以 start/stop 用复查到的真实状态判定
-            var ok = outcome.result.ok
-            var extra = ""
-            if let verified = outcome.verified {
-                if (type == "start") != verified.running {
-                    ok = false
-                    extra = "\n\n⚠️ 复查状态仍是「\(verified.statusLabel)」，操作可能没生效。"
-                } else {
-                    extra = "\n\n复查状态：\(verified.statusLabel)"
-                }
+    /// 勾中的记录换算成域名（`@` 就是主域名本身）
+    var acmePickerPicked: [String] {
+        acmePickerRecords
+            .filter { acmePickerSelected.contains($0.recordId) }
+            .map { $0.fqdn }
+    }
+
+    /// 追加到域名输入框（已有的不重复加，所以可以分几次挑）
+    func acmeConfirmPick() {
+        let picked = acmePickerPicked
+        if !picked.isEmpty {
+            var current = acmeDomainList
+            for domain in picked where !current.contains(domain) {
+                current.append(domain)
             }
-            return ActionResult(ok: ok,
-                                message: ok ? "\(name) \(self.btActionLabel(type))完成"
-                                            : outcome.result.message,
-                                detail: raw + extra)
-        } after: {
-            self.recordBTFromToast(label)
-            self.loadBTServices()
+            acmeDomains = current.joined(separator: ", ")
         }
+        acmeClosePicker()
     }
 
-    func btActionLabel(_ type: String) -> String {
-        switch type {
-        case "start": return "启动"
-        case "stop": return "停止"
-        case "restart": return "重启"
-        case "reload": return "重载"
-        default: return type
-        }
+    func acmeClosePicker() {
+        acmePickerVisible = false
+        acmePickerSelected = []
     }
 
-    func loadBTSites() {
-        let service = bt
-        load("正在读取网站列表…", { .success(service.sitesWithRealStatus()) },
-             into: { sites in
-                 self.btSites = sites
-                 self.btLastResponse = "【网站列表】\n" + sites.map {
-                     "\($0.name) [\($0.statusLabel)] \($0.typeLabel)"
-                 }.joined(separator: "\n")
-                 self.btLastResponseOK = true
+    // MARK: 服务器运维配置（域名解析 / 证书 / 宝塔面板共用）
+
+    /// 切到另一份配置：三页的数据一起换（服务重建 + 运行时状态清空）。
+    func opsProfileChanged() {
+        persistSettings()
+        rebuildServices()
+        // 上一套配置的数据不该留在界面上
+        dnsState = DNSState()
+        acmeChallenges = []
+        acmeCertificates = []
+        acmeCertError = nil
+        acmePickerDomains = []
+        acmePickerRecords = []
+        acmePickerDomain = nil
+        if dnsConfigured { dnsRefreshDomains() }
+        refreshACMEStatus()
+    }
+
+    func opsAddProfile() {
+        settings.addOpsProfile()
+        opsProfileChanged()
+    }
+
+    func opsRemoveProfile() {
+        settings.removeSelectedOpsProfile()
+        opsProfileChanged()
+    }
+
+    // MARK: 域名解析（阿里云 DNS）
+
+    @Published var dnsState = DNSState()
+
+    /// 凭据是否配好 —— 界面用它决定是显示表单还是先让填 Key
+    var dnsConfigured: Bool { settings.dns.isConfigured }
+
+    /// 给别的页面显示用（证书页）：只露 AccessKey 后 4 位，别的地方一律不亮明文
+    var dnsCredentialSummary: String {
+        guard settings.dns.hasCredentials else { return "未配置" }
+        let key = settings.dns.aliKey.trimmingCharacters(in: .whitespaces)
+        let label = settings.selectedOpsProfile?.label ?? "阿里云"
+        return key.count > 4 ? "\(label)（****\(key.suffix(4))）" : label
+    }
+
+    /// 保存设置并让服务拿到最新配置（和证书页一个套路）
+    private func syncDNSSettings() {
+        SettingsStore.save(settings)
+        rebuildServices()
+    }
+
+    func dnsRefreshDomains() {
+        syncDNSSettings()
+        let service = dns
+        dnsState.error = ""
+        load("正在拉取域名列表…", { service.domains() },
+             into: { domains in
+                 self.dnsState.domains = domains
+                 self.dnsState.loadedAt = Date()
+                 self.dnsState.message = domains.isEmpty ? "这个账号下没有域名" : "共 \(domains.count) 个域名"
+                 // 选中的域名不在了（换过账号 / 删过域名）就清掉
+                 if let selected = self.dnsState.selectedDomain,
+                    !domains.contains(where: { $0.name == selected }) {
+                     self.dnsState.selectedDomain = nil
+                     self.dnsState.records = []
+                 }
+                 if self.dnsState.selectedDomain == nil, let first = domains.first {
+                     self.dnsSelectDomain(first.name)
+                 }
              },
              onError: { message in
-                 self.btSites = []
-                 self.toast = Toast(text: "读取网站列表失败", ok: false, detail: message)
+                 self.dnsState.domains = []
+                 self.dnsState.records = []
+                 self.dnsState.message = ""
+                 self.dnsState.error = message
              })
     }
 
-    /// 读取数据库列表（按当前选中的类型）
-    func loadBTDatabases() {
-        let service = bt
-        let type = BTDatabaseType.find(btDatabaseTypeKey)
-        load("正在读取 \(type.label) 数据库列表…", { .success(service.databaseList(type: type)) },
+    func dnsSelectDomain(_ name: String) {
+        dnsState.selectedDomain = name
+        dnsState.records = []
+        dnsState.error = ""
+        dnsCancelEdit()
+        dnsLoadRecords()
+    }
+
+    func dnsLoadRecords() {
+        guard let domain = dnsState.selectedDomain else { return }
+        let service = dns
+        load("正在读取 \(domain) 的解析记录…", { service.records(domain: domain) },
+             into: { records in
+                 self.dnsState.records = records
+                 self.dnsState.loadedAt = Date()
+                 self.dnsState.message = records.isEmpty
+                     ? "\(domain) 还没有解析记录"
+                     : "\(domain)：\(records.count) 条记录"
+                 self.dnsState.error = ""
+             },
+             onError: { message in
+                 self.dnsState.records = []
+                 self.dnsState.message = ""
+                 self.dnsState.error = message
+             })
+    }
+
+    /// 把某条已有记录填进表单开始改（`editingRecordId` 非空就表示"正在改"）
+    func dnsEditRecord(_ record: DNSRecord) {
+        dnsState.editingRecordId = record.recordId
+        dnsState.editor = DNSRecordDraft.from(record, defaultTTL: settings.dns.clampedTTL)
+    }
+
+    func dnsCancelEdit() {
+        dnsState.editingRecordId = nil
+        dnsState.editor.clear(defaultTTL: settings.dns.clampedTTL)
+    }
+
+    /// 提交表单：正在编辑就更新，否则新增
+    func dnsSaveRecord() {
+        guard let domain = dnsState.selectedDomain else {
+            toast = Toast(text: "先在上面选一个域名", ok: false)
+            return
+        }
+        syncDNSSettings()
+        let service = dns
+        let draft = dnsState.editor
+        let rr = draft.rr.trimmingCharacters(in: .whitespaces)
+        let value = draft.value.trimmingCharacters(in: .whitespaces)
+        let ttl = Int(draft.ttl.trimmingCharacters(in: .whitespaces)) ?? settings.dns.clampedTTL
+
+        // 本地先校验一道：阿里云的报错文案不好懂，来回一趟也慢
+        if let problem = service.validate(rr: rr, type: draft.type, value: value, priority: draft.priority) {
+            toast = Toast(text: problem, ok: false)
+            return
+        }
+
+        if let recordId = dnsState.editingRecordId {
+            dnsWrite("正在保存解析记录…") {
+                service.updateRecord(recordId: recordId, rr: rr, type: draft.type,
+                                     value: value, ttl: ttl, priority: draft.priority)
+            } after: {
+                self.dnsCancelEdit()
+                self.dnsLoadRecords()
+            }
+        } else {
+            dnsWrite("正在添加解析记录…") {
+                service.addRecord(domain: domain, rr: rr, type: draft.type,
+                                  value: value, ttl: ttl, priority: draft.priority)
+            } after: {
+                // 清空表单，但保留 TTL（连着加几条时不用重填）
+                let ttlText = self.dnsState.editor.ttl
+                self.dnsState.editor.clear(defaultTTL: Int(ttlText) ?? self.settings.dns.clampedTTL)
+                self.dnsLoadRecords()
+            }
+        }
+    }
+
+    /// 删除是破坏性的，先弹个确认框
+    func dnsDeleteRecord(_ record: DNSRecord) {
+        let alert = NSAlert()
+        alert.messageText = "删除这条解析记录？"
+        alert.informativeText = "\(record.fqdn)\n\(record.type)　\(record.value)"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "删除")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        syncDNSSettings()
+        let service = dns
+        let recordId = record.recordId
+        dnsWrite("正在删除解析记录…") {
+            service.deleteRecord(recordId: recordId)
+        } after: {
+            if self.dnsState.editingRecordId == recordId { self.dnsCancelEdit() }
+            self.dnsLoadRecords()
+        }
+    }
+
+    /// 写操作用它包一层：`Outcome<String>` 转成 `ActionResult`，好复用通用的提示条
+    private func dnsWrite(_ label: String, _ work: @escaping () -> Outcome<String>,
+                          after: (() -> Void)? = nil) {
+        perform(label, {
+            switch work() {
+            case .success(let message): return ActionResult(ok: true, message: message)
+            case .failure(let message): return ActionResult(ok: false, message: message)
+            }
+        }, after: after)
+    }
+
+    // MARK: AI 开发（无人值守）
+
+    /// 看门狗状态：轮次、阶段、倒计时、日志尾部
+    @Published var aiDev = AIDevSnapshot()
+    /// codex 环境自检结果：路径、版本、登录态、可用模型、本机代理
+    @Published var aiEnv = AIEnvironmentReport()
+    /// 最近一次结束的结论（正常结束 / 限额等待 / 已停止…）
+    @Published var aiDevMessage = ""
+    /// 工作目录里是否已经有完成标记
+    @Published var aiDoneFlagExists = false
+    /// 「审查者」（默认 DeepSeek）的状态：打包出来的请求、拿回来的报告、错误
+    @Published var aiReview = AIReviewState()
+    /// 「云端任务」（codex cloud）：任务列表、选中的任务、详情文本
+    @Published var aiCloud = AICloudState()
+
+    // MARK: AI 开发（无人值守）
+
+    // MARK: AI 开发（无人值守）
+
+    /// AI 页面改了设置就立刻存盘（模型/推理强度/代理这些下次开 App 还在）
+    func syncAISettings() {
+        SettingsStore.save(settings)
+    }
+
+    /// 重新检测 codex 环境：可执行文件、版本、登录状态、可用模型、本机代理
+    func aiInspectEnvironment() {
+        load("正在检测 codex 环境…", { .success(AIEnvironment.inspect()) },
+             into: { report in
+                 self.aiEnv = report
+                 var notes: [String] = []
+                 if report.codexPath.isEmpty { notes.append("找不到 codex 命令，先装 Codex CLI") }
+                 if !report.loggedIn { notes.append("还没登录，先在终端跑一次 codex login") }
+                 self.toast = Toast(text: notes.isEmpty ? "codex 环境正常" : notes.joined(separator: "；"),
+                                    ok: notes.isEmpty,
+                                    detail: "codex：\(report.codexPath.isEmpty ? "未找到" : report.codexPath)"
+                                          + "\n版本：\(report.version.isEmpty ? "未知" : report.version)"
+                                          + "\n模型来源：\(report.modelsSource)（\(report.models.count) 个）"
+                                          + "\n本机代理：\(report.proxy.summary)")
+             },
+             onError: { message in
+                 self.toast = Toast(text: "检测 codex 环境失败", ok: false, detail: message)
+             })
+    }
+
+    /// 开始跑任务。`resume` = true 时跳过任务描述，直接续跑工作目录里最近的会话。
+    func aiStartTask(resume: Bool) {
+        let workDir = settings.ai.resolvedWorkDir
+        guard let codex = Paths.which("codex") else {
+            toast = Toast(text: "找不到 codex 命令", ok: false,
+                          detail: "先装好 Codex CLI（npm i -g @openai/codex 或 brew install codex）并登录。")
+            return
+        }
+        guard FileTools.exists(AIEnvironment.authPath) else {
+            toast = Toast(text: "codex 还没登录", ok: false,
+                          detail: "先在终端跑一次 codex login —— 本工具直接复用 ~/.codex 里的登录态。")
+            return
+        }
+        guard settings.ai.hasWorkDir else {
+            toast = Toast(text: "先填「任务目录」", ok: false,
+                          detail: "codex 会在那个目录里干活；resume 也按目录找会话，换了目录就等于换了任务。")
+            return
+        }
+        guard FileTools.isDirectory(workDir) else {
+            toast = Toast(text: "任务目录不存在：\(workDir)", ok: false)
+            return
+        }
+        if !resume, settings.ai.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            toast = Toast(text: "先写「任务描述」", ok: false,
+                          detail: "新建会话必须有任务描述；只想接着上次跑，请点「续跑最近会话」。")
+            return
+        }
+        SettingsStore.save(settings)
+        aiDevMessage = ""
+        refreshAIDoneFlag()
+        aiRunner.start(settings: settings.ai, resume: resume, codexPath: codex)
+        toast = Toast(text: resume ? "已开始续跑最近的会话" : "已开始执行任务", ok: true,
+                      detail: "看门狗会一直盯着；碰到 5 小时限额会等到恢复时间再自动续跑，随时可以停。")
+    }
+
+    /// 停：先给 codex 发 SIGTERM，3 秒不退再 SIGKILL
+    func aiStopTask() {
+        guard aiDev.running else { return }
+        aiRunner.stop()
+        aiDevMessage = "已请求停止，等 codex 退出…"
+    }
+
+    /// 标记任务完成：在任务目录放一个 `.codex_done`，看门狗下一轮开始前就会退出
+    func aiMarkTaskDone() {
+        let workDir = settings.ai.resolvedWorkDir
+        guard settings.ai.hasWorkDir, FileTools.isDirectory(workDir) else {
+            toast = Toast(text: "任务目录无效，标记失败", ok: false)
+            return
+        }
+        let flag = workDir + "/" + AIDevRunner.doneFlagName
+        if let error = FileTools.write(flag, "done \(Date())\n") {
+            toast = Toast(text: "写完成标记失败", ok: false, detail: error)
+            return
+        }
+        refreshAIDoneFlag()
+        toast = Toast(text: "已标记完成", ok: true,
+                      detail: "看门狗会在下一轮开始前退出；想再跑一次，点「删除完成标记」。")
+    }
+
+    func aiClearDoneFlag() {
+        let workDir = settings.ai.resolvedWorkDir
+        guard settings.ai.hasWorkDir else { return }
+        try? FileManager.default.removeItem(atPath: workDir + "/" + AIDevRunner.doneFlagName)
+        refreshAIDoneFlag()
+        toast = Toast(text: "已删除完成标记", ok: true)
+    }
+
+    private func refreshAIDoneFlag() {
+        let workDir = settings.ai.resolvedWorkDir
+        aiDoneFlagExists = settings.ai.hasWorkDir && FileTools.exists(workDir + "/" + AIDevRunner.doneFlagName)
+    }
+
+    // MARK: 审查与修复（另一位云端模型当审查者）
+
+    /// 一次审查的产物（打包好的请求 + 拿回来的报告 + 落盘路径）。
+    private struct ReviewRunResult {
+        var requestText = ""
+        var requestPath = ""
+        var report = ReviewReport()
+        var reportPath = ""
+        var notes = ""
+    }
+
+    /// 收集审查材料：需求原文 + 每轮自我说明 + git 改动 + 验收结果。
+    /// 静态函数，方便直接在后台线程跑（不碰 self 状态）。
+    private static func collectReviewRequest(workDir: String,
+                                             aiSettings: AIDevSettings,
+                                             reviewSettings: AIReviewSettings) -> Outcome<ReviewRequest> {
+        var request = ReviewRequest()
+        request.requirement = aiSettings.prompt
+        request.plan = FileTools.read(AIArtifacts.directory(workDir) + "/plan.md")
+        request.roundNotes = AIArtifacts.roundNotes(workDir)
+
+        var notes: [String] = []
+        let commands = Acceptance.commands(aiSettings.acceptanceCommands)
+        if commands.isEmpty {
+            notes.append("没有配置验收命令：完成判定只能靠模型自己说，请重点检查功能正确性。")
+        } else {
+            request.acceptance = Acceptance.run(commands, cwd: workDir,
+                                                timeout: TimeInterval(max(30, aiSettings.acceptanceTimeout)))
+        }
+
+        let snapshot = GitDiff.collect(workDir: workDir,
+                                       maxChars: max(4000, reviewSettings.maxDiffChars))
+        request.diff = snapshot.diff
+        request.diffStat = snapshot.stat
+        request.diffTruncated = snapshot.truncated
+        if !snapshot.error.isEmpty { notes.append(snapshot.error) }
+        if snapshot.truncated { notes.append("diff 太长已截断，只送去了前一部分。") }
+        if !snapshot.untracked.isEmpty {
+            notes.append("新建的文件（未跟踪）：" + snapshot.untracked.joined(separator: "、")
+                         + "——内容已附在 diff 末尾。")
+        }
+        request.materialNotes = notes.joined(separator: "\n")
+
+        if request.diff.isEmpty, snapshot.error.isEmpty, request.roundNotes.isEmpty {
+            return .failure("拿不到任何材料：这个目录里既没有 git 改动，也没有跑过任务。先让 codex 干一轮再来审查。")
+        }
+        return .success(request)
+    }
+
+    /// 打包 + 调用审查者（整条链都在后台线程跑）。
+    private static func performReview(workDir: String, aiSettings: AIDevSettings,
+                                      reviewSettings: AIReviewSettings,
+                                      callReviewer: Bool) -> Outcome<ReviewRunResult> {
+        switch collectReviewRequest(workDir: workDir, aiSettings: aiSettings, reviewSettings: reviewSettings) {
+        case .failure(let message):
+            return .failure(message)
+        case .success(let request):
+            let text = ReviewRequestBuilder.markdown(request)
+            let requestPath = AIArtifacts.reviewRequestPath(workDir)
+            if let error = FileTools.write(requestPath, text) { return .failure(error) }
+            var result = ReviewRunResult(requestText: text, requestPath: requestPath, notes: request.materialNotes)
+            guard callReviewer else { return .success(result) }
+            switch ReviewClient.review(settings: reviewSettings, request: request) {
+            case .failure(let message):
+                return .failure(message)
+            case .success(let report):
+                let reportPath = AIArtifacts.reviewReportPath(workDir)
+                _ = FileTools.write(reportPath, report.raw)
+                result.report = report
+                result.reportPath = reportPath
+                return .success(result)
+            }
+        }
+    }
+
+    /// 只打包、不调用审查者：把请求写成 `.ai/review-request.md`，
+    /// 你可以直接复制给别人看，也可以先确认材料齐不齐。
+    func aiPrepareReview() {
+        let workDir = settings.ai.resolvedWorkDir
+        guard settings.ai.hasWorkDir, FileTools.isDirectory(workDir) else {
+            toast = Toast(text: "先填有效的任务目录", ok: false)
+            return
+        }
+        SettingsStore.save(settings)
+        let aiSettings = settings.ai
+        let reviewSettings = settings.review
+        load("正在打包审查材料…",
+             { AppModel.performReview(workDir: workDir, aiSettings: aiSettings,
+                                      reviewSettings: reviewSettings, callReviewer: false) },
              into: { result in
-                 self.recordBT(result, label: "\(type.label) 数据库列表")
-                 self.btDatabases = BTPanelService.parseDatabases(result, type: type)
+                 self.aiReview.requestText = result.requestText
+                 self.aiReview.requestPath = result.requestPath
+                 self.aiReview.materialError = result.notes
+                 self.aiReview.error = ""
+                 self.toast = Toast(text: "审查材料已打包（\(result.requestText.count) 字符）", ok: true,
+                                    detail: "已写到 \(result.requestPath)\n\n\(result.notes)")
              },
              onError: { message in
-                 self.btDatabases = []
-                 self.toast = Toast(text: "读取 \(type.label) 数据库列表失败", ok: false, detail: message)
+                 self.aiReview.error = message
+                 self.toast = Toast(text: "打包审查材料失败", ok: false, detail: message)
              })
     }
 
-    /// 切换数据库类型并重新加载
-    func selectBTDatabaseType(_ key: String) {
-        guard btDatabaseTypeKey != key else { return }
-        btDatabaseTypeKey = key
-        btDatabases = []
-        loadBTDatabases()
-    }
-
-    /// 读取各服务的安装 / 运行状态。
-    /// 运行状态**以服务器进程表为准**：一次拉全量进程再比对，比逐个查商店快也更准。
-    func loadBTServices() {
-        let service = bt
-        load("正在读取服务状态…", {
-            .success(service.serviceStatuses())
-        }, into: { statuses in
-            self.btServices = statuses
-            let known = statuses.filter { $0.installed }.count
-            self.btLastResponse = "【服务状态】\n" + statuses.map {
-                "\($0.name) [\($0.statusLabel)] \($0.version)"
-            }.joined(separator: "\n")
-            self.btLastResponseOK = true
-            self.toast = Toast(text: "读到 \(statuses.count) 个服务（\(known) 个已安装）",
-                               ok: true, detail: "")
-        }, onError: { message in
-            self.btServices = []
-            self.toast = Toast(text: "读取服务状态失败", ok: false, detail: message)
-        })
-    }
-
-    /// 待二次确认的服务操作（停止 / 重启 / 重载会中断服务）
-    struct BTPendingServiceAction: Identifiable {
-        var id: String { "\(serviceName)-\(type)" }
-        var serviceName: String
-        var serviceLabel: String
-        var type: String
-    }
-
-    /// 待二次确认的网站操作（停止网站会中断访问）
-    struct BTPendingSiteAction: Identifiable {
-        var id: String { "\(siteID)-\(start ? "start" : "stop")" }
-        var siteID: String
-        var siteName: String
-        var start: Bool
-        /// 站点类型标签（PHP / Python / 反向代理…），用于确认弹窗
-        var typeLabel: String = ""
-        /// 该类型的启停说明（不同站点类型启停行为不同）
-        var note: String = ""
-    }
-
-    @Published var btPendingService: BTPendingServiceAction?
-    @Published var btPendingSite: BTPendingSiteAction?
-
-    /// 启动属于低风险、且常点的操作 → 直接执行；
-    /// 停止 / 重启 / 重载会中断服务 → 先弹确认。
-    func requestBTServiceAction(name: String, label: String, type: String) {
-        if type == "start" {
-            btServiceAction(name: name, type: type)
-        } else {
-            btPendingService = BTPendingServiceAction(serviceName: name, serviceLabel: label, type: type)
-        }
-    }
-
-    func confirmBTServiceAction() {
-        guard let pending = btPendingService else { return }
-        btPendingService = nil
-        btServiceAction(name: pending.serviceName, type: pending.type)
-    }
-
-    /// 启动网站直接执行；停止网站先确认（确认框会按站点类型给出启停说明）
-    func requestBTSiteAction(site: BTSite, start: Bool) {
-        if start {
-            btSiteAction(site: site, start: true)
-        } else {
-            btPendingSite = BTPendingSiteAction(siteID: site.id, siteName: site.name, start: false,
-                                                typeLabel: site.typeLabel, note: site.restartNote)
-        }
-    }
-
-    func confirmBTSiteAction() {
-        guard let pending = btPendingSite else { return }
-        btPendingSite = nil
-        if let site = btSites.first(where: { $0.id == pending.siteID }) {
-            btSiteAction(site: site, start: pending.start)
-        } else {
-            btSiteAction(site: BTSite(id: pending.siteID, name: pending.siteName, path: "",
-                                      domains: "", status: "1"),
-                         start: pending.start)
-        }
-    }
-
-    func btSiteAction(site: BTSite, start: Bool) {
-        syncBTSettings()
-        let service = bt
-        let label = "\(start ? "启动" : "停止")网站 \(site.name)"
-        perform("正在\(start ? "启动" : "停止")网站 \(site.name)…") {
-            var ok = false
-            var endpoint = ""
-            var raw = ""
-            var tried: [String] = []
-            // Python 项目走宝塔的专用接口，它才能**真正停掉 uwsgi 应用进程**；
-            // 站点接口 /site?action=SiteStop 只摘 nginx 转发，进程照旧在跑。
-            if site.isPythonProject {
-                let outcome = service.pythonProjectAction(site: site, start: start)
-                ok = outcome.project.ok
-                endpoint = "/project/python/\(start ? "StartProject" : "StopProject")（name=\(site.name)）"
-                         + "\n+ /site?action=\(start ? "SiteStart" : "SiteStop")（id=\(site.id)）"
-                raw = "项目接口：\(outcome.project.raw.isEmpty ? outcome.project.message : outcome.project.raw)"
-                    + "\n站点接口：\(outcome.site.raw.isEmpty ? outcome.site.message : outcome.site.raw)"
-                tried = [endpoint]
-            } else {
-                let outcome = service.setSiteRunning(site, start: start)
-                ok = outcome.result.ok
-                endpoint = outcome.endpoint
-                raw = outcome.result.raw.isEmpty ? outcome.result.message : outcome.result.raw
-                tried = outcome.tried
-            }
-            // 面板回「成功」不算数，复查列表里的真实 status
-            var verify = ""
-            if ok {
-                // 复查用带真实项目状态的列表（Python 项目看项目接口，其它看 sites 表）
-                let fresh = service.sitesWithRealStatus().first { $0.id == site.id }
-                if let fresh {
-                    if fresh.running != start {
-                        ok = false
-                        verify = "\n\n⚠️ 复查面板列表：该站点现在仍是「\(fresh.statusLabel)」，操作可能没生效。"
-                    } else {
-                        verify = "\n\n复查面板列表：\(fresh.statusLabel) ✅"
-                    }
-                } else {
-                    verify = "\n\n（复查时没在列表里找到该站点，无法二次确认）"
-                }
-                // 项目类站点额外核对应用进程 —— 这才区分得出"只停了转发"和"真停了进程"
-                let hints = site.processNameHints
-                if !hints.isEmpty {
-                    let procs = service.processList()
-                    let count = procs.filter { row in
-                        let procName = ((row["name"] as? String) ?? "").lowercased()
-                        return hints.contains { procName.hasPrefix($0) }
-                    }.count
-                    let label = hints.joined(separator: "/")
-                    if start && count == 0 {
-                        verify += "\n⚠️ 未检测到 \(label) 进程，启动可能没成功。"
-                    } else if !start && count > 0 {
-                        verify += "\n⚠️ 服务器上仍有 \(count) 个 \(label) 进程在跑，请到面板确认是否属于本项目。"
-                    } else if !start {
-                        verify += "\n应用进程（\(label)）也已停止 ✅"
-                    }
-                }
-            }
-            let detail = "调用的接口：\n" + tried.joined(separator: "\n")
-                       + "\n\n响应：\n" + raw + verify
-            return ActionResult(ok: ok,
-                                message: ok
-                                    ? "\(site.name) 已\(start ? "启动" : "停止")"
-                                    : "\(raw)\n（已尝试 \(tried.count) 个接口，详见下方）",
-                                detail: detail)
-        } after: {
-            self.recordBTFromToast(label)
-            self.loadBTSites()
-        }
-    }
-
-    /// 把已签发的证书部署成宝塔某个网站的 SSL（申请 → 部署 一条龙）
-    func deployCertificateToBTPanel() {
-        syncBTSettings()
-        let service = bt
-        let siteName = btDeploySite.trimmingCharacters(in: .whitespaces)
-        let domain = btDeployDomain.trimmingCharacters(in: .whitespaces)
-        guard !siteName.isEmpty else {
-            toast = Toast(text: "先选要部署到哪个网站", ok: false)
+    /// 调审查者（默认 DeepSeek）复核这份交付，拿回结构化的必修复清单。
+    func aiRunReview() {
+        let workDir = settings.ai.resolvedWorkDir
+        guard settings.ai.hasWorkDir, FileTools.isDirectory(workDir) else {
+            toast = Toast(text: "先填有效的任务目录", ok: false)
             return
         }
-        guard let certificate = acmeCertificates.first(where: { $0.domain == domain }) else {
-            toast = Toast(text: "找不到证书 \(domain)：先在「证书」页申请一张", ok: false)
+        guard settings.review.isConfigured else {
+            toast = Toast(text: "还没配审查者", ok: false,
+                          detail: "在「审查与修复」标签页填 baseURL / 模型名 / API 密钥（默认 DeepSeek）。")
             return
         }
-        let key = FileTools.read(certificate.keyPath)
-        let fullchain = FileTools.read(certificate.fullchainPath)
-        guard !key.isEmpty, !fullchain.isEmpty else {
-            toast = Toast(text: "读不到证书文件",
-                          ok: false,
-                          detail: "私钥：\(certificate.keyPath)\n证书链：\(certificate.fullchainPath)")
-            return
-        }
+        SettingsStore.save(settings)
+        let aiSettings = settings.ai
+        let reviewSettings = settings.review
+        load("正在请 \(reviewSettings.model) 审查…",
+             { AppModel.performReview(workDir: workDir, aiSettings: aiSettings,
+                                      reviewSettings: reviewSettings, callReviewer: true) },
+             into: { result in
+                 self.aiReview.requestText = result.requestText
+                 self.aiReview.requestPath = result.requestPath
+                 self.aiReview.report = result.report
+                 self.aiReview.reportPath = result.reportPath
+                 self.aiReview.reviewedAt = Date()
+                 self.aiReview.materialError = result.notes
+                 self.aiReview.error = ""
+                 let mustFix = result.report.mustFix.count
+                 self.toast = Toast(text: mustFix == 0 ? "审查完成：没有必修项" : "审查完成：必修 \(mustFix) 项",
+                                    ok: result.report.parsed,
+                                    detail: result.report.summary + "\n\n报告已写到 \(result.reportPath)")
+             },
+             onError: { message in
+                 self.aiReview.error = message
+                 self.toast = Toast(text: "审查失败", ok: false, detail: message)
+             })
+    }
 
-        perform("正在把 \(domain) 的证书部署到网站 \(siteName)…") {
-            let r = service.deploySSL(siteName: siteName, privateKey: key, fullchain: fullchain)
-            return ActionResult(ok: r.ok, message: r.message,
-                                detail: r.raw.isEmpty ? r.message : r.raw)
-        } after: {
-            self.recordBTFromToast("为 \(siteName) 部署 SSL")
-            self.loadBTSites()
+    /// 按审查报告的「必修」清单逐条修：每轮只修一条，修完跑验收，通过才下一条。
+    func aiStartFixQueue() {
+        let workDir = settings.ai.resolvedWorkDir
+        let findings = aiReview.report.mustFix
+        guard !findings.isEmpty else {
+            toast = Toast(text: "报告里没有必修项，不用修", ok: false)
+            return
         }
+        guard let codex = Paths.which("codex") else {
+            toast = Toast(text: "找不到 codex 命令", ok: false)
+            return
+        }
+        guard settings.ai.hasWorkDir, FileTools.isDirectory(workDir) else {
+            toast = Toast(text: "先填有效的任务目录", ok: false)
+            return
+        }
+        if Acceptance.commands(settings.ai.acceptanceCommands).isEmpty {
+            toast = Toast(text: "修复队列需要有验收命令", ok: false,
+                          detail: "没有验收命令就没法判断某一条到底修好没有。先在「任务」页填一条（例如 ./tests/run.sh）。")
+            return
+        }
+        SettingsStore.save(settings)
+        aiDevMessage = ""
+        aiReview.fixProgress = "0/\(findings.count)"
+        aiRunner.start(settings: settings.ai, resume: true, codexPath: codex, fixQueue: findings)
+        toast = Toast(text: "开始按报告逐条修复（\(findings.count) 条）", ok: true,
+                      detail: "每条修完会跑验收命令，通过才进入下一条；某条连续两轮都修不好就停下等你。")
+    }
+
+    // MARK: 云端任务（codex cloud）
+
+    /// 拉任务列表。这一页是「丢需求 → 云端自己干 → 回来看 diff → apply」那条路。
+    func aiCloudRefresh() {
+        let cloudSettings = settings.cloud
+        load("正在拉取云端任务…", { AICloudClient.list(settings: cloudSettings) },
+             into: { tasks in
+                 self.aiCloud.tasks = tasks
+                 self.aiCloud.loadedAt = Date()
+                 self.aiCloud.error = ""
+                 self.aiCloud.message = tasks.isEmpty ? "云端还没有任务" : "共 \(tasks.count) 条任务"
+                 if let selected = self.aiCloud.selectedID,
+                    !tasks.contains(where: { $0.id == selected }) {
+                     self.aiCloud.selectedID = nil
+                     self.aiCloud.detail = ""
+                     self.aiCloud.detailKind = ""
+                 }
+             },
+             onError: { message in
+                 self.aiCloud.error = message
+                 self.aiCloud.message = ""
+             })
+    }
+
+    /// 把需求派到云端。这是整套流程的起点，之后关掉 App 也不影响它跑。
+    func aiCloudSubmit() {
+        let query = aiCloud.query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
+            toast = Toast(text: "先写需求", ok: false)
+            return
+        }
+        guard settings.cloud.isConfigured else {
+            toast = Toast(text: "先填云端环境 ID", ok: false,
+                          detail: "在终端跑 `codex cloud` 可以浏览/创建云端环境（是一份带仓库的沙箱）。")
+            return
+        }
+        SettingsStore.save(settings)
+        aiCloud.message = ""
+        aiCloud.error = ""
+        let cloudSettings = settings.cloud
+        load("正在派发云端任务…", { AICloudClient.exec(query: query, settings: cloudSettings) },
+             into: { result in
+                 self.aiCloud.query = ""
+                 self.aiCloud.message = result.taskID.isEmpty
+                     ? "已派发（没从输出里认出任务 ID，刷新列表就能看到）"
+                     : "已派发：\(String(result.taskID.prefix(8)))"
+                 self.aiCloud.detail = result.output
+                 self.aiCloud.detailKind = "派发结果"
+                 self.toast = Toast(text: self.aiCloud.message, ok: true, detail: result.output)
+                 self.aiCloudRefresh()
+             },
+             onError: { message in
+                 self.aiCloud.error = message
+                 self.toast = Toast(text: "派发失败", ok: false, detail: message)
+             })
+    }
+
+    /// 取选中任务的状态（原始文本，界面直接显示）。
+    func aiCloudLoadStatus() {
+        guard let task = aiCloud.selectedTask else {
+            toast = Toast(text: "先在列表里选一条任务", ok: false)
+            return
+        }
+        let taskID = task.id
+        load("正在取任务状态…", { AICloudClient.status(taskID: taskID) },
+             into: { text in
+                 self.aiCloud.detail = text
+                 self.aiCloud.detailKind = "任务状态"
+                 self.aiCloud.error = ""
+             },
+             onError: { message in
+                 self.aiCloud.error = message
+                 self.toast = Toast(text: "取任务状态失败", ok: false, detail: message)
+             })
+    }
+
+    /// 取选中任务的改动（unified diff）。
+    func aiCloudLoadDiff() {
+        guard let task = aiCloud.selectedTask else {
+            toast = Toast(text: "先在列表里选一条任务", ok: false)
+            return
+        }
+        let taskID = task.id
+        load("正在取云端改动…", { AICloudClient.diff(taskID: taskID, attempt: 1) },
+             into: { text in
+                 self.aiCloud.detail = text.isEmpty ? "（这条任务没有产生改动）" : text
+                 self.aiCloud.detailKind = "改动（diff）"
+                 self.aiCloud.error = ""
+             },
+             onError: { message in
+                 self.aiCloud.error = message
+                 self.toast = Toast(text: "取改动失败", ok: false, detail: message)
+             })
+    }
+
+    /// 把选中任务的改动 apply 到本地仓库目录（会改本地文件，所以结果要说清）。
+    func aiCloudApply() {
+        guard let task = aiCloud.selectedTask else {
+            toast = Toast(text: "先在列表里选一条任务", ok: false)
+            return
+        }
+        guard settings.cloud.hasWorkDir else {
+            toast = Toast(text: "先填「本地仓库路径」", ok: false,
+                          detail: "apply 会把这条任务的 diff 打到那个目录里（它就是云端环境对应的本地仓库）。")
+            return
+        }
+        let taskID = task.id
+        let workDir = settings.cloud.resolvedWorkDir
+        SettingsStore.save(settings)
+        load("正在把云端改动应用到本地…", { AICloudClient.apply(taskID: taskID, attempt: 1, workDir: workDir) },
+             into: { text in
+                 self.aiCloud.detail = text
+                 self.aiCloud.detailKind = "apply 结果"
+                 self.toast = Toast(text: "已应用到 \(workDir)", ok: true,
+                                    detail: text.isEmpty ? "（codex 没输出内容，去目录里看 git status）" : text)
+             },
+             onError: { message in
+                 self.aiCloud.error = message
+                 self.toast = Toast(text: "应用失败", ok: false, detail: message)
+             })
     }
 }

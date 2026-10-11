@@ -1,0 +1,82 @@
+name: Build Seraphim
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  swiftui-macos:
+    name: SwiftUI macOS arm64
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server-status/go.mod
+          cache-dependency-path: server-status/go.mod
+      - name: Test SwiftUI core
+        run: ./tests/run.sh
+      - name: Build native application
+        run: ./build.sh
+      - name: Package application
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent build/Seraphim.app build/Seraphim-SwiftUI-mac-arm64.zip
+          cd build
+          shasum -a 256 Seraphim-SwiftUI-mac-arm64.zip > Seraphim-SwiftUI-SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seraphim-swiftui-mac-arm64
+          path: |
+            build/Seraphim-SwiftUI-mac-arm64.zip
+            build/Seraphim-SwiftUI-SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  electron:
+    name: Electron macOS, Windows, Linux
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: electron
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server-status/go.mod
+          cache-dependency-path: server-status/go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: electron/package-lock.json
+      - name: Test server
+        working-directory: server-status
+        run: go test ./...
+      - name: Install dependencies
+        run: npm ci
+      - name: Test Electron core
+        run: npm test
+      - name: Package all platforms
+        run: npm run pack:all
+      - name: Verify archives and checksums
+        run: |
+          cd ../build/electron
+          unzip -tqq Seraphim-Electron-*-mac-arm64.zip
+          unzip -tqq Seraphim-Electron-*-win-x64.zip
+          tar -tzf Seraphim-Electron-*-linux-x64.tar.gz >/dev/null
+          shasum -a 256 Seraphim-Electron-*-mac-arm64.zip Seraphim-Electron-*-win-x64.zip Seraphim-Electron-*-linux-x64.tar.gz > SHA256SUMS.txt
+          shasum -a 256 -c SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seraphim-electron-mac-win-linux
+          path: |
+            build/electron/Seraphim-Electron-*-mac-arm64.zip
+            build/electron/Seraphim-Electron-*-win-x64.zip
+            build/electron/Seraphim-Electron-*-linux-x64.tar.gz
+            build/electron/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
