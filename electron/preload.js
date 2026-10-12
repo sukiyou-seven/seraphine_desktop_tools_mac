@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 contextBridge.exposeInMainWorld('sera', Object.freeze({
   connections: () => ipcRenderer.invoke('connections:list'),
@@ -11,8 +11,14 @@ contextBridge.exposeInMainWorld('sera', Object.freeze({
   dnsCall: (action, params = {}) => ipcRenderer.invoke('dns:call', action, params),
   certificates: () => ipcRenderer.invoke('certificates:list'),
   issueCertificate: (input) => ipcRenderer.invoke('certificates:issue', input),
-  chooseUpload: () => ipcRenderer.invoke('files:choose-upload'),
-  upload: (localPath, remotePath, overwrite) => ipcRenderer.invoke('files:upload', { localPath, remotePath, overwrite }),
+  chooseUpload: (kind) => ipcRenderer.invoke('files:choose-upload', kind),
+  registerDropped: (files) => ipcRenderer.invoke('files:register-drop', Array.from(files, (file) => webUtils.getPathForFile(file)).filter(Boolean)),
+  upload: (ids, remoteDir, overwrite) => ipcRenderer.invoke('files:upload', { ids, remoteDir, overwrite }),
+  onUploadProgress: (callback) => {
+    const listener = (_event, progress) => callback(progress);
+    ipcRenderer.on('files:upload-progress', listener);
+    return () => ipcRenderer.removeListener('files:upload-progress', listener);
+  },
   download: (remotePath) => ipcRenderer.invoke('files:download', remotePath),
   exportInstaller: (architecture) => ipcRenderer.invoke('installer:export', architecture),
   chooseSSHKey: () => ipcRenderer.invoke('installer:choose-key'),

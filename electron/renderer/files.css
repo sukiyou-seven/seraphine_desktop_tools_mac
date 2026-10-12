@@ -1,0 +1,17 @@
+.file-drop-hint {
+  margin: 8px 0 12px;
+  padding: 10px 14px;
+  border: 1px dashed var(--border, #aab3bf);
+  border-radius: 8px;
+  color: var(--muted, #687484);
+  font-size: 13px;
+}
+#content.file-drop-active {
+  outline: 3px solid var(--accent, #5c77db);
+  outline-offset: 4px;
+  border-radius: 8px;
+}
+#content.file-drop-active .file-drop-hint {
+  background: rgba(92, 119, 219, .12);
+  color: inherit;
+}

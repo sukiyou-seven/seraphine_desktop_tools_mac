@@ -44,6 +44,12 @@ enum ServerFileError: LocalizedError {
 }
 
 enum ServerFileAPI {
+    struct UploadSummary {
+        var files = 0
+        var directories = 0
+        var skipped = 0
+    }
+
     static func url(endpoint: String, path: String, remotePath: String,
                     extraQuery: [URLQueryItem] = []) throws -> URL {
         let status = try ServerStatusAPI.statusURL(endpoint)
@@ -157,6 +163,48 @@ enum ServerFileAPI {
         try check(response, expected: 204)
     }
 
+    static func uploadSelection(connection: ServerConnection, token: String, localURLs: [URL],
+                                remoteDirectory: String, overwrite: Bool) async throws -> UploadSummary {
+        guard !localURLs.isEmpty, localURLs.count <= 100 else {
+            throw UploadValidationError.invalidSelection
+        }
+        let manager = FileManager.default
+        let names = localURLs.map(\.lastPathComponent)
+        guard Set(names).count == names.count else { throw UploadValidationError.duplicateNames }
+        var summary = UploadSummary()
+        var itemCount = 0
+        func visit(_ local: URL, _ parts: [String]) async throws {
+            itemCount += 1
+            guard itemCount <= 20_000 else { throw UploadValidationError.tooManyItems }
+            let values = try local.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey,
+                                                             .isSymbolicLinkKey, .fileSizeKey])
+            if values.isSymbolicLink == true { summary.skipped += 1; return }
+            let remote = (remoteDirectory == "/" ? "" : remoteDirectory) + "/" + parts.joined(separator: "/")
+            if values.isDirectory == true {
+                do {
+                    try await mkdir(connection: connection, token: token, path: remote)
+                } catch ServerFileError.response(409) where overwrite {
+                    _ = try await list(connection: connection, token: token, path: remote)
+                }
+                summary.directories += 1
+                let children = try manager.contentsOfDirectory(at: local, includingPropertiesForKeys: nil)
+                    .sorted { $0.lastPathComponent < $1.lastPathComponent }
+                for child in children { try await visit(child, parts + [child.lastPathComponent]) }
+            } else if values.isRegularFile == true {
+                guard Int64(values.fileSize ?? 0) <= 2 * 1024 * 1024 * 1024 else {
+                    throw UploadValidationError.fileTooLarge(parts.joined(separator: "/"))
+                }
+                try await upload(connection: connection, token: token, localFile: local,
+                                 remotePath: remote, overwrite: overwrite)
+                summary.files += 1
+            } else {
+                summary.skipped += 1
+            }
+        }
+        for local in localURLs { try await visit(local, [local.lastPathComponent]) }
+        return summary
+    }
+
     static func download(connection: ServerConnection, token: String, remotePath: String,
                          saveTo destination: URL) async throws {
         let url = try url(endpoint: connection.endpoint, path: "/v1/files/content", remotePath: remotePath)
@@ -169,5 +217,17 @@ enum ServerFileAPI {
             try fm.removeItem(at: destination)
         }
         try fm.moveItem(at: temporary, to: destination)
+    }
+}
+
+enum UploadValidationError: LocalizedError {
+    case invalidSelection, duplicateNames, tooManyItems, fileTooLarge(String)
+    var errorDescription: String? {
+        switch self {
+        case .invalidSelection: return "一次最多上传 100 个文件或文件夹"
+        case .duplicateNames: return "所选文件或文件夹的名称重复"
+        case .tooManyItems: return "一次最多上传 20000 个文件和目录"
+        case .fileTooLarge(let name): return "\(name) 超过单文件 2 GiB 限制"
+        }
     }
 }

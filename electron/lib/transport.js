@@ -57,7 +57,9 @@ async function request(connection, token, method, path, { body, input, output, t
           const chunks = [];
           for await (const chunk of res) chunks.push(chunk);
           const detail = Buffer.concat(chunks).toString('utf8').trim();
-          reject(new Error(detail || `服务器返回 HTTP ${res.statusCode}`));
+          const error = new Error(detail || `服务器返回 HTTP ${res.statusCode}`);
+          error.status = res.statusCode;
+          reject(error);
           return;
         }
         try {

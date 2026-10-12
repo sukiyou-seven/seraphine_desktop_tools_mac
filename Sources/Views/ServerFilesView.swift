@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 struct ServerFilesView: View {
     let connection: ServerConnection
@@ -21,7 +22,8 @@ struct ServerFilesView: View {
     @State private var permissionTarget: RemoteFile?
     @State private var permissionsInput = ""
     @State private var permissionsError = ""
-    @State private var pendingUpload: URL?
+    @State private var pendingUpload: [URL] = []
+    @State private var dropTargeted = false
     @State private var pendingRename: (from: String, to: String)?
     @State private var confirmUploadOverwrite = false
     @State private var confirmRenameOverwrite = false
@@ -111,6 +113,12 @@ struct ServerFilesView: View {
             }
             .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .textBackgroundColor)))
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.18)))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(dropTargeted ? Color.accentColor : .clear, lineWidth: 3))
+            .onDrop(of: [UTType.fileURL.identifier], isTargeted: $dropTargeted, perform: receiveDrop)
+
+            Text("可选择多个文件或文件夹，也可拖拽到列表上传；保留目录结构和空目录。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
             Text("点击权限数字可修改权限；点击每行的删除按钮可删除文件或目录。新上传的普通文件默认 0644，新建目录默认 0755。")
                 .font(.caption)
@@ -122,11 +130,11 @@ struct ServerFilesView: View {
         .onReceive(NotificationCenter.default.publisher(for: .serverManagementRefresh)) { _ in
             Task { await refresh() }
         }
-        .confirmationDialog("覆盖服务器上已有的文件？", isPresented: $confirmUploadOverwrite) {
+        .confirmationDialog("服务器上已有同名文件或文件夹，覆盖文件并合并文件夹？", isPresented: $confirmUploadOverwrite) {
             Button("覆盖上传", role: .destructive) { upload(overwrite: true) }
-            Button("取消", role: .cancel) { pendingUpload = nil }
+            Button("取消", role: .cancel) { pendingUpload = [] }
         } message: {
-            Text(pendingUpload?.lastPathComponent ?? "")
+            Text(pendingUpload.map(\.lastPathComponent).joined(separator: "、"))
         }
         .confirmationDialog("覆盖重命名目标文件？", isPresented: $confirmRenameOverwrite) {
             Button("覆盖并重命名", role: .destructive) { rename(overwrite: true) }
@@ -387,12 +395,45 @@ struct ServerFilesView: View {
     private func chooseUpload() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let local = panel.url else { return }
-        pendingUpload = local
-        let destination = (listing?.path == "/" ? "" : (listing?.path ?? currentPath)) + "/" + local.lastPathComponent
-        if listing?.entries.contains(where: { $0.path == destination }) == true {
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        guard panel.runModal() == .OK else { return }
+        stageUpload(panel.urls)
+    }
+
+    private func receiveDrop(_ providers: [NSItemProvider]) -> Bool {
+        let matching = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
+        guard !matching.isEmpty, !working else { return false }
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var urls: [URL] = []
+        for provider in matching {
+            group.enter()
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                let url: URL?
+                if let value = item as? URL { url = value }
+                else if let value = item as? Data { url = URL(dataRepresentation: value, relativeTo: nil) }
+                else { url = nil }
+                if let url, url.isFileURL {
+                    lock.lock(); urls.append(url); lock.unlock()
+                }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) { stageUpload(urls) }
+        return true
+    }
+
+    private func stageUpload(_ locals: [URL]) {
+        guard !working, !locals.isEmpty else { return }
+        let names = locals.map(\.lastPathComponent)
+        guard Set(names).count == names.count else {
+            message = "所选文件或文件夹的名称重复"
+            hasError = true
+            return
+        }
+        pendingUpload = locals
+        if listing?.entries.contains(where: { names.contains($0.name) }) == true {
             confirmUploadOverwrite = true
         } else {
             upload(overwrite: false)
@@ -400,12 +441,27 @@ struct ServerFilesView: View {
     }
 
     private func upload(overwrite: Bool) {
-        guard let local = pendingUpload else { return }
-        pendingUpload = nil
-        let destination = (listing?.path == "/" ? "" : (listing?.path ?? currentPath)) + "/" + local.lastPathComponent
-        execute {
-            try await ServerFileAPI.upload(connection: connection, token: token,
-                                           localFile: local, remotePath: destination, overwrite: overwrite)
+        let locals = pendingUpload
+        guard !locals.isEmpty, !working else { return }
+        pendingUpload = []
+        let directory = listing?.path ?? currentPath
+        working = true
+        message = "正在上传 \(locals.count) 项…"
+        hasError = false
+        Task {
+            do {
+                let result = try await ServerFileAPI.uploadSelection(connection: connection, token: token,
+                    localURLs: locals, remoteDirectory: directory, overwrite: overwrite)
+                working = false
+                await refresh()
+                message = "上传完成：\(result.files) 个文件、\(result.directories) 个文件夹" +
+                    (result.skipped > 0 ? "；跳过 \(result.skipped) 个符号链接或特殊文件" : "")
+                hasError = false
+            } catch {
+                working = false
+                message = error.localizedDescription
+                hasError = true
+            }
         }
     }
 

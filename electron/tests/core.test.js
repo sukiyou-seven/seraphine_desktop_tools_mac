@@ -12,6 +12,44 @@ const { request } = require('../lib/transport');
 const { encode, canonical, stringToSign, signature } = require('../lib/dns');
 const { normalizeDomains } = require('../lib/certificates');
 const { validate: validateSSH, fingerprint: sshFingerprint } = require('../lib/ssh-installer');
+const { planUpload, remotePath, uploadPlan } = require('../lib/file-upload');
+
+test('folder upload keeps nested files and empty directories, merges only after confirmation', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sera-upload-'));
+  try {
+    const root = path.join(dir, 'website');
+    fs.mkdirSync(path.join(root, 'assets'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'empty'));
+    fs.writeFileSync(path.join(root, 'assets', '.hidden'), 'yes');
+    fs.writeFileSync(path.join(root, 'index.html'), '<h1>ok</h1>');
+    fs.symlinkSync(path.join(root, 'index.html'), path.join(root, 'shortcut'));
+    const plan = planUpload([root]);
+    assert.equal(plan.skipped, 1);
+    assert.deepEqual(plan.items.map((item) => item.parts.join('/')),
+      ['website', 'website/assets', 'website/assets/.hidden', 'website/empty', 'website/index.html']);
+    const visited = [];
+    const actions = {
+      mkdir: async (destination) => {
+        visited.push(`mkdir ${destination}`);
+        if (destination.endsWith('/website')) throw Object.assign(new Error('exists'), { status: 409 });
+      },
+      directoryExists: async () => true,
+      uploadFile: async (_local, destination, overwrite) => visited.push(`file ${destination} ${overwrite}`)
+    };
+    await assert.rejects(uploadPlan(plan, '/www/seraphim/web', false, actions), /website.*失败/);
+    visited.length = 0;
+    const result = await uploadPlan(plan, '/www/seraphim/web', true, actions);
+    assert.deepEqual(result, { files: 2, directories: 3, skipped: 1 });
+    assert.deepEqual(visited, [
+      'mkdir /www/seraphim/web/website',
+      'mkdir /www/seraphim/web/website/assets',
+      'file /www/seraphim/web/website/assets/.hidden true',
+      'mkdir /www/seraphim/web/website/empty',
+      'file /www/seraphim/web/website/index.html true'
+    ]);
+    assert.throws(() => remotePath('/www/seraphim', ['..', 'etc']), /名称无效/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('connection storage keeps tokens out of public view and validates HTTPS', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sera-connections-'));

@@ -19,7 +19,7 @@ npm run pack:all
 
 解压后，macOS 打开 `Seraphim.app`，Windows 运行 `Seraphim.exe`，Linux 运行解压目录中的 `seraphim-electron`。
 
-推送到仓库 `main` 时，`.github/workflows/build.yml` 会在 GitHub Actions 上运行测试并打包四个桌面产物（含原生 SwiftUI macOS 版），上传带 SHA-256 校验文件的 Artifacts；也支持手动触发。CI 产物和本地构建一样，尚未使用开发者证书签名或公证。
+推送到仓库 `main` 时，`.github/workflows/build.yml` 会在 GitHub Actions 上运行测试并打包四个桌面产物（含原生 SwiftUI macOS 版）。四个平台版本分别作为独立 Artifact 上传，并自动创建包含四个压缩包和 `SHA256SUMS.txt` 的预览版 GitHub Release。推送 `v*` 标签会创建正式 Release；手动触发也会创建预览版。CI 产物尚未使用开发者证书签名或公证。
 
 `npm run prepare:server` 会从 `../server-status` 构建 Linux 二进制文件。已有构建文件时，可设置 `SERA_USE_EXISTING_SERVER_BINARIES=1` 仅用于打包；正式发布建议重新构建。
 

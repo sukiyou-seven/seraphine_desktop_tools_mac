@@ -216,7 +216,7 @@ MySQL 的账号是「用户名 + 允许来源」的组合（例如 `myapp@%`）�
 
 跨平台 Electron 版现已提供服务器管理模块，可打包为 Windows、macOS 和 Linux 客户端。开发命令、产物格式与功能范围见 [Electron 客户端说明](electron/README.md)。原生 macOS 版仍按下文构建。
 
-推送到 `main` 后，GitHub Actions 会自动构建原生 SwiftUI macOS 版和 Electron 的 macOS、Windows、Linux 版。在仓库的 **Actions → Build Seraphim → 对应运行 → Artifacts** 下载压缩包；也可用 `workflow_dispatch` 手动运行。产物保留 30 天。
+推送到 `main` 后，GitHub Actions 会自动构建原生 SwiftUI macOS 版和 Electron 的 macOS、Windows、Linux 版。四个版本分别出现在 **Actions → Build Seraphim → 对应运行 → Artifacts**，构建成功后也会自动上传到 **Releases** 作为预览版，并附带 `SHA256SUMS.txt`。推送 `v*` 标签会生成正式 Release；也可用 `workflow_dispatch` 手动运行。Actions Artifacts 保留 30 天。
 
 ```bash
 # 1) 装数据库本体（本工具不负责安装，只管已有实例）

@@ -8,6 +8,7 @@ const { createCertificates } = require('./lib/certificates');
 const { request } = require('./lib/transport');
 const { route, pathQuery } = require('./lib/routes');
 const { createSSHInstaller } = require('./lib/ssh-installer');
+const { planUpload, remotePath, uploadPlan } = require('./lib/file-upload');
 
 let store;
 let dns;
@@ -15,7 +16,7 @@ let certificates;
 let sshInstaller;
 let certificateJob = false;
 let window;
-const chosenUploads = new Set();
+const chosenUploads = new Map();
 const chosenSSHKeys = new Set();
 const appIcon = path.join(__dirname, 'assets', 'icon.png');
 
@@ -76,20 +77,54 @@ app.whenReady().then(() => {
     const [method, endpoint, body] = route(action, payload);
     return (await request(connection, token, method, endpoint, { body })).data;
   });
-  ipcMain.handle('files:choose-upload', async () => {
-    const result = await dialog.showOpenDialog(window, { properties: ['openFile'] });
-    if (result.canceled) return null;
-    const selected = result.filePaths[0];
-    chosenUploads.add(selected);
-    return { path: selected, name: path.basename(selected), size: fs.statSync(selected).size };
+  const registerUploads = (paths) => {
+    if (!Array.isArray(paths) || !paths.length || paths.length > 100) throw new Error('一次最多上传 100 个文件或文件夹');
+    const entries = paths.map((localPath) => {
+      if (typeof localPath !== 'string' || !path.isAbsolute(localPath)) throw new Error('本地路径无效');
+      const info = fs.lstatSync(localPath);
+      if (!info.isFile() && !info.isDirectory()) throw new Error('无法上传符号链接或特殊文件');
+      return { id: crypto.randomUUID(), name: path.basename(localPath), kind: info.isDirectory() ? 'directory' : 'file', localPath };
+    });
+    chosenUploads.clear();
+    for (const entry of entries) chosenUploads.set(entry.id, entry.localPath);
+    return entries.map(({ id, name, kind }) => ({ id, name, kind }));
+  };
+  ipcMain.handle('files:choose-upload', async (_event, kind) => {
+    if (!['file', 'directory'].includes(kind)) throw new Error('上传类型无效');
+    const result = await dialog.showOpenDialog(window, {
+      properties: [kind === 'file' ? 'openFile' : 'openDirectory', 'multiSelections']
+    });
+    return result.canceled ? null : registerUploads(result.filePaths);
   });
-  ipcMain.handle('files:upload', async (_event, { localPath, remotePath, overwrite }) => {
-    if (!chosenUploads.has(localPath)) throw new Error('请先通过文件选择窗口选择本地文件');
-    if (typeof remotePath !== 'string' || !remotePath.startsWith('/')) throw new Error('服务器路径无效');
+  ipcMain.handle('files:register-drop', (_event, paths) => registerUploads(paths));
+  ipcMain.handle('files:upload', async (event, { ids, remoteDir, overwrite }) => {
+    if (!Array.isArray(ids) || !ids.length || ids.length > 100 || new Set(ids).size !== ids.length ||
+        ids.some((id) => !chosenUploads.has(id))) throw new Error('请重新选择要上传的内容');
+    const plan = planUpload(ids.map((id) => chosenUploads.get(id)));
+    remotePath(remoteDir, plan.items[0].parts);
     const { connection, token } = store.selected();
-    const query = `${pathQuery(remotePath)}&overwrite=${overwrite === true}`;
-    await request(connection, token, 'PUT', `/v1/files/content?${query}`, { input: localPath, timeout: 3600000 });
-    return true;
+    const listing = (await request(connection, token, 'GET', `/v1/files?${pathQuery(remoteDir)}`)).data;
+    const conflicts = plan.roots.filter((name) => listing.entries.some((item) => item.name === name));
+    if (conflicts.length && overwrite !== true) throw new Error(`服务器上已存在：${conflicts.join('、')}，请确认覆盖后重试`);
+    const result = await uploadPlan(plan, remoteDir, overwrite === true, {
+      mkdir: (destination) => request(connection, token, 'POST', '/v1/files', {
+        body: { operation: 'mkdir', path: destination }
+      }),
+      directoryExists: async (destination) => {
+        try {
+          await request(connection, token, 'GET', `/v1/files?${pathQuery(destination)}`);
+          return true;
+        } catch (error) {
+          if ([400, 404, 409].includes(error.status)) return false;
+          throw error;
+        }
+      },
+      uploadFile: (localPath, destination, allowOverwrite) => request(connection, token, 'PUT',
+        `/v1/files/content?${pathQuery(destination)}&overwrite=${allowOverwrite}`, { input: localPath, timeout: 3600000 }),
+      progress: (completed, total, name) => event.sender.send('files:upload-progress', { completed, total, name })
+    });
+    chosenUploads.clear();
+    return result;
   });
   ipcMain.handle('files:download', async (_event, remotePath) => {
     const { connection, token } = store.selected();

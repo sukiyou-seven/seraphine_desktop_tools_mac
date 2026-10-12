@@ -207,9 +207,24 @@ renders.status = () => {
 renders.files = () => {
   $('#page-actions').innerHTML = '';
   const entries = S.data.entries || [];
-  $('#content').innerHTML = `<div class="toolbar"><button class="secondary" data-action="files.up">上一级</button><input id="file-path" aria-label="服务器路径" value="${esc(S.filePath)}"><button class="secondary" data-action="files.go">前往</button><button data-action="files.mkdir">新建文件夹</button><button class="secondary" data-action="files.touch">新建文件</button><button class="secondary" data-action="files.upload">上传</button></div>
+  $('#content').innerHTML = `<div class="toolbar"><button class="secondary" data-action="files.up">上一级</button><input id="file-path" aria-label="服务器路径" value="${esc(S.filePath)}"><button class="secondary" data-action="files.go">前往</button><button data-action="files.mkdir">新建文件夹</button><button class="secondary" data-action="files.touch">新建文件</button><button class="secondary" data-action="files.upload-file">上传文件</button><button class="secondary" data-action="files.upload-folder">上传文件夹</button></div>
+    <div class="file-drop-hint">也可以把文件或文件夹拖到这里上传，保留文件夹结构和空目录。</div>
     <section class="card"><table class="table"><thead><tr><th>名称</th><th>权限</th><th>大小</th><th>修改时间</th><th></th></tr></thead><tbody>${entries.map((file, index) => `<tr><td>${file.kind === 'directory' ? '📁' : '📄'} <button class="linklike mono" data-action="files.open" data-index="${index}">${esc(file.name)}</button></td><td class="mono">${esc(file.permissions || '—')}</td><td>${file.kind === 'directory' ? '—' : fmtBytes(file.size_bytes)}</td><td>${esc((file.modified_at || '').replace('T', ' ').slice(0, 16))}</td><td class="actions-cell"><div class="actions">${file.kind === 'directory' ? button('进入', 'files.open', `data-index="${index}"`) : button('下载', 'files.download', `data-index="${index}"`)}${button('重命名', 'files.rename', `data-index="${index}"`)}${button('权限', 'files.chmod', `data-index="${index}"`)}${button('删除', 'files.delete', `data-index="${index}"`, 'danger')}</div></td></tr>`).join('')}</tbody></table>${entries.length ? '' : empty('此目录为空')}</section>`;
 };
+
+async function beginFileUpload(chosen) {
+  if (!chosen?.length || S.busy) return;
+  const existing = chosen.filter((entry) => S.data.entries.some((item) => item.name === entry.name));
+  const overwrite = existing.length > 0;
+  if (overwrite && !confirm(`服务器上已有 ${existing.map((entry) => entry.name).join('、')}。覆盖同名文件并合并文件夹？`)) return;
+  const directory = S.filePath;
+  setNotice(`正在上传 ${chosen.length} 项…`);
+  const result = await run(() => window.sera.upload(chosen.map((entry) => entry.id), directory, overwrite));
+  if (result) {
+    await refresh(false);
+    setNotice(`上传完成：${result.files} 个文件、${result.directories} 个文件夹${result.skipped ? `；跳过 ${result.skipped} 个符号链接或特殊文件` : ''}`);
+  }
+}
 
 async function fileAction(action, index) {
   const file = S.data.entries[index];
@@ -224,17 +239,8 @@ async function fileAction(action, index) {
       await api('files.command', { operation: action === 'files.mkdir' ? 'mkdir' : 'touch', path: joinRemote(S.filePath, name) });
       await refresh(false);
     }, '创建');
-  } else if (action === 'files.upload') {
-    const chosen = await window.sera.chooseUpload();
-    if (!chosen) return;
-    const remote = joinRemote(S.filePath, chosen.name);
-    let overwrite = false;
-    if (S.data.entries.some((item) => item.name === chosen.name)) {
-      if (!confirm(`覆盖服务器上的 ${chosen.name}？`)) return;
-      overwrite = true;
-    }
-    await run(() => window.sera.upload(chosen.path, remote, overwrite), '上传完成');
-    await refresh(false);
+  } else if (action === 'files.upload-file' || action === 'files.upload-folder') {
+    await beginFileUpload(await window.sera.chooseUpload(action === 'files.upload-folder' ? 'directory' : 'file'));
   } else if (action === 'files.download') {
     const saved = await run(() => window.sera.download(file.path));
     if (saved) setNotice(`已下载到 ${saved}`);
@@ -806,6 +812,38 @@ document.addEventListener('input', (event) => {
     $('#store-search').focus();
     $('#store-search').setSelectionRange(position, position);
   }
+});
+let fileDragDepth = 0;
+const hasDroppedFiles = (event) => Array.from(event.dataTransfer?.types || []).includes('Files');
+document.addEventListener('dragenter', (event) => {
+  if (!hasDroppedFiles(event)) return;
+  event.preventDefault();
+  if (S.section === 'files') {
+    fileDragDepth++;
+    $('#content').classList.add('file-drop-active');
+  }
+});
+document.addEventListener('dragover', (event) => {
+  if (!hasDroppedFiles(event)) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = S.section === 'files' && !S.busy ? 'copy' : 'none';
+});
+document.addEventListener('dragleave', (event) => {
+  if (!hasDroppedFiles(event)) return;
+  fileDragDepth = Math.max(0, fileDragDepth - 1);
+  if (!fileDragDepth) $('#content').classList.remove('file-drop-active');
+});
+document.addEventListener('drop', async (event) => {
+  if (!hasDroppedFiles(event)) return;
+  event.preventDefault();
+  fileDragDepth = 0;
+  $('#content').classList.remove('file-drop-active');
+  if (S.section !== 'files' || S.busy || !event.target.closest('#content')) return;
+  try { await beginFileUpload(await window.sera.registerDropped(event.dataTransfer.files)); }
+  catch (error) { setNotice(error.message || String(error), true); }
+});
+window.sera.onUploadProgress(({ completed, total, name }) => {
+  if (S.section === 'files') setNotice(`正在上传 ${completed}/${total}：${name}`);
 });
 $('#connection-select').addEventListener('change', async (event) => {
   try {
