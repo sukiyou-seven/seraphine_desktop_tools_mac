@@ -5,7 +5,9 @@ sera_download httpd-2.4.69.tar.gz https://downloads.apache.org/httpd/httpd-2.4.6
 sera_extract_tar
 cd "$sera_work"
 sera_stage '编译 Apache HTTP Server'
-./configure --prefix="$sera_prefix" --enable-so --enable-ssl --enable-rewrite --with-mpm=event --with-ssl
+./configure --prefix="$sera_prefix" --enable-so --enable-ssl --enable-rewrite \
+    --enable-proxy=shared --enable-proxy-http=shared --enable-proxy-fcgi=shared \
+    --with-mpm=event --with-ssl
 make -j1
 sera_create_user seraphim-apache
 sera_create_prefix

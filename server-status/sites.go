@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -20,13 +21,14 @@ import (
 )
 
 type site struct {
-	ID       string   `json:"id"`
-	Provider string   `json:"provider"`
-	Domains  []string `json:"domains"`
-	Kind     string   `json:"kind"`
-	Upstream string   `json:"upstream"`
-	Root     string   `json:"root"`
-	Enabled  bool     `json:"enabled"`
+	ID         string   `json:"id"`
+	Provider   string   `json:"provider"`
+	Domains    []string `json:"domains"`
+	Kind       string   `json:"kind"`
+	Upstream   string   `json:"upstream"`
+	PHPVersion string   `json:"php_version,omitempty"`
+	Root       string   `json:"root"`
+	Enabled    bool     `json:"enabled"`
 }
 
 type siteProvider struct {
@@ -38,8 +40,9 @@ type siteProvider struct {
 }
 
 type siteListing struct {
-	Items     []site         `json:"items"`
-	Providers []siteProvider `json:"providers"`
+	Items       []site         `json:"items"`
+	Providers   []siteProvider `json:"providers"`
+	PHPVersions []string       `json:"php_versions"`
 }
 
 type siteManager struct {
@@ -48,6 +51,8 @@ type siteManager struct {
 	mu        sync.Mutex
 	test      func(context.Context, string) error
 	reload    func(context.Context, string) error
+	start     func(context.Context, string) error
+	phpReady  func(string) bool
 	isRunning func(context.Context, string) bool
 }
 
@@ -90,6 +95,26 @@ func newSiteManager(root string, software *softwareManager) *siteManager {
 			return fmt.Errorf("%s 重载失败：%s", provider, strings.TrimSpace(string(output)))
 		}
 		return nil
+	}
+	sm.start = func(ctx context.Context, provider string) error {
+		output, err := software.systemctl(ctx, "start", "sera-"+provider+".service")
+		if err != nil {
+			return fmt.Errorf("%s 启动失败：%s", provider, strings.TrimSpace(string(output)))
+		}
+		return nil
+	}
+	sm.phpReady = func(target string) bool {
+		network := "tcp"
+		if strings.HasPrefix(target, "unix:") {
+			network = "unix"
+			target = strings.TrimPrefix(target, "unix:")
+		}
+		conn, err := net.DialTimeout(network, target, 200*time.Millisecond)
+		if err != nil {
+			return false
+		}
+		_ = conn.Close()
+		return true
 	}
 	return sm
 }
@@ -156,18 +181,138 @@ func (sm *siteManager) normalize(input site) (site, error) {
 		}
 	}
 	input.Domains = domains
-	if input.Kind != "static" && input.Kind != "proxy" {
-		return site{}, errors.New("网站类型须为静态站点或反向代理")
+	if input.Kind != "static" && input.Kind != "proxy" && input.Kind != "php" {
+		return site{}, errors.New("网站类型须为静态站点、PHP 网站或反向代理")
 	}
 	if input.Kind == "proxy" {
 		if err := validateUpstream(input.Upstream); err != nil {
 			return site{}, err
 		}
 		input.Upstream = strings.TrimSuffix(input.Upstream, "/")
+		input.PHPVersion = ""
+	} else if input.Kind == "php" {
+		input.Upstream = ""
+		if _, err := sm.phpTarget(input.PHPVersion); err != nil {
+			return site{}, err
+		}
 	} else {
 		input.Upstream = ""
+		input.PHPVersion = ""
 	}
 	return input, nil
+}
+
+func (sm *siteManager) phpTarget(version string) (string, error) {
+	if !versionPattern.MatchString(version) {
+		return "", errors.New("请选择已安装的 PHP 版本")
+	}
+	legacy := filepath.Join(sm.root, "server/php")
+	versioned := filepath.Join(legacy, "versions", version)
+	for _, entry := range []struct{ prefix, target string }{
+		{versioned, "unix:" + filepath.Join(versioned, "run/php-fpm.sock")},
+		{legacy, "127.0.0.1:9000"},
+	} {
+		if directory, err := os.Lstat(entry.prefix); err != nil || !directory.IsDir() {
+			continue
+		}
+		info, err := os.Lstat(filepath.Join(entry.prefix, ".sera-installed"))
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(entry.prefix, ".sera-installed"))
+		if err == nil && strings.TrimSpace(string(data)) == version {
+			return entry.target, nil
+		}
+	}
+	return "", fmt.Errorf("PHP %s 尚未安装，请先在环境管理安装", version)
+}
+
+func (sm *siteManager) ensurePHP(ctx context.Context, version string) error {
+	target, err := sm.phpTarget(version)
+	if err != nil {
+		return err
+	}
+	unit := "sera-php.service"
+	if strings.HasPrefix(target, "unix:") {
+		unit = "sera-php-" + version + ".service"
+		runDir := filepath.Dir(strings.TrimPrefix(target, "unix:"))
+		if info, err := os.Lstat(runDir); err != nil || !info.IsDir() {
+			return fmt.Errorf("PHP socket 目录无效：%s", runDir)
+		}
+		if err := os.Chmod(runDir, 0750); err != nil {
+			return fmt.Errorf("PHP socket 目录权限设置失败：%w", err)
+		}
+	}
+	logDir := "php"
+	if strings.HasPrefix(target, "unix:") {
+		logDir = "php-" + version
+	}
+	logFile := filepath.Join(sm.root, "logs", logDir, "php-fpm.log")
+	if info, err := os.Lstat(logFile); err == nil {
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("PHP 日志文件无效：%s", logFile)
+		}
+		account, err := user.Lookup("seraphim-web")
+		if err != nil {
+			return fmt.Errorf("PHP 运行用户不存在：%w", err)
+		}
+		uid, err := strconv.Atoi(account.Uid)
+		if err != nil {
+			return err
+		}
+		gid, err := strconv.Atoi(account.Gid)
+		if err != nil {
+			return err
+		}
+		if err := os.Chown(logFile, uid, gid); err != nil {
+			return fmt.Errorf("PHP 日志权限修复失败：%w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	output, err := sm.software.systemctl(ctx, "is-active", unit)
+	if err != nil || strings.TrimSpace(string(output)) != "active" {
+		output, err = sm.software.systemctl(ctx, "start", unit)
+		if err != nil {
+			return fmt.Errorf("PHP %s 启动失败：%s", version, strings.TrimSpace(string(output)))
+		}
+	}
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) && ctx.Err() == nil {
+		output, err = sm.software.systemctl(ctx, "is-active", unit)
+		if err == nil && strings.TrimSpace(string(output)) == "active" && sm.phpReady(target) {
+			return nil
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	return fmt.Errorf("PHP %s 服务未就绪，请检查 PHP-FPM 日志", version)
+}
+
+func (sm *siteManager) phpVersions() []string {
+	versions := map[string]bool{}
+	legacy := filepath.Join(sm.root, "server/php")
+	if data, err := os.ReadFile(filepath.Join(legacy, ".sera-installed")); err == nil {
+		version := strings.TrimSpace(string(data))
+		if versionPattern.MatchString(version) {
+			versions[version] = true
+		}
+	}
+	if entries, err := os.ReadDir(filepath.Join(legacy, "versions")); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() || !versionPattern.MatchString(entry.Name()) {
+				continue
+			}
+			if data, err := os.ReadFile(filepath.Join(legacy, "versions", entry.Name(), ".sera-installed")); err == nil && strings.TrimSpace(string(data)) == entry.Name() {
+				versions[entry.Name()] = true
+			}
+		}
+	}
+	result := make([]string, 0, len(versions))
+	for version := range versions {
+		result = append(result, version)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(result)))
+	return result
 }
 
 func (sm *siteManager) siteDir(provider string) string {
@@ -197,7 +342,7 @@ func (sm *siteManager) installed(provider string) bool {
 func (sm *siteManager) list() (siteListing, error) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	result := siteListing{Items: []site{}, Providers: []siteProvider{}}
+	result := siteListing{Items: []site{}, Providers: []siteProvider{}, PHPVersions: sm.phpVersions()}
 	for _, entry := range siteProviders {
 		entry.Installed = sm.installed(entry.ID)
 		if entry.Installed {
@@ -281,7 +426,7 @@ func (sm *siteManager) checkDomainConflict(candidate site) error {
 	return nil
 }
 
-func siteConfig(item site, port int) []byte {
+func siteConfig(item site, port int, phpTarget string) []byte {
 	domains := strings.Join(item.Domains, " ")
 	access := filepath.Join("/www/seraphim/logs", item.Provider+"-"+item.ID+"-access.log")
 	problem := filepath.Join("/www/seraphim/logs", item.Provider+"-"+item.ID+"-error.log")
@@ -292,8 +437,18 @@ func siteConfig(item site, port int) []byte {
 			fmt.Fprintf(&body, "    ServerAlias %s\n", domain)
 		}
 		fmt.Fprintf(&body, "    ErrorLog %q\n    CustomLog %q combined\n", problem, access)
-		if item.Kind == "static" {
+		if item.Kind == "static" || item.Kind == "php" {
 			fmt.Fprintf(&body, "    DocumentRoot %q\n    <Directory %q>\n        Require all granted\n        Options FollowSymLinks\n        AllowOverride None\n    </Directory>\n", item.Root, item.Root)
+			if item.Kind == "php" {
+				body.WriteString("    DirectoryIndex index.php index.html\n")
+				handler := "proxy:fcgi://" + phpTarget
+				if strings.HasPrefix(phpTarget, "unix:") {
+					handler = "proxy:" + phpTarget + "|fcgi://localhost/"
+				}
+				fmt.Fprintf(&body, "    <FilesMatch %q>\n        SetHandler %q\n    </FilesMatch>\n", `\.php$`, handler)
+			} else {
+				fmt.Fprintf(&body, "    <FilesMatch %q>\n        Require all denied\n    </FilesMatch>\n", `\.php$`)
+			}
 		} else {
 			fmt.Fprintf(&body, "    ProxyPreserveHost On\n    ProxyPass / %q\n    ProxyPassReverse / %q\n", item.Upstream+"/", item.Upstream+"/")
 		}
@@ -303,8 +458,17 @@ func siteConfig(item site, port int) []byte {
 	var body strings.Builder
 	fmt.Fprintf(&body, "server {\n    listen %d;\n    server_name %s;\n", port, domains)
 	fmt.Fprintf(&body, "    access_log %s;\n    error_log %s warn;\n", access, problem)
-	if item.Kind == "static" {
-		fmt.Fprintf(&body, "    root %s;\n    index index.html;\n    location / { try_files $uri $uri/ =404; }\n", item.Root)
+	if item.Kind == "static" || item.Kind == "php" {
+		fmt.Fprintf(&body, "    root %s;\n", item.Root)
+		if item.Kind == "php" {
+			fastcgiParams := "/www/seraphim/server/nginx/conf/fastcgi_params"
+			if item.Provider == "openresty" {
+				fastcgiParams = "/www/seraphim/server/openresty/nginx/conf/fastcgi_params"
+			}
+			fmt.Fprintf(&body, "    index index.php index.html;\n    location / { try_files $uri $uri/ /index.php?$query_string; }\n    location ~ \\.php$ {\n        try_files $uri =404;\n        include %s;\n        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;\n        fastcgi_pass %s;\n    }\n", fastcgiParams, phpTarget)
+		} else {
+			body.WriteString("    index index.html;\n    location / { try_files $uri $uri/ =404; }\n    location ~ \\.php$ { return 404; }\n")
+		}
 	} else {
 		fmt.Fprintf(&body, "    location / {\n        proxy_pass %s;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n    }\n", item.Upstream)
 	}
@@ -312,23 +476,35 @@ func siteConfig(item site, port int) []byte {
 	return []byte(body.String())
 }
 
-func siteInclude(base, provider, root string) ([]byte, error) {
+func siteInclude(base, provider, root string, php bool) ([]byte, error) {
 	pattern := filepath.Join(root, "sites", provider, "*.conf")
-	if strings.Contains(base, pattern) {
-		return []byte(base), nil
-	}
 	if provider == "apache" {
-		// The bundled Apache build has these DSO modules. They are needed by proxy sites.
-		extra := "\nLoadModule proxy_module modules/mod_proxy.so\nLoadModule proxy_http_module modules/mod_proxy_http.so\n"
-		for _, name := range []string{"proxy_module", "proxy_http_module"} {
-			for _, line := range strings.Split(base, "\n") {
-				if strings.HasPrefix(strings.TrimSpace(line), "LoadModule "+name+" ") {
-					extra = strings.Replace(extra, "LoadModule "+name+" modules/mod_"+strings.TrimSuffix(name, "_module")+".so\n", "", 1)
-					break
-				}
+		if php {
+			base = strings.Replace(base, "Group seraphim-apache", "Group seraphim-web", 1)
+		}
+		for _, module := range []string{"proxy_module", "proxy_http_module", "proxy_fcgi_module"} {
+			if module == "proxy_fcgi_module" && !php {
+				continue
+			}
+			if !strings.Contains(base, "LoadModule "+module+" ") {
+				base += "\nLoadModule " + module + " modules/mod_" + strings.TrimSuffix(module, "_module") + ".so\n"
 			}
 		}
-		return []byte(base + extra + "IncludeOptional " + pattern + "\n"), nil
+		if !strings.Contains(base, pattern) {
+			base += "IncludeOptional " + pattern + "\n"
+		}
+		return []byte(base), nil
+	}
+	if php {
+		userLine := regexp.MustCompile(`(?m)^\s*user\s+[^;]+;\s*$`)
+		if userLine.MatchString(base) {
+			base = userLine.ReplaceAllString(base, "user seraphim-web;")
+		} else {
+			base = "user seraphim-web;\n" + base
+		}
+	}
+	if strings.Contains(base, pattern) {
+		return []byte(base), nil
 	}
 	trimmed := strings.TrimRight(base, " \t\r\n")
 	if !strings.HasSuffix(trimmed, "}") || !strings.Contains(trimmed, "http {") {
@@ -497,12 +673,12 @@ func (sm *siteManager) apply(input site, deleteSite, creating bool) (site, error
 			return site{}, err
 		}
 	} else {
-		if input.Kind == "static" {
+		if input.Kind == "static" || input.Kind == "php" {
 			if err := ensureSiteRoot(sm.root, input.Provider, input.ID); err != nil {
 				return site{}, err
 			}
 		}
-		base, err := siteInclude(string(snapshots[0].data), input.Provider, sm.root)
+		base, err := siteInclude(string(snapshots[0].data), input.Provider, sm.root, input.Kind == "php")
 		if err != nil {
 			return site{}, err
 		}
@@ -521,20 +697,37 @@ func (sm *siteManager) apply(input site, deleteSite, creating bool) (site, error
 					port = provider.Port
 				}
 			}
-			if err := atomicSiteWrite(paths[2], siteConfig(input, port), 0644); err != nil {
+			phpTarget := ""
+			if input.Kind == "php" {
+				var err error
+				phpTarget, err = sm.phpTarget(input.PHPVersion)
+				if err != nil {
+					return site{}, err
+				}
+			}
+			if err := atomicSiteWrite(paths[2], siteConfig(input, port, phpTarget), 0644); err != nil {
 				return site{}, err
 			}
 		} else if err := os.Remove(paths[2]); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return site{}, err
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	if err := sm.test(ctx, input.Provider); err != nil {
 		return site{}, err
 	}
+	if !deleteSite && input.Enabled && input.Kind == "php" {
+		if err := sm.ensurePHP(ctx, input.PHPVersion); err != nil {
+			return site{}, err
+		}
+	}
 	if sm.isRunning(ctx, input.Provider) {
 		if err := sm.reload(ctx, input.Provider); err != nil {
+			return site{}, err
+		}
+	} else if !deleteSite && input.Enabled {
+		if err := sm.start(ctx, input.Provider); err != nil {
 			return site{}, err
 		}
 	}

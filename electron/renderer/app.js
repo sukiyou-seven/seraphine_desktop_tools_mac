@@ -271,24 +271,35 @@ renders.sites = () => {
   $('#page-actions').innerHTML = '<button data-action="sites.new">新建网站</button>';
   const sites = list(S.data), providers = S.data.providers || [];
   $('#content').innerHTML = `${card('Web 服务', providers.map((provider) => row(`<strong>${esc(provider.name)}</strong> ${tag(provider.installed ? (provider.running ? '运行中' : '已停止') : '未安装', provider.running)} <span class="small muted">端口 ${esc(provider.port)}</span>`)).join('') || empty('没有可用的 Web 服务'))}
-    ${sites.map((site, index) => card(site.domains?.[0] || site.id, `<div class="inline">${tag(site.provider)} ${tag(site.kind === 'proxy' ? '反向代理' : '静态网站')} ${tag(site.enabled ? '已启用' : '已停用', site.enabled)}</div><dl class="kv"><dt>域名</dt><dd>${esc((site.domains || []).join('、'))}</dd><dt>目录</dt><dd class="mono">${esc(site.root)}</dd>${site.kind === 'proxy' ? `<dt>上游</dt><dd class="mono">${esc(site.upstream)}</dd>` : ''}</dl>`, `${button('编辑', 'sites.edit', `data-index="${index}"`)}${button(site.enabled ? '停用' : '启用', 'sites.toggle', `data-index="${index}"`)}${button('文件', 'sites.files', `data-index="${index}"`)}${button('删除', 'sites.delete', `data-index="${index}"`, 'danger')}`)).join('') || empty('尚无网站')}`;
+    ${sites.map((site, index) => card(site.domains?.[0] || site.id, `<div class="inline">${tag(site.provider)} ${tag(site.kind === 'proxy' ? '反向代理' : site.kind === 'php' ? `PHP ${site.php_version || ''}` : '静态网站')} ${tag(site.enabled ? '已启用' : '已停用', site.enabled)}</div><dl class="kv"><dt>域名</dt><dd>${esc((site.domains || []).join('、'))}</dd><dt>目录</dt><dd class="mono">${esc(site.root)}</dd>${site.kind === 'proxy' ? `<dt>上游</dt><dd class="mono">${esc(site.upstream)}</dd>` : ''}</dl>`, `${button('编辑', 'sites.edit', `data-index="${index}"`)}${button(site.enabled ? '停用' : '启用', 'sites.toggle', `data-index="${index}"`)}${site.kind !== 'proxy' ? button('文件', 'sites.files', `data-index="${index}"`) : ''}${button('删除', 'sites.delete', `data-index="${index}"`, 'danger')}`)).join('') || empty('尚无网站')}`;
 };
 function siteForm(site) {
   const installed = (S.data.providers || []).filter((provider) => provider.installed);
+  const phpVersions = S.data.php_versions || [];
   modal(site ? '编辑网站' : '新建网站', [
     { name: 'provider', label: 'Web 服务', type: 'select', options: (site ? S.data.providers : installed).map((provider) => [provider.id, provider.name]), value: site?.provider },
-    { name: 'kind', label: '网站类型', type: 'select', options: [['static', '静态网站'], ['proxy', '反向代理']], value: site?.kind || 'static' },
+    { name: 'kind', label: '网站类型', type: 'select', options: [['static', '静态网站'], ['php', 'PHP 网站'], ['proxy', '反向代理']], value: site?.kind || 'static' },
     { name: 'domains', label: '域名（逗号或换行分隔）', type: 'textarea', value: site?.domains?.join('\n') || '', required: true, full: true },
+    { name: 'phpVersion', label: 'PHP 版本', type: 'select', options: phpVersions.length ? phpVersions.map((version) => [version, version]) : [['', '请先到环境管理安装 PHP']], value: site?.php_version || phpVersions[0] || '', full: true },
     { name: 'upstream', label: '反向代理地址（仅代理站点）', value: site?.upstream || '', placeholder: 'http://127.0.0.1:3000', full: true },
     { name: 'enabled', label: '启用网站', type: 'checkbox', value: site?.enabled ?? true }
   ], async (values) => {
     const payload = { provider: values.provider, kind: values.kind,
-      domains: values.domains.split(/[\s,，]+/).filter(Boolean), upstream: values.upstream.trim(), enabled: values.enabled };
+      domains: values.domains.split(/[\s,，]+/).filter(Boolean), upstream: values.upstream.trim(),
+      php_version: values.kind === 'php' ? values.phpVersion : '', enabled: values.enabled };
     if (!payload.domains.length) throw new Error('至少输入一个域名');
+    if (payload.kind === 'php' && !payload.php_version) throw new Error('请先到环境管理安装 PHP');
     await api(site ? 'sites.update' : 'sites.create', site
       ? { provider: site.provider, id: site.id, site: payload } : { site: payload });
     await refresh(false);
   });
+  const updateFields = () => {
+    const kind = $('#field-kind').value;
+    $('#field-phpVersion').closest('.field').hidden = kind !== 'php';
+    $('#field-upstream').closest('.field').hidden = kind !== 'proxy';
+  };
+  $('#field-kind').addEventListener('change', updateFields);
+  updateFields();
 }
 async function siteAction(action, index) {
   const site = list(S.data)[index];
@@ -296,6 +307,7 @@ async function siteAction(action, index) {
   else if (action === 'sites.edit') siteForm(site);
   else if (action === 'sites.toggle') await mutate('sites.update', { provider: site.provider, id: site.id,
     site: { provider: site.provider, domains: site.domains, kind: site.kind, upstream: site.upstream,
+      php_version: site.php_version || '',
       enabled: !site.enabled } }, site.enabled ? '网站已停用' : '网站已启用');
   else if (action === 'sites.files') { S.filePath = site.root; S.section = 'files'; await refresh(); }
   else if (action === 'sites.delete' && confirm(`删除 ${site.domains?.[0] || site.id} 的网站配置？网站文件会保留。`))

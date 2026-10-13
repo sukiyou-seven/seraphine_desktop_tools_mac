@@ -42,7 +42,7 @@ case "$id" in
     if [ "$id" = ruby ]; then "$sera_prefix/bin/ruby" --version; fi
     if [ "$id" = php ]; then
         install -d -m 0755 "$sera_prefix/etc" "$sera_prefix/etc/conf.d"
-        install -d -m 0700 "$sera_prefix/run"
+        install -d -m 0750 "$sera_prefix/run"
         cp php.ini-production "$sera_prefix/etc/php.ini"
         if ! getent group seraphim-web >/dev/null 2>&1; then groupadd --system seraphim-web; fi
         if ! id -u seraphim-web >/dev/null 2>&1; then useradd --system --no-create-home --gid seraphim-web --shell /sbin/nologin seraphim-web; fi
@@ -58,12 +58,17 @@ group = seraphim-web
 listen = $sera_prefix/run/php-fpm.sock
 listen.owner = seraphim-web
 listen.group = seraphim-web
+listen.mode = 0660
 pm = ondemand
 pm.max_children = 3
 pm.process_idle_timeout = 10s
 EOF
         chown -R seraphim-web:seraphim-web "$sera_prefix/run"
         "$sera_prefix/sbin/php-fpm" -t -y "$sera_prefix/etc/php-fpm.conf" -c "$sera_prefix/etc/php.ini"
+        if [ -f "$sera_root/logs/php-$version/php-fpm.log" ]; then
+            chown seraphim-web:seraphim-web "$sera_root/logs/php-$version/php-fpm.log"
+            chmod 0600 "$sera_root/logs/php-$version/php-fpm.log"
+        fi
         "$sera_prefix/bin/php" --version
         cat > "$unit" <<EOF
 [Unit]

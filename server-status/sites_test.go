@@ -129,9 +129,14 @@ func TestSitesRollbackAndSymlink(t *testing.T) {
 	}
 	sites.test = func(context.Context, string) error { return nil }
 	sites.isRunning = func(context.Context, string) bool { return false }
+	starts := 0
+	sites.start = func(context.Context, string) error { starts++; return nil }
 	item := site{ID: "example.com", Provider: "nginx", Domains: []string{"example.com"}, Kind: "static", Root: filepath.Join(root, "web/nginx/example.com"), Enabled: true}
 	if _, err := sites.apply(item, false, true); err != nil {
 		t.Fatal(err)
+	}
+	if starts != 1 {
+		t.Fatalf("enabled website did not start Nginx: %d", starts)
 	}
 	before, _ := os.ReadFile(sites.confPath("nginx", item.ID))
 	sites.test = func(context.Context, string) error { return errors.New("syntax rejected") }
@@ -156,5 +161,114 @@ func TestSitesRollbackAndSymlink(t *testing.T) {
 	item.Root = link
 	if _, err := sites.apply(item, false, true); err == nil {
 		t.Fatal("symlink root accepted")
+	}
+}
+
+func TestPHPSitesUseInstalledFPMAndStaticSitesHidePHPSource(t *testing.T) {
+	root := t.TempDir()
+	sites := newSiteManager(root, newSoftwareManager(root))
+	for _, provider := range siteProviders {
+		base := sites.basePath(provider.ID)
+		if err := os.MkdirAll(filepath.Dir(base), 0755); err != nil {
+			t.Fatal(err)
+		}
+		config := "http {\n}\n"
+		if provider.ID == "apache" {
+			config = "ServerRoot \"/tmp\"\n"
+		}
+		if err := os.WriteFile(base, []byte(config), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "server", provider.ID, ".sera-installed"), []byte("test"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacy := filepath.Join(root, "server/php")
+	if err := os.MkdirAll(legacy, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, ".sera-installed"), []byte("8.4.26\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	versioned := filepath.Join(legacy, "versions/8.3.35")
+	if err := os.MkdirAll(versioned, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(versioned, ".sera-installed"), []byte("8.3.35\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(versioned, "run"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if got := sites.phpVersions(); len(got) != 2 || got[0] != "8.4.26" || got[1] != "8.3.35" {
+		t.Fatalf("versions: %v", got)
+	}
+	started := []string{}
+	running := map[string]bool{}
+	sites.phpReady = func(string) bool { return true }
+	sites.software.systemctl = func(_ context.Context, args ...string) ([]byte, error) {
+		if args[0] == "is-active" {
+			if running[args[1]] {
+				return []byte("active"), nil
+			}
+			return []byte("inactive"), errors.New("inactive")
+		}
+		started = append(started, args[1])
+		running[args[1]] = true
+		return nil, nil
+	}
+	if err := sites.ensurePHP(context.Background(), "8.4.26"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sites.ensurePHP(context.Background(), "8.3.35"); err != nil {
+		t.Fatal(err)
+	}
+	if len(started) != 2 || started[0] != "sera-php.service" || started[1] != "sera-php-8.3.35.service" {
+		t.Fatalf("unexpected FPM services: %v", started)
+	}
+	if info, err := os.Stat(filepath.Join(versioned, "run")); err != nil || info.Mode().Perm() != 0750 {
+		t.Fatalf("versioned socket directory must be accessible to web group: %v %v", info, err)
+	}
+	if _, err := sites.normalize(site{Provider: "nginx", Domains: []string{"x.example.com"}, Kind: "php", PHPVersion: "8.2.1"}); err == nil {
+		t.Fatal("uninstalled PHP accepted")
+	}
+	for _, provider := range siteProviders {
+		base := site{ID: provider.ID + ".example.com", Provider: provider.ID, Domains: []string{provider.ID + ".example.com"}, Root: filepath.Join(root, "web", provider.ID, provider.ID+".example.com"), Enabled: true}
+		static := base
+		static.Kind = "static"
+		staticConfig := string(siteConfig(static, provider.Port, ""))
+		if !strings.Contains(staticConfig, "\\.php$") || !strings.Contains(staticConfig, "denied") && !strings.Contains(staticConfig, "return 404") {
+			t.Fatalf("%s can expose PHP source: %s", provider.ID, staticConfig)
+		}
+		php := base
+		php.Kind, php.PHPVersion = "php", "8.4.26"
+		legacyTarget, err := sites.phpTarget(php.PHPVersion)
+		if err != nil {
+			t.Fatal(err)
+		}
+		config := string(siteConfig(php, provider.Port, legacyTarget))
+		if !strings.Contains(config, "127.0.0.1:9000") || !strings.Contains(config, "index.php") {
+			t.Fatalf("%s PHP handler missing: %s", provider.ID, config)
+		}
+		php.PHPVersion = "8.3.35"
+		versionTarget, err := sites.phpTarget(php.PHPVersion)
+		if err != nil || !strings.HasPrefix(versionTarget, "unix:") {
+			t.Fatalf("version target: %q %v", versionTarget, err)
+		}
+		config = string(siteConfig(php, provider.Port, versionTarget))
+		if !strings.Contains(config, "php-fpm.sock") {
+			t.Fatalf("%s versioned handler missing: %s", provider.ID, config)
+		}
+	}
+	base := "ServerRoot \"/tmp\"\nGroup seraphim-apache\nIncludeOptional " + filepath.Join(root, "sites/apache/*.conf") + "\n"
+	config, err := siteInclude(base, "apache", root, true)
+	if err != nil || !strings.Contains(string(config), "LoadModule proxy_fcgi_module modules/mod_proxy_fcgi.so") || !strings.Contains(string(config), "Group seraphim-web") {
+		t.Fatalf("Apache proxy_fcgi missing: %s %v", config, err)
+	}
+	for _, provider := range []string{"nginx", "openresty"} {
+		config, err := siteInclude("http {\n    include "+filepath.Join(root, "sites", provider, "*.conf")+";\n}\n", provider, root, true)
+		if err != nil || !strings.HasPrefix(string(config), "user seraphim-web;\n") {
+			t.Fatalf("%s web worker cannot access PHP socket: %s %v", provider, config, err)
+		}
 	}
 }

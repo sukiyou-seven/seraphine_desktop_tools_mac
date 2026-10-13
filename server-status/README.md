@@ -31,7 +31,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o ../
 
 软件商店中的 35 款软件分别安装到 `/www/seraphim/server/{id}`。持久化数据保存在对应软件目录的 `data/`，下载包放在 `/www/seraphim/download`，安装与运行日志放在 `/www/seraphim/logs`。编译依赖和共享库可能由系统的 apt 或 dnf 安装；软件本体和自带运行环境位于指定目录。常驻服务的 systemd 单元作为启动入口，保存在 `/etc/systemd/system`；工具链与 Podman 没有常驻服务。卸载先停止并禁用服务，再移除该软件的安装目录和服务单元；可选择把完整目录移到 `/www/seraphim/backup/software`（仍占用磁盘空间），或连同配置和数据彻底删除。系统依赖包、下载缓存及共享日志不会随卸载删除。
 
-网站管理要求先从软件商店安装 Nginx、Apache 或 OpenResty。三者分别监听 HTTP 80、8082、8083 端口。新建静态网站时创建 `/www/seraphim/web/{服务}/{首个域名}`；反向代理可指向 HTTP/HTTPS 上游。每次变更都会先检查 Web 服务配置，再在服务运行时重载；检查或重载失败则恢复原配置。删除网站仅删除站点定义和 Web 服务配置，保留网站目录。网站证书尚未由此页面部署，当前创建的是 HTTP 站点。
+网站管理要求先从软件商店安装 Nginx、Apache 或 OpenResty。三者分别监听 HTTP 80、8082、8083 端口。静态和 PHP 网站使用 `/www/seraphim/web/{服务}/{首个域名}`；PHP 网站需先安装相应版本的 PHP，网站配置会将 `.php` 请求转发到该版本的 FPM。启用网站时会启动所选 Web 服务及 PHP-FPM。静态网站拒绝直接读取 `.php` 源码。反向代理可指向 HTTP/HTTPS 上游。每次变更都会先检查 Web 服务配置，再在服务运行时重载；检查或重载失败则恢复原配置。删除网站仅删除站点定义和 Web 服务配置，保留网站目录。网站证书尚未由此页面部署，当前创建的是 HTTP 站点。
 
 环境管理从各软件官方发布源读取版本和下载校验值，查询结果缓存 15 分钟。新版本安装在 `/www/seraphim/server/{id}/versions/{version}`，可与同种环境的其他版本并存；升级前的 `/www/seraphim/server/{id}` 仍被识别为旧版安装。安装包下载后验证发布源提供的 SHA-256 或 SHA-512，客户端仅选择版本，不传下载地址或命令。项目管理可指定已安装的运行环境版本；旧项目继续使用原有路径。PHP 每个新版本拥有独立的 FPM 服务和 Unix socket。环境管理不会修改系统全局 PATH。
 

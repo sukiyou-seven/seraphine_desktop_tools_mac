@@ -6,6 +6,7 @@ struct RemoteSite: Codable, Identifiable {
     let domains: [String]
     let kind: String
     let upstream: String
+    let phpVersion: String?
     let root: String
     let enabled: Bool
     var uniqueID: String { "\(provider)/\(id)" }
@@ -23,6 +24,7 @@ struct RemoteSiteProvider: Decodable, Identifiable {
 struct RemoteSiteListing: Decodable {
     let items: [RemoteSite]
     let providers: [RemoteSiteProvider]
+    let phpVersions: [String]?
 }
 
 struct RemoteSitePayload: Encodable {
@@ -30,6 +32,7 @@ struct RemoteSitePayload: Encodable {
     let domains: [String]
     let kind: String
     let upstream: String
+    let phpVersion: String?
     let enabled: Bool
 }
 
@@ -96,14 +99,18 @@ enum ServerSiteAPI {
         let (data, response) = try await session.data(for: request(connection: connection, token: token,
                                                                      path: "/v1/sites", method: "GET"))
         try check(response, data: data, expected: 200)
-        return try JSONDecoder().decode(RemoteSiteListing.self, from: data)
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(RemoteSiteListing.self, from: data)
     }
 
     static func create(connection: ServerConnection, token: String,
                        payload: RemoteSitePayload) async throws -> RemoteSite {
         let session = try session(connection: connection)
         defer { session.invalidateAndCancel() }
-        let body = try JSONEncoder().encode(payload)
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let body = try encoder.encode(payload)
         let (data, response) = try await session.data(for: request(connection: connection, token: token,
                                                                      path: "/v1/sites", method: "POST", body: body))
         try check(response, data: data, expected: 201)
@@ -114,7 +121,9 @@ enum ServerSiteAPI {
                        payload: RemoteSitePayload) async throws {
         let session = try session(connection: connection)
         defer { session.invalidateAndCancel() }
-        let body = try JSONEncoder().encode(payload)
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let body = try encoder.encode(payload)
         let (data, response) = try await session.data(for: request(connection: connection, token: token,
                                                                      path: "/v1/sites/\(site.provider)/\(site.id)",
                                                                      method: "PUT", body: body))

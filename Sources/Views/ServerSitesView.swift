@@ -6,7 +6,7 @@ struct ServerSitesView: View {
     let openFiles: (String) -> Void
     let openStore: () -> Void
 
-    @State private var listing = RemoteSiteListing(items: [], providers: [])
+    @State private var listing = RemoteSiteListing(items: [], providers: [], phpVersions: [])
     @State private var working = false
     @State private var message = ""
     @State private var hasError = false
@@ -17,6 +17,7 @@ struct ServerSitesView: View {
     @State private var domainInput = ""
     @State private var kind = "static"
     @State private var upstream = ""
+    @State private var phpVersion = ""
     @State private var enabled = true
 
     private var installedProviders: [RemoteSiteProvider] {
@@ -33,7 +34,7 @@ struct ServerSitesView: View {
                     .disabled(working || installedProviders.isEmpty)
                 if working { ProgressView().controlSize(.small) }
             }
-            Text("管理 Nginx、Apache 和 OpenResty 的静态站点与反向代理。网站文件在 /www/seraphim/web，日志在 /www/seraphim/logs。")
+            Text("管理 Nginx、Apache 和 OpenResty 的静态、PHP 与反向代理网站。网站文件在 /www/seraphim/web，日志在 /www/seraphim/logs。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             if !message.isEmpty {
@@ -106,7 +107,8 @@ struct ServerSitesView: View {
                 Text(verbatim: site.domains.joined(separator: "、"))
                     .font(.headline)
                     .lineLimit(1)
-                Text(verbatim: site.kind == "static" ? site.root : "代理至 \(site.upstream)")
+                Text(verbatim: site.kind == "proxy" ? "代理至 \(site.upstream)" :
+                     site.kind == "php" ? "PHP \(site.phpVersion ?? "") · \(site.root)" : site.root)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -120,7 +122,7 @@ struct ServerSitesView: View {
                     .foregroundStyle(site.enabled ? Color.green : Color.secondary)
             }
             .frame(width: 155, alignment: .trailing)
-            if site.kind == "static" {
+            if site.kind != "proxy" {
                 Button("文件") { openFiles(site.root) }
             }
             Button("编辑") { beginEdit(site) }
@@ -147,9 +149,21 @@ struct ServerSitesView: View {
                     .textFieldStyle(.roundedBorder)
                 Picker("网站类型", selection: $kind) {
                     Text("静态站点").tag("static")
+                    Text("PHP 网站").tag("php")
                     Text("反向代理").tag("proxy")
                 }
                 .pickerStyle(.segmented)
+                if kind == "php" {
+                    Picker("PHP 版本", selection: $phpVersion) {
+                        ForEach(listing.phpVersions ?? [], id: \.self) { version in
+                            Text(version).tag(version)
+                        }
+                    }
+                    if (listing.phpVersions ?? []).isEmpty {
+                        Text("请先到环境管理安装 PHP；启用网站时会自动启动对应的 PHP-FPM。")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
+                }
                 if kind == "proxy" {
                     TextField("上游地址，例如 http://127.0.0.1:3000", text: $upstream)
                         .textFieldStyle(.roundedBorder)
@@ -175,7 +189,7 @@ struct ServerSitesView: View {
             }
         }
         .padding(20)
-        .frame(width: 600, height: 430)
+        .frame(width: 600, height: 480)
     }
 
     private var parsedDomains: [String] {
@@ -190,6 +204,7 @@ struct ServerSitesView: View {
         domainInput = ""
         kind = "static"
         upstream = ""
+        phpVersion = listing.phpVersions?.first ?? ""
         enabled = true
         showingEditor = true
     }
@@ -202,6 +217,7 @@ struct ServerSitesView: View {
         domainInput = site.domains.joined(separator: ", ")
         kind = site.kind
         upstream = site.upstream
+        phpVersion = site.phpVersion ?? listing.phpVersions?.first ?? ""
         enabled = site.enabled
         showingEditor = true
     }
@@ -227,8 +243,14 @@ struct ServerSitesView: View {
             hasError = true
             return
         }
+        if kind == "php" && phpVersion.isEmpty {
+            message = "请先安装 PHP 运行环境"
+            hasError = true
+            return
+        }
         let payload = RemoteSitePayload(provider: provider, domains: domains,
                                         kind: kind, upstream: upstream.trimmingCharacters(in: .whitespacesAndNewlines),
+                                        phpVersion: kind == "php" ? phpVersion : nil,
                                         enabled: enabled)
         let existing = editing
         working = true
@@ -256,7 +278,8 @@ struct ServerSitesView: View {
 
     private func toggle(_ site: RemoteSite) {
         let payload = RemoteSitePayload(provider: site.provider, domains: site.domains,
-                                        kind: site.kind, upstream: site.upstream, enabled: !site.enabled)
+                                        kind: site.kind, upstream: site.upstream,
+                                        phpVersion: site.phpVersion, enabled: !site.enabled)
         working = true
         Task { @MainActor in
             do {

@@ -15,3 +15,4 @@
   background: rgba(92, 119, 219, .12);
   color: inherit;
 }
+.field[hidden] { display: none; }
