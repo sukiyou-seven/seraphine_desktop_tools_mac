@@ -45,6 +45,11 @@ type project struct {
 	Runtime        string `json:"runtime"`
 	RuntimeVersion string `json:"runtime_version,omitempty"`
 	UseVenv        bool   `json:"use_venv,omitempty"`
+	PythonServer   string `json:"python_server,omitempty"`
+	PythonCallable string `json:"python_callable,omitempty"`
+	PythonWorkers  int    `json:"python_workers,omitempty"`
+	PythonThreads  int    `json:"python_threads,omitempty"`
+	ServerReady    bool   `json:"server_ready"`
 	Entry          string `json:"entry"`
 	Port           int    `json:"port"`
 	Directory      string `json:"directory"`
@@ -70,6 +75,21 @@ type projectManager struct {
 
 var projectIDPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,47}$`)
 var projectEntryPattern = regexp.MustCompile(`^[A-Za-z0-9._/-]{1,240}$`)
+var pythonIdentifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+func pythonModule(entry string) (string, error) {
+	name := strings.TrimSuffix(entry, ".py")
+	parts := strings.Split(name, "/")
+	if len(parts) > 1 && parts[len(parts)-1] == "__init__" {
+		parts = parts[:len(parts)-1]
+	}
+	for _, part := range parts {
+		if !pythonIdentifierPattern.MatchString(part) {
+			return "", errors.New("WSGI 入口路径每一层都须是有效的 Python 模块名")
+		}
+	}
+	return strings.Join(parts, "."), nil
+}
 
 func newProjectManager(root string, software *softwareManager) *projectManager {
 	return &projectManager{root: root, unitDir: "/etc/systemd/system", software: software,
@@ -136,6 +156,42 @@ func (pm *projectManager) normalize(item project) (project, error) {
 	if item.UseVenv && item.Runtime != "python" {
 		return project{}, errors.New("仅 Python 项目可以使用虚拟环境")
 	}
+	if item.Runtime == "python" {
+		if item.PythonServer == "" {
+			item.PythonServer = "direct" // Existing projects keep their previous behavior.
+		}
+		if item.PythonServer != "direct" && item.PythonServer != "gunicorn" && item.PythonServer != "uwsgi" {
+			return project{}, errors.New("Python 启动方式只能是直接运行、Gunicorn 或 uWSGI")
+		}
+		if item.PythonServer != "direct" {
+			if !item.UseVenv {
+				return project{}, errors.New("Gunicorn 和 uWSGI 需要启用项目虚拟环境")
+			}
+			if item.Port < 1 {
+				return project{}, errors.New("WSGI 项目须配置监听端口")
+			}
+			if _, err := pythonModule(item.Entry); err != nil {
+				return project{}, err
+			}
+			if item.PythonCallable == "" {
+				item.PythonCallable = "app"
+			}
+			if !pythonIdentifierPattern.MatchString(item.PythonCallable) {
+				return project{}, errors.New("WSGI callable 须为有效的 Python 标识符")
+			}
+			if item.PythonWorkers == 0 {
+				item.PythonWorkers = 2
+			}
+			if item.PythonThreads == 0 {
+				item.PythonThreads = 1
+			}
+			if item.PythonWorkers < 1 || item.PythonWorkers > 32 || item.PythonThreads < 1 || item.PythonThreads > 64 {
+				return project{}, errors.New("进程数须为 1–32，线程数须为 1–64")
+			}
+		}
+	} else if item.PythonServer != "" || item.PythonCallable != "" || item.PythonWorkers != 0 || item.PythonThreads != 0 {
+		return project{}, errors.New("Python 启动配置只能用于 Python 项目")
+	}
 	if !validProjectEntry(item.Runtime, item.Entry) {
 		return project{}, errors.New("入口须为项目目录内对应类型的相对文件路径；Go 也可使用 .")
 	}
@@ -158,6 +214,7 @@ func (pm *projectManager) normalize(item project) (project, error) {
 	item.Enabled = false
 	item.RuntimeReady = false
 	item.VenvReady = false
+	item.ServerReady = false
 	return item, nil
 }
 
@@ -361,10 +418,22 @@ func (pm *projectManager) unit(item project) []byte {
 	}
 	entry := filepath.Join(base, item.Entry)
 	args := append([]string{binary}, runtime.Subcommand...)
+	if item.Runtime == "python" && item.PythonServer != "" && item.PythonServer != "direct" {
+		module, _ := pythonModule(item.Entry)
+		binary = filepath.Join(pm.venvDir(item.ID), "bin", item.PythonServer)
+		address := "127.0.0.1:" + strconv.Itoa(item.Port)
+		if item.PythonServer == "gunicorn" {
+			args = []string{binary, "--bind", address, "--workers", strconv.Itoa(item.PythonWorkers), "--threads", strconv.Itoa(item.PythonThreads), module + ":" + item.PythonCallable}
+		} else {
+			args = []string{binary, "--master", "--http-socket", address, "--processes", strconv.Itoa(item.PythonWorkers), "--threads", strconv.Itoa(item.PythonThreads), "--module", module, "--callable", item.PythonCallable, "--need-app", "--die-on-term"}
+		}
+	}
 	if item.Runtime == "deno" {
 		args = append(args, "--allow-read="+base, "--allow-write="+data)
 	}
-	args = append(args, entry)
+	if item.Runtime != "python" || item.PythonServer == "" || item.PythonServer == "direct" {
+		args = append(args, entry)
+	}
 	quoted := make([]string, len(args))
 	for index, arg := range args {
 		quoted[index] = systemdQuoted(arg)
@@ -418,6 +487,7 @@ func (pm *projectManager) read(id string) (project, error) {
 func (pm *projectManager) state(ctx context.Context, item project) project {
 	item.RuntimeReady = pm.runtimeReadyVersion(item.Runtime, item.RuntimeVersion)
 	item.VenvReady = pm.venvReady(item)
+	item.ServerReady = pm.pythonServerReady(item)
 	statusCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if output, err := pm.systemctl(statusCtx, "is-active", pm.unitName(item.ID)); err == nil || len(output) > 0 {
@@ -516,6 +586,9 @@ func (pm *projectManager) save(ctx context.Context, item project, creating bool)
 	if wasRunning && item.UseVenv && !pm.venvReady(item) {
 		return project{}, errors.New("请先为项目创建与所选 Python 版本匹配的虚拟环境")
 	}
+	if wasRunning && !pm.pythonServerReady(item) {
+		return project{}, errors.New("请先在项目虚拟环境中安装所选 Python 启动器")
+	}
 	if err := pm.prepareDirectories(item.ID); err != nil {
 		return project{}, err
 	}
@@ -584,6 +657,9 @@ func (pm *projectManager) action(ctx context.Context, id, action string) error {
 		}
 		if item.UseVenv && !pm.venvReady(item) {
 			return errors.New("请先为项目创建与所选 Python 版本匹配的虚拟环境")
+		}
+		if !pm.pythonServerReady(item) {
+			return errors.New("请先在项目虚拟环境中安装所选 Python 启动器")
 		}
 		if err := pm.prepareDirectories(id); err != nil {
 			return err

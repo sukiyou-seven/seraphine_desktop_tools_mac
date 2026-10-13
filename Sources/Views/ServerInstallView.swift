@@ -28,7 +28,7 @@ struct ServerInstallView: View {
                 Spacer()
                 Button("关闭") { dismiss() }
             }
-            Text("服务端安装到 /www/seraphim，通过 HTTPS 27520 提供接口。安装不会覆盖已有服务端。")
+            Text("服务端安装到 /www/seraphim，通过 HTTPS 27520 提供接口。再次安装会覆盖升级程序，并保留令牌、证书、服务配置和业务数据。")
                 .font(.callout).foregroundStyle(.secondary)
             Picker("安装方式", selection: $method) {
                 Text("命令行安装").tag(0)
@@ -60,11 +60,11 @@ struct ServerInstallView: View {
                         }
                     }
                     if let result {
-                        Card(title: connectionSaved ? "安装成功 · 连接信息已保存" : "服务端已安装 · 请保存连接信息") {
+                        Card(title: connectionSaved ? "安装或升级成功 · 连接信息已保存" : "服务端已安装或升级 · 请保存连接信息") {
                             InfoRow(label: "HTTPS 地址", value: result.endpoint)
                             InfoRow(label: "API 令牌", value: result.token)
                             InfoRow(label: "证书指纹", value: result.fingerprint)
-                            Text("请保存这三项；令牌和证书指纹不会再次由安装器显示。还需在服务器防火墙或云安全组中放行 TCP 27520。")
+                            Text("覆盖升级会沿用原有令牌和证书。首次安装后请保存连接信息，并在服务器防火墙或云安全组中放行 TCP 27520。")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }
@@ -102,14 +102,14 @@ struct ServerInstallView: View {
                     .frame(maxWidth: 300)
             }
             commandBlock("sudo chmod 755 /tmp/sera-install && sudo /tmp/sera-install install -host \(shellQuoted(address.isEmpty ? "服务器地址" : address))")
-            Text("安装完成后，终端会打印 HTTPS 地址、API 令牌和证书 SHA-256 指纹；填入「服务器状态」的连接配置即可。")
+            Text("首次安装会生成连接信息；再次执行同一命令会覆盖升级服务端并保留连接信息。")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
 
     private var sshPane: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("填写 SSH 信息后，应用会识别架构、上传内置安装文件并执行 sera install。SSH 只用于安装；之后客户端只通过 HTTPS API 通信。")
+            Text("填写 SSH 信息后，应用会识别架构、上传内置文件并安装或覆盖升级服务端。SSH 只用于安装和升级；日常管理使用 HTTPS API。")
                 .font(.callout).foregroundStyle(.secondary)
             field("SSH 主机", placeholder: "192.168.0.103", value: $host)
             field("HTTPS 地址", placeholder: "服务器 IP 或绑定的域名", value: $address)
@@ -138,7 +138,7 @@ struct ServerInstallView: View {
             Text("首次连接由应用记录 SSH 主机密钥；以后密钥变化时会在这里提示。SSH 密码不会保存到连接配置。")
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
-                Button("安装并保存连接") { startInstall() }
+                Button("安装或升级并保存连接") { startInstall() }
                     .disabled(installing)
                 if installing { ProgressView().controlSize(.small); Text("正在通过 SSH 安装…") }
             }
@@ -211,7 +211,7 @@ struct ServerInstallView: View {
                 result = installed
                 try onInstalled(installed, options.host)
                 connectionSaved = true
-                message = "服务端已安装并保存连接配置。"
+                message = "服务端已安装或升级，连接配置已保存。"
                 password = ""
                 sudoPassword = ""
             } catch ServerInstallError.hostKeyChanged {

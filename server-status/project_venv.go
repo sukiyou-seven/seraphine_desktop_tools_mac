@@ -35,6 +35,18 @@ func (pm *projectManager) venvReady(item project) bool {
 	return err == nil && python.Mode().IsRegular() && python.Mode().Perm()&0111 != 0
 }
 
+func (pm *projectManager) pythonServerReady(item project) bool {
+	if item.Runtime != "python" || item.PythonServer == "direct" || item.PythonServer == "" {
+		return true
+	}
+	if !pm.venvReady(item) {
+		return false
+	}
+	path := filepath.Join(pm.venvDir(item.ID), "bin", item.PythonServer)
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0111 != 0
+}
+
 func (pm *projectManager) runAsProject(ctx context.Context, item project, binary string, args []string, log *os.File) error {
 	uid, gid, err := pm.ensureUser()
 	if err != nil {
@@ -54,7 +66,7 @@ func (pm *projectManager) runAsProject(ctx context.Context, item project, binary
 }
 
 func (pm *projectManager) manageVenv(ctx context.Context, id, action string) error {
-	if action != "create" && action != "install_requirements" {
+	if action != "create" && action != "install_requirements" && action != "install_server" {
 		return errors.New("不支持此虚拟环境操作")
 	}
 	if !pm.software.beginServiceAction() {
@@ -103,6 +115,23 @@ func (pm *projectManager) manageVenv(ctx context.Context, id, action string) err
 			[]string{"-m", "pip", "install", "--no-input", "-r", requirements}, log)
 		if err != nil {
 			return fmt.Errorf("安装项目依赖失败：%w；请查看项目日志", err)
+		}
+		return nil
+	}
+	if action == "install_server" {
+		if item.PythonServer == "direct" || item.PythonServer == "" {
+			return errors.New("直接运行模式无需安装启动器")
+		}
+		if !pm.venvReady(item) {
+			return errors.New("请先创建与所选 Python 版本匹配的虚拟环境")
+		}
+		err := pm.runAsProject(work, item, filepath.Join(pm.venvDir(id), "bin", "python3"),
+			[]string{"-m", "pip", "install", "--no-input", item.PythonServer}, log)
+		if err != nil {
+			return fmt.Errorf("安装 Python 启动器失败：%w；请查看项目日志", err)
+		}
+		if !pm.pythonServerReady(item) {
+			return errors.New("启动器安装后校验失败；请查看项目日志")
 		}
 		return nil
 	}

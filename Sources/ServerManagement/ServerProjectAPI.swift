@@ -21,9 +21,15 @@ struct RemoteProject: Decodable, Identifiable {
     let runtimeReady: Bool
     let useVenv: Bool?
     let venvReady: Bool?
+    let pythonServer: String?
+    let pythonCallable: String?
+    let pythonWorkers: Int?
+    let pythonThreads: Int?
+    let serverReady: Bool?
 
     var usesVenv: Bool { useVenv == true }
     var hasReadyVenv: Bool { venvReady == true }
+    var hasReadyServer: Bool { serverReady != false }
 
     var running: Bool { activeState == "active" }
     var stateText: String {
@@ -49,6 +55,10 @@ struct RemoteProjectPayload: Encodable {
     let runtime: String
     let runtimeVersion: String
     let useVenv: Bool
+    let pythonServer: String
+    let pythonCallable: String
+    let pythonWorkers: Int
+    let pythonThreads: Int
     let entry: String
     let port: Int
     let directory: String
@@ -57,6 +67,10 @@ struct RemoteProjectPayload: Encodable {
         case id, name, runtime, entry, port
         case runtimeVersion = "runtime_version"
         case useVenv = "use_venv"
+        case pythonServer = "python_server"
+        case pythonCallable = "python_callable"
+        case pythonWorkers = "python_workers"
+        case pythonThreads = "python_threads"
         case directory
     }
 }

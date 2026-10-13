@@ -405,15 +405,22 @@ struct ServerManagementView: View {
     }
 
     private func saveInstalledServer(_ result: ServerInstallResult, host: String) throws {
-        let connection = ServerConnection(name: host, endpoint: result.endpoint,
+        var updated = connections
+        let connection: ServerConnection
+        if let index = updated.firstIndex(where: { $0.endpoint == result.endpoint }) {
+            updated[index].fingerprint = result.fingerprint
+            connection = updated[index]
+        } else {
+            connection = ServerConnection(name: host, endpoint: result.endpoint,
                                           fingerprint: result.fingerprint)
-        let updated = connections + [connection]
+            updated.append(connection)
+        }
         try ServerConnectionStore.save(updated, selectedID: connection.id, token: result.token)
         connections = updated
         selectedID = connection.id
         token = result.token
         snapshot = nil
-        message = "已保存新服务器连接；正在验证 HTTPS…"
+        message = "连接配置已保存；正在验证 HTTPS…"
         hasError = false
         Task { await refresh() }
     }

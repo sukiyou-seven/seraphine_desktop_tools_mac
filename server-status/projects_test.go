@@ -245,3 +245,76 @@ func TestProjectUsesChosenServerDirectory(t *testing.T) {
 		t.Fatalf("started without virtualenv: %d", got)
 	}
 }
+
+func TestPythonWSGIServersValidateAndGenerateUnits(t *testing.T) {
+	a, pm := projectTestAPI(t)
+	for _, body := range []string{
+		`{"id":"bad","name":"Bad","runtime":"python","entry":"main.py","port":8080,"python_server":"gunicorn"}`,
+		`{"id":"bad","name":"Bad","runtime":"python","entry":"main.py","use_venv":true,"python_server":"gunicorn"}`,
+		`{"id":"bad","name":"Bad","runtime":"python","entry":"bad-name.py","port":8080,"use_venv":true,"python_server":"gunicorn"}`,
+		`{"id":"bad","name":"Bad","runtime":"python","entry":"main.py","port":8080,"use_venv":true,"python_server":"gunicorn","python_callable":"app;touch /tmp/bad"}`,
+		`{"id":"bad","name":"Bad","runtime":"python","entry":"main.py","port":8080,"use_venv":true,"python_server":"uwsgi","python_workers":33}`,
+	} {
+		if got := projectRequest(a, "POST", "/v1/projects", body, true).Code; got != 409 {
+			t.Fatalf("accepted invalid WSGI configuration %s: %d", body, got)
+		}
+	}
+	created := projectRequest(a, "POST", "/v1/projects", `{"id":"web","name":"Web","runtime":"python","entry":"site/app.py","port":8080,"use_venv":true,"python_server":"gunicorn","python_callable":"application","python_workers":3,"python_threads":2}`, true)
+	if created.Code != 201 {
+		t.Fatalf("create Gunicorn project: %d %s", created.Code, created.Body.String())
+	}
+	unit, err := os.ReadFile(pm.unitPath("web"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"/data/venv/bin/gunicorn", "\"--bind\" \"127.0.0.1:8080\"", "\"--workers\" \"3\"", "\"--threads\" \"2\"", "\"site.app:application\""} {
+		if !strings.Contains(string(unit), expected) {
+			t.Fatalf("Gunicorn unit missing %q: %s", expected, unit)
+		}
+	}
+	entry := filepath.Join(pm.projectDir("web"), "site", "app.py")
+	if err := os.MkdirAll(filepath.Dir(entry), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(entry, []byte("application = None\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := projectRequest(a, "POST", "/v1/projects/web/action", `{"action":"start"}`, true).Code; got != 409 {
+		t.Fatalf("started without virtual environment: %d", got)
+	}
+	venv := pm.venvDir("web")
+	if err := os.MkdirAll(filepath.Join(venv, "bin"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for path, data := range map[string]string{
+		filepath.Join(venv, ".sera-python-base"): pm.pythonBase(project{Runtime: "python"}) + "\n",
+		filepath.Join(venv, "pyvenv.cfg"):        "home = test\n",
+		filepath.Join(venv, "bin", "python3"):    "#!/bin/sh\n",
+	} {
+		if err := os.WriteFile(path, []byte(data), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := projectRequest(a, "POST", "/v1/projects/web/action", `{"action":"start"}`, true).Code; got != 409 {
+		t.Fatalf("started without Gunicorn: %d", got)
+	}
+	if err := os.WriteFile(filepath.Join(venv, "bin", "gunicorn"), []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if got := projectRequest(a, "POST", "/v1/projects/web/action", `{"action":"start"}`, true).Code; got != 204 {
+		t.Fatalf("Gunicorn start: %d", got)
+	}
+	updated := projectRequest(a, "PUT", "/v1/projects/web", `{"name":"Web","runtime":"python","entry":"site/app.py","port":8081,"use_venv":true,"python_server":"uwsgi","python_callable":"application","python_workers":2,"python_threads":1}`, true)
+	if updated.Code != 204 {
+		t.Fatalf("switch to uWSGI: %d %s", updated.Code, updated.Body.String())
+	}
+	unit, err = os.ReadFile(pm.unitPath("web"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"/data/venv/bin/uwsgi", "\"--http-socket\" \"127.0.0.1:8081\"", "\"--module\" \"site.app\"", "\"--callable\" \"application\""} {
+		if !strings.Contains(string(unit), expected) {
+			t.Fatalf("uWSGI unit missing %q: %s", expected, unit)
+		}
+	}
+}

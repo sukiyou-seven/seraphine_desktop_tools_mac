@@ -26,6 +26,10 @@ struct ServerProjectsView: View {
     @State private var runtimeInput = "python"
     @State private var runtimeVersionInput = ""
     @State private var useVenvInput = true
+    @State private var pythonServerInput = "gunicorn"
+    @State private var pythonCallableInput = "app"
+    @State private var pythonWorkersInput = "2"
+    @State private var pythonThreadsInput = "1"
     @State private var entryInput = "main.py"
     @State private var portInput = "3000"
     @State private var directoryInput = ""
@@ -122,6 +126,7 @@ struct ServerProjectsView: View {
                     .foregroundStyle(.secondary)
                 if !project.runtimeReady { Text("运行环境缺失").foregroundStyle(.orange) }
                 if project.usesVenv && !project.hasReadyVenv { Text("虚拟环境未就绪").foregroundStyle(.orange) }
+                if !project.hasReadyServer { Text("启动器未安装").foregroundStyle(.orange) }
                 Spacer()
                 Button("文件") { openFiles(project.directory) }
                 Button("日志") {
@@ -132,20 +137,26 @@ struct ServerProjectsView: View {
                 Button("编辑") { beginEdit(project) }.disabled(working)
                 if project.running {
                     Button("重启") { action(project, "restart") }
-                        .disabled(working || !project.runtimeReady || (project.usesVenv && !project.hasReadyVenv))
+                        .disabled(working || !project.runtimeReady || (project.usesVenv && !project.hasReadyVenv) || !project.hasReadyServer)
                     Button("停止") { action(project, "stop") }.disabled(working)
                 } else {
                     Button("启动") { action(project, "start") }
-                        .disabled(working || !project.runtimeReady || (project.usesVenv && !project.hasReadyVenv))
+                        .disabled(working || !project.runtimeReady || (project.usesVenv && !project.hasReadyVenv) || !project.hasReadyServer)
                 }
                 Button(project.enabled ? "取消自启" : "开机自启") {
                     action(project, project.enabled ? "disable" : "enable")
                 }
-                .disabled(working || ((!project.runtimeReady || (project.usesVenv && !project.hasReadyVenv)) && !project.enabled))
+                .disabled(working || ((!project.runtimeReady || (project.usesVenv && !project.hasReadyVenv) || !project.hasReadyServer) && !project.enabled))
                 Button("删除…", role: .destructive) { pendingDelete = project }.disabled(working)
             }
             InfoRow(label: "目录", value: project.directory)
             InfoRow(label: "入口", value: project.entry)
+            if project.runtime == "python" {
+                InfoRow(label: "启动方式", value: (project.pythonServer ?? "direct") == "direct" ? "直接运行" : (project.pythonServer == "uwsgi" ? "uWSGI" : "Gunicorn"))
+                if project.pythonServer != nil && project.pythonServer != "direct" {
+                    InfoRow(label: "WSGI", value: "\(project.pythonCallable ?? "app") · \(project.pythonWorkers ?? 2) 进程 · \(project.pythonThreads ?? 1) 线程/进程")
+                }
+            }
             if project.usesVenv {
                 VStack(alignment: .leading, spacing: 6) {
                     InfoRow(label: "Python 虚拟环境", value: "/www/seraphim/projects/\(project.id)/data/venv")
@@ -158,6 +169,10 @@ struct ServerProjectsView: View {
                         } else {
                             Button("安装 requirements.txt") { venv(project, "install_requirements") }
                                 .disabled(working || project.running)
+                            if project.pythonServer != "direct" && !project.hasReadyServer {
+                                Button("安装 \(project.pythonServer == "uwsgi" ? "uWSGI" : "Gunicorn")") { venv(project, "install_server") }
+                                    .disabled(working || project.running)
+                            }
                         }
                         Spacer()
                     }
@@ -214,6 +229,23 @@ struct ServerProjectsView: View {
                 }
                 if runtimeInput == "python" {
                     Toggle("使用项目虚拟环境", isOn: $useVenvInput)
+                    Picker("启动方式", selection: $pythonServerInput) {
+                        Text("Gunicorn（WSGI）").tag("gunicorn")
+                        Text("uWSGI（WSGI）").tag("uwsgi")
+                        Text("直接运行脚本").tag("direct")
+                    }
+                    .onChange(of: pythonServerInput) { newValue in
+                        if newValue != "direct" { useVenvInput = true }
+                    }
+                    if pythonServerInput != "direct" {
+                        TextField("WSGI callable（例如 app 或 application）", text: $pythonCallableInput)
+                        HStack {
+                            TextField("进程数", text: $pythonWorkersInput)
+                            TextField("每进程线程数", text: $pythonThreadsInput)
+                        }
+                        Text("入口填写定义 WSGI callable 的 .py 文件；服务仅监听 127.0.0.1。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
                 HStack {
                     TextField("工程目录（留空使用默认目录）", text: $directoryInput)
@@ -237,7 +269,7 @@ struct ServerProjectsView: View {
                 .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
-            Text("自定义工程目录须已存在。保存后上传入口文件；启用 Python 虚拟环境时先创建它，再从工程目录的 requirements.txt 安装依赖。未安装环境的项目可先保存，安装后再选择版本。Go 入口可填 . 或 main.go。")
+            Text("自定义工程目录须已存在。保存后上传入口文件；Python 项目先创建虚拟环境，再安装 requirements.txt 和启动器。未安装环境的项目可先保存。Go 入口可填 . 或 main.go。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             if hasError && !message.isEmpty {
@@ -251,7 +283,7 @@ struct ServerProjectsView: View {
             }
         }
         .padding(20)
-        .frame(width: 650, height: 540)
+        .frame(width: 650, height: 650)
         .sheet(item: $pathSelection) { selection in
             ServerProjectPathPicker(connection: connection, token: token,
                                     selection: selection, runtime: runtimeInput,
@@ -307,6 +339,10 @@ struct ServerProjectsView: View {
         runtimeInput = installedRuntimes.first?.id ?? "python"
         runtimeVersionInput = installedRuntimes.first?.legacyInstalled == true ? "" : (installedRuntimes.first?.versions?.first ?? "")
         useVenvInput = runtimeInput == "python"
+        pythonServerInput = "gunicorn"
+        pythonCallableInput = "app"
+        pythonWorkersInput = "2"
+        pythonThreadsInput = "1"
         entryInput = defaultEntry(for: runtimeInput)
         portInput = "3000"
         directoryInput = ""
@@ -322,6 +358,10 @@ struct ServerProjectsView: View {
         runtimeInput = project.runtime
         runtimeVersionInput = project.runtimeVersion ?? ""
         useVenvInput = project.usesVenv
+        pythonServerInput = project.pythonServer ?? "direct"
+        pythonCallableInput = project.pythonCallable ?? "app"
+        pythonWorkersInput = String(project.pythonWorkers ?? 2)
+        pythonThreadsInput = String(project.pythonThreads ?? 1)
         entryInput = project.entry
         portInput = project.port == 0 ? "" : String(project.port)
         directoryInput = project.directory
@@ -350,11 +390,28 @@ struct ServerProjectsView: View {
             hasError = true
             return
         }
+        let isWSGI = runtimeInput == "python" && pythonServerInput != "direct"
+        guard !isWSGI || (number > 0 && useVenvInput) else {
+            message = "Gunicorn/uWSGI 需要虚拟环境和监听端口"
+            hasError = true
+            return
+        }
+        let workers = Int(pythonWorkersInput) ?? 0
+        let threads = Int(pythonThreadsInput) ?? 0
+        guard !isWSGI || ((1...32).contains(workers) && (1...64).contains(threads)) else {
+            message = "进程数须为 1–32，线程数须为 1–64"
+            hasError = true
+            return
+        }
         let payload = RemoteProjectPayload(id: idInput.trimmingCharacters(in: .whitespacesAndNewlines),
                                            name: nameInput.trimmingCharacters(in: .whitespacesAndNewlines),
                                            runtime: runtimeInput,
                                            runtimeVersion: runtimeVersionInput,
                                            useVenv: runtimeInput == "python" && useVenvInput,
+                                           pythonServer: runtimeInput == "python" ? pythonServerInput : "",
+                                           pythonCallable: isWSGI ? pythonCallableInput.trimmingCharacters(in: .whitespacesAndNewlines) : "",
+                                           pythonWorkers: isWSGI ? workers : 0,
+                                           pythonThreads: isWSGI ? threads : 0,
                                            entry: entryInput.trimmingCharacters(in: .whitespacesAndNewlines),
                                            port: number,
                                            directory: directoryInput.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -405,7 +462,7 @@ struct ServerProjectsView: View {
                 try await ServerProjectAPI.venv(connection: connection, token: token, id: project.id, action: command)
                 working = false
                 await refresh()
-                message = command == "create" ? "虚拟环境已创建" : "requirements.txt 依赖已安装"
+                message = command == "create" ? "虚拟环境已创建" : command == "install_server" ? "Python 启动器已安装" : "requirements.txt 依赖已安装"
                 hasError = false
             } catch {
                 working = false

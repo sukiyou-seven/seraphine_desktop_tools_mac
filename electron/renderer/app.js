@@ -321,8 +321,8 @@ renders.projects = () => {
   const projects = list(S.data), runtimes = S.data.runtimes || [];
   $('#content').innerHTML = projects.map((project, index) => {
     const runtime = runtimes.find((item) => item.id === project.runtime);
-    return card(project.name, `<div class="inline">${tag(project.active_state === 'active' ? '运行中' : project.active_state === 'failed' ? '启动失败' : '已停止', project.active_state === 'active')} ${tag(project.enabled ? '开机启动' : '不自启')} ${tag(`${runtime?.name || project.runtime} ${project.runtime_version || ''}`)} ${!project.runtime_ready ? tag('运行环境缺失') : ''} ${project.use_venv && !project.venv_ready ? tag('虚拟环境未就绪') : ''}</div><dl class="kv"><dt>工程目录</dt><dd class="mono">${esc(project.directory)}</dd><dt>入口</dt><dd class="mono">${esc(project.entry)}</dd><dt>端口</dt><dd>${esc(project.port || '未指定')}</dd></dl>`,
-      `${button('编辑', 'projects.edit', `data-index="${index}"`)}${button('文件', 'projects.files', `data-index="${index}"`)}${button('日志', 'projects.log', `data-index="${index}"`)}${project.use_venv ? button(project.venv_ready ? '安装依赖' : '创建虚拟环境', 'projects.venv', `data-index="${index}"`) : ''}${button(project.active_state === 'active' ? '停止' : '启动', 'projects.toggle', `data-index="${index}"`)}${project.active_state === 'active' ? button('重启', 'projects.restart', `data-index="${index}"`) : ''}${button(project.enabled ? '取消自启' : '开机自启', 'projects.enable', `data-index="${index}"`)}${button('删除', 'projects.delete', `data-index="${index}"`, 'danger')}`);
+    return card(project.name, `<div class="inline">${tag(project.active_state === 'active' ? '运行中' : project.active_state === 'failed' ? '启动失败' : '已停止', project.active_state === 'active')} ${tag(project.enabled ? '开机启动' : '不自启')} ${tag(`${runtime?.name || project.runtime} ${project.runtime_version || ''}`)} ${!project.runtime_ready ? tag('运行环境缺失') : ''} ${project.use_venv && !project.venv_ready ? tag('虚拟环境未就绪') : ''} ${project.server_ready === false ? tag('启动器未安装') : ''}</div><dl class="kv"><dt>工程目录</dt><dd class="mono">${esc(project.directory)}</dd><dt>入口</dt><dd class="mono">${esc(project.entry)}</dd>${project.runtime === 'python' ? `<dt>启动方式</dt><dd>${esc(project.python_server === 'uwsgi' ? 'uWSGI' : project.python_server === 'gunicorn' ? 'Gunicorn' : '直接运行')}${project.python_server && project.python_server !== 'direct' ? ` · ${esc(project.python_callable || 'app')} · ${esc(project.python_workers || 2)} 进程 · ${esc(project.python_threads || 1)} 线程/进程` : ''}</dd>` : ''}<dt>端口</dt><dd>${esc(project.port || '未指定')}</dd></dl>`,
+      `${button('编辑', 'projects.edit', `data-index="${index}"`)}${button('文件', 'projects.files', `data-index="${index}"`)}${button('日志', 'projects.log', `data-index="${index}"`)}${project.use_venv ? button(project.venv_ready ? '安装依赖' : '创建虚拟环境', 'projects.venv', `data-index="${index}"`) : ''}${project.runtime === 'python' && project.python_server && project.python_server !== 'direct' && project.venv_ready && project.server_ready === false ? button(`安装 ${project.python_server === 'uwsgi' ? 'uWSGI' : 'Gunicorn'}`, 'projects.server', `data-index="${index}"`) : ''}${button(project.active_state === 'active' ? '停止' : '启动', 'projects.toggle', `data-index="${index}"`)}${project.active_state === 'active' ? button('重启', 'projects.restart', `data-index="${index}"`) : ''}${button(project.enabled ? '取消自启' : '开机自启', 'projects.enable', `data-index="${index}"`)}${button('删除', 'projects.delete', `data-index="${index}"`, 'danger')}`);
   }).join('') || empty('尚无服务器项目；可先上传项目文件，再创建项目配置');
 };
 function projectForm(project) {
@@ -341,11 +341,24 @@ function projectForm(project) {
     { name: 'directory', label: '工程目录（服务器绝对路径，留空使用默认目录）', value: project?.directory || '', full: true, browse: 'directory' },
     { name: 'entry', label: '入口（相对于工程目录）', value: project?.entry || defaultEntries[first], required: true, full: true, browse: 'entry' },
     { name: 'port', label: 'PORT 环境变量', type: 'number', value: project?.port ?? 3000 },
-    { name: 'use_venv', label: '使用 Python 虚拟环境', type: 'checkbox', value: project?.use_venv ?? first === 'python' }
+    { name: 'use_venv', label: '使用 Python 虚拟环境', type: 'checkbox', value: project?.use_venv ?? first === 'python' },
+    { name: 'python_server', label: 'Python 启动方式', type: 'select', options: [['gunicorn', 'Gunicorn（WSGI）'], ['uwsgi', 'uWSGI（WSGI）'], ['direct', '直接运行脚本']], value: project?.python_server || 'gunicorn' },
+    { name: 'python_callable', label: 'WSGI callable（例如 app）', value: project?.python_callable || 'app' },
+    { name: 'python_workers', label: '进程数（1–32）', type: 'number', value: project?.python_workers || 2 },
+    { name: 'python_threads', label: '每进程线程数（1–64）', type: 'number', value: project?.python_threads || 1 }
   ], async (values) => {
+    const wsgi = values.runtime === 'python' && values.python_server !== 'direct';
+    if (wsgi && (!values.use_venv || Number(values.port) < 1)) throw new Error('Gunicorn/uWSGI 需要虚拟环境和监听端口');
+    if (wsgi && (!Number.isInteger(Number(values.python_workers)) || Number(values.python_workers) < 1 || Number(values.python_workers) > 32 ||
+      !Number.isInteger(Number(values.python_threads)) || Number(values.python_threads) < 1 || Number(values.python_threads) > 64))
+      throw new Error('进程数须为 1–32，线程数须为 1–64');
     const payload = { id: project?.id || values.id.trim(), name: values.name.trim(), runtime: values.runtime,
       runtime_version: values.runtime_version, directory: values.directory.trim(), entry: values.entry.trim(),
-      port: Number(values.port || 0), use_venv: values.runtime === 'python' && values.use_venv };
+      port: Number(values.port || 0), use_venv: values.runtime === 'python' && values.use_venv,
+      python_server: values.runtime === 'python' ? values.python_server : '',
+      python_callable: wsgi ? values.python_callable.trim() : '',
+      python_workers: wsgi ? Number(values.python_workers) : 0,
+      python_threads: wsgi ? Number(values.python_threads) : 0 };
     await api(project ? 'projects.update' : 'projects.create', project
       ? { id: project.id, project: payload } : { project: payload });
     await refresh(false);
@@ -358,7 +371,17 @@ function projectForm(project) {
       .map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join('');
     if (!project) $('#field-entry').value = defaultEntries[event.target.value] || '';
     $('#field-use_venv').checked = event.target.value === 'python';
+    updatePythonFields();
   });
+  $('#field-python_server').addEventListener('change', updatePythonFields);
+  function updatePythonFields() {
+    const python = $('#field-runtime').value === 'python';
+    const wsgi = python && $('#field-python_server').value !== 'direct';
+    for (const name of ['use_venv', 'python_server']) $('#field-' + name).closest('.field').hidden = !python;
+    for (const name of ['python_callable', 'python_workers', 'python_threads']) $('#field-' + name).closest('.field').hidden = !wsgi;
+    if (wsgi) $('#field-use_venv').checked = true;
+  }
+  updatePythonFields();
 }
 async function projectAction(action, index) {
   const project = list(S.data)[index];
@@ -373,6 +396,7 @@ async function projectAction(action, index) {
     action: project.enabled ? 'disable' : 'enable' });
   else if (action === 'projects.venv') await mutate('projects.venv', { id: project.id,
     action: project.venv_ready ? 'install_requirements' : 'create' });
+  else if (action === 'projects.server') await mutate('projects.venv', { id: project.id, action: 'install_server' });
   else if (action === 'projects.delete' && confirm(`删除 ${project.name} 项目服务？项目文件和日志将保留。`))
     await mutate('projects.delete', { id: project.id }, '项目服务已删除');
 }
@@ -654,12 +678,12 @@ async function databaseAction(action, index, id) {
 
 renders.installer = () => {
   $('#page-actions').innerHTML = '';
-  $('#content').innerHTML = `${card('通过 SSH 安装', '<p>输入服务器 SSH 信息，确认主机指纹后，应用会上传内置安装文件、执行安装并保存 HTTPS 连接。</p><button data-action="installer.ssh">填写 SSH 信息…</button><p class="help">SSH 仅用于安装；日常管理使用 HTTPS API。SSH 密码只用于本次安装，不保存。</p>')}
-    ${card('通过命令行安装', `<div class="toolbar"><select id="installer-arch"><option value="amd64">x86_64 / amd64</option><option value="arm64">aarch64 / arm64</option></select><button data-action="installer.export">导出 sera 安装文件…</button></div><p class="help">在服务器上运行 uname -m 查看架构。将文件上传到 /tmp/sera-install，以 root 或 sudo 执行：</p><div class="code">chmod 755 /tmp/sera-install\nsudo /tmp/sera-install install -host 服务器地址</div><p class="help">安装器会打印 HTTPS 地址、API 令牌和证书指纹。请将三项填入「连接设置」，并放行 TCP 27520。</p>`)}
+  $('#content').innerHTML = `${card('通过 SSH 安装或升级', '<p>输入服务器 SSH 信息，确认主机指纹后，应用会上传内置文件、安装或覆盖升级服务端并保存 HTTPS 连接。</p><button data-action="installer.ssh">填写 SSH 信息…</button><p class="help">覆盖升级保留令牌、证书、服务配置及业务数据。SSH 密码只用于本次操作，不保存。</p>')}
+    ${card('通过命令行安装或升级', `<div class="toolbar"><select id="installer-arch"><option value="amd64">x86_64 / amd64</option><option value="arm64">aarch64 / arm64</option></select><button data-action="installer.export">导出 sera 安装文件…</button></div><p class="help">在服务器上运行 uname -m 查看架构。将文件上传到 /tmp/sera-install，以 root 或 sudo 执行：</p><div class="code">chmod 755 /tmp/sera-install\nsudo /tmp/sera-install install -host 服务器地址</div><p class="help">再次执行同一命令会覆盖升级。安装器打印 HTTPS 地址、API 令牌和证书指纹；升级沿用原值。</p>`)}
     ${card('绑定域名与证书', '<p>域名解析与正式证书可由管理员配置。服务端监听 27520，证书更新后需要重启 server-status 服务。</p>')}`;
 };
 function sshInstallForm() {
-  modal('通过 SSH 安装服务端', [
+  modal('通过 SSH 安装或升级服务端', [
     { name: 'host', label: 'SSH 主机 IP / 域名', required: true },
     { name: 'port', label: 'SSH 端口', type: 'number', value: 22, required: true },
     { name: 'username', label: 'SSH 用户', value: 'root', required: true },
@@ -678,12 +702,13 @@ function sshInstallForm() {
     let result;
     try { result = await window.sera.installSSH(target, key.fingerprint); }
     catch (error) { setNotice(error.message || String(error), true); throw error; }
-    S.doc = await window.sera.saveConnection({ name: target.host, endpoint: result.endpoint,
+    const existing = S.doc.entries.find(({ connection }) => connection.endpoint === result.endpoint)?.connection;
+    S.doc = await window.sera.saveConnection({ id: existing?.id, name: existing?.name || target.host, endpoint: result.endpoint,
       token: result.token, fingerprint: result.fingerprint });
     renderChrome();
-    info('服务端已安装', `HTTPS：${result.endpoint}\nAPI 令牌：${result.token}\n证书指纹：${result.fingerprint}\n\n连接已保存，请放行 TCP 27520。`);
+    info('服务端已安装或升级', `HTTPS：${result.endpoint}\nAPI 令牌：${result.token}\n证书指纹：${result.fingerprint}\n\n连接已保存。`);
     await refresh(false);
-  }, '检查指纹并安装');
+  }, '检查指纹并安装或升级');
 }
 async function loadDNSRecords() {
   const result = await window.sera.dnsCall('DescribeDomainRecords', { DomainName: S.dnsSelected,

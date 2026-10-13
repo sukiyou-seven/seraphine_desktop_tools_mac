@@ -35,7 +35,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o ../
 
 环境管理从各软件官方发布源读取版本和下载校验值，查询结果缓存 15 分钟。新版本安装在 `/www/seraphim/server/{id}/versions/{version}`，可与同种环境的其他版本并存；升级前的 `/www/seraphim/server/{id}` 仍被识别为旧版安装。安装包下载后验证发布源提供的 SHA-256 或 SHA-512，客户端仅选择版本，不传下载地址或命令。项目管理可指定已安装的运行环境版本；旧项目继续使用原有路径。PHP 每个新版本拥有独立的 FPM 服务和 Unix socket。环境管理不会修改系统全局 PATH。
 
-项目管理支持 Python、Node.js、Go、Java JAR、.NET DLL、Ruby、Bun 和 Deno 常驻项目。可以先创建项目配置，再安装运行环境并选择版本。工程目录默认是 `/www/seraphim/projects/{项目标识}`，也可以指定服务器上已有的绝对目录；入口相对于工程目录。Go 的入口可为 `.` 或 `.go` 文件。Python 项目可使用位于管理目录 `data/venv` 的独立虚拟环境，并通过接口安装工程目录中的 `requirements.txt`。`PORT` 是可选的环境变量，反向代理可在网站管理中手动指向 `http://127.0.0.1:{端口}`。项目由独立的 `sera-project` 系统账户运行，工程目录在服务中只读，项目 `data/` 可写；服务日志位于 `/www/seraphim/logs/projects`。可以查看运行状态、启停、重启、设置开机启动及读取日志。删除项目会停用服务并删除项目定义，但保留源文件、数据和日志。客户端只传结构化项目配置和固定动作，服务端生成 systemd 单元，不接受任意命令文本。
+项目管理支持 Python、Node.js、Go、Java JAR、.NET DLL、Ruby、Bun 和 Deno 常驻项目。可以先创建项目配置，再安装运行环境并选择版本。工程目录默认是 `/www/seraphim/projects/{项目标识}`，也可以指定服务器上已有的绝对目录；入口相对于工程目录。Go 的入口可为 `.` 或 `.go` 文件。Python 项目可使用位于管理目录 `data/venv` 的独立虚拟环境，并通过接口安装工程目录中的 `requirements.txt`。新建 Python Web 项目默认使用 Gunicorn，也可选择 uWSGI；两者都要求项目虚拟环境、端口和 WSGI callable。入口写 `app.py` 或 `package/app.py`，服务端转换为 Python 模块路径，再以 `module:callable` 启动；可配置 1–32 个进程、每进程 1–64 个线程，固定监听 `127.0.0.1:{端口}`。创建虚拟环境后可单独安装所选启动器，或者将其写入 `requirements.txt`；服务端会在启动前检查可执行文件。旧 Python 项目继续直接运行脚本，编辑后可切换。`PORT` 仍作为环境变量传入项目，反向代理可在网站管理中手动指向 `http://127.0.0.1:{端口}`。项目由独立的 `sera-project` 系统账户运行，工程目录在服务中只读，项目 `data/` 可写；服务日志位于 `/www/seraphim/logs/projects`。可以查看运行状态、启停、重启、设置开机启动及读取日志。删除项目会停用服务并删除项目定义，但保留源文件、数据和日志。客户端只传结构化项目配置和固定动作，服务端生成 systemd 单元，不接受任意命令文本。
 
 数据库管理显示 MySQL、MariaDB、PostgreSQL、MongoDB、Redis、Valkey、SQLite 七种实例的安装与运行状态。MySQL、MariaDB、PostgreSQL 可建库、删库、建用户、重置密码、删除用户、授予只读或读写权限以及撤销权限。用户密码由服务端随机生成，创建或重置时返回一次；管理接口只接收结构化字段，服务端执行固定数据库客户端与限定的 SQL 模板。MySQL 首次使用时可把安装生成的临时 root 密码更换为管理密码，保存在 `/www/seraphim/server/mysql/sera-admin-password`，权限为 `0600`；已有密码也可验证后保存。PostgreSQL 新安装默认支持本机 SCRAM 密码连接，旧安装可在界面显式启用并重启；不会对外网开放数据库端口。PostgreSQL 对现有表、序列和 `public` schema 授权，其他 schema 与未来由别的账户创建的对象需要另行配置。Redis、Valkey 支持 ACL 账户创建、删除、停用、密码重置及只读/读写权限切换；权限作用于该实例的全部键，默认账户和自定义 ACL 账户在界面中受保护。新安装默认把 ACL 文件放在各自的 `data/users.acl`；旧安装可在界面启用持久化，服务会重启一次。ACL 文件和数据目录分别限制为 `0600` 与 `0700`，普通账户密码仅在创建或重置时显示一次。若已有默认账户密码，须先在界面验证并保存。MongoDB、SQLite 目前只提供实例总览。
 
@@ -50,21 +50,18 @@ chmod 755 /tmp/sera-install
 sudo /tmp/sera-install install -host 203.0.113.10
 ```
 
-`install` 创建约定目录，将自身复制到 `/www/seraphim/server/sera`，生成一年有效的自签证书及随机 256 位令牌，写入 systemd 单元并启动服务，最后打印 HTTPS 地址、API 令牌和证书 SHA-256 指纹。若已有程序、单元或凭据，安装器拒绝覆盖。启动失败时清理本次创建的安装文件。SSH 方式会识别 x86_64/aarch64 架构、上传安装文件、运行相同命令，并把连接信息保存到桌面端；SSH 密码只在安装期间使用，不保存。首次 SSH 连接由应用记录主机公钥，保存在本机应用数据目录的 `ssh_known_hosts`；之后密钥变化会在安装窗口显示此前和当前的指纹，由用户决定是否更新。非 root 用户须具有 sudo 权限，可填写 sudo 密码或使用免密 sudo。
+`install` 首次运行时创建约定目录，将自身复制到 `/www/seraphim/server/sera`，生成一年有效的自签证书及随机 256 位令牌，写入 systemd 单元并启动服务，最后打印 HTTPS 地址、API 令牌和证书 SHA-256 指纹。再次执行同一命令会覆盖升级已有服务端：先在 `/www/seraphim/backup/server` 备份旧程序，再原子替换并重启；检查原证书指纹及原令牌的 HTTPS 接口，失败时恢复旧程序。升级不改动令牌、证书、定制的 systemd 单元、项目和业务数据。若安装不完整或服务单元指向其他程序路径，安装器会报错而不覆盖。SSH 方式会识别 x86_64/aarch64 架构、上传安装文件、运行相同命令，并把连接信息保存到桌面端；SSH 密码只在本次操作期间使用，不保存。首次 SSH 连接由应用记录主机公钥，保存在本机应用数据目录的 `ssh_known_hosts`；之后密钥变化会在安装窗口显示此前和当前的指纹，由用户决定是否更新。非 root 用户须具有 sudo 权限，可填写 sudo 密码或使用免密 sudo。
 
 服务端仅支持运行 systemd 的 Linux 系统，不依赖发行版的 apt 或 dnf。安装后仍需在主机防火墙及云安全组放行 TCP 27520。`init` 仍可用于手动初始化凭据，不会覆盖现有凭据。令牌存放于 `/www/seraphim/server/config/token`，配置目录为 `0700`，私钥与令牌为 `0600`。服务名沿用 `server-status` 方便已有安装升级；命令行程序名为 `sera`。
 
-升级已有安装时，先把新二进制上传为服务器上的 `/tmp/sera-new`，再以 root 执行：
+升级已有安装时，将新二进制上传为服务器上的 `/tmp/sera-new`，然后执行：
 
 ```sh
-cp -p /www/seraphim/server/sera /www/seraphim/server/sera.backup
-install -m 0755 /tmp/sera-new /www/seraphim/server/sera.new
-mv /www/seraphim/server/sera.new /www/seraphim/server/sera
-systemctl restart server-status
-systemctl is-active server-status
+chmod 755 /tmp/sera-new
+sudo /tmp/sera-new install -host 203.0.113.10
 ```
 
-若服务未恢复为 `active`，将 `sera.backup` 复制回 `sera` 并再次重启。升级不会覆盖连接令牌、证书或已有站点与数据库。计划任务生成的 systemd 单元始终调用固定路径 `/www/seraphim/server/sera`。
+将示例 IP 换成客户端使用的地址。升级不会覆盖连接令牌、证书或已有站点与数据库。计划任务生成的 systemd 单元始终调用固定路径 `/www/seraphim/server/sera`。
 
 服务通过 HTTPS 监听 `27520`。文件管理覆盖整个服务器文件系统，服务管理能控制防火墙的 systemd 单元，因此服务以 root 运行；持有连接令牌的人可以进行服务器操作。云安全组应只允许自己的客户端来源地址访问 27520，令牌只保存在可信设备。上传默认不覆盖，目录递归删除必须显式请求；根目录、常见系统顶层目录和上述固定布局目录不可整体删除或重命名。文件或目录内的普通条目仍按系统权限操作，软链接不能作为路径穿越。
 
@@ -130,7 +127,7 @@ MySQL 默认只监听 `127.0.0.1:3306`；初始化的临时 root 密码保存在
 | `POST /v1/projects` | 创建项目，接收 `id`、`name`、`runtime`、`runtime_version`、`directory`、`entry`、`port` 和 Python 的 `use_venv`；运行环境可稍后安装 |
 | `PUT /v1/projects/{id}` | 更新项目；运行中的项目自动重启，失败时恢复原配置 |
 | `POST /v1/projects/{id}/action` | 仅接受 `start`、`stop`、`restart`、`enable`、`disable` |
-| `POST /v1/projects/{id}/venv` | Python 项目虚拟环境操作，`action` 为 `create` 或 `install_requirements`；直接运行所选解释器，不接受命令文本 |
+| `POST /v1/projects/{id}/venv` | Python 项目虚拟环境操作，`action` 为 `create`、`install_requirements` 或 `install_server`；安装启动器时只接受项目配置中的 Gunicorn/uWSGI 名称，不接受命令文本 |
 | `GET /v1/projects/{id}/log` | 读取最近 64 KiB 项目日志 |
 | `DELETE /v1/projects/{id}` | 删除项目服务和定义，保留项目文件及日志 |
 | `GET /v1/databases` | 七种数据库实例的安装、运行、端口和认证状态 |
