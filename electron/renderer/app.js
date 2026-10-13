@@ -166,7 +166,7 @@ const loaders = {
   projects: async () => { S.data = await api('projects.list'); },
   environments: async () => { S.data = await api('environments.list'); },
   services: async () => { S.data = await Promise.all([api('software.list'), api('services.list')]); },
-  store: async () => { S.data = await api('software.list'); },
+  store: async () => { S.data = await Promise.all([api('software.list'), api('software.jobs')]); },
   firewall: async () => { S.data = await api('firewall.get'); },
   tasks: async () => { S.data = await api('tasks.list'); },
   databases: async () => {
@@ -321,8 +321,8 @@ renders.projects = () => {
   const projects = list(S.data), runtimes = S.data.runtimes || [];
   $('#content').innerHTML = projects.map((project, index) => {
     const runtime = runtimes.find((item) => item.id === project.runtime);
-    return card(project.name, `<div class="inline">${tag(project.active_state === 'active' ? '运行中' : project.active_state === 'failed' ? '启动失败' : '已停止', project.active_state === 'active')} ${tag(project.enabled ? '开机启动' : '不自启')} ${tag(`${runtime?.name || project.runtime} ${project.runtime_version || ''}`)} ${!project.runtime_ready ? tag('运行环境缺失') : ''} ${project.use_venv && !project.venv_ready ? tag('虚拟环境未就绪') : ''} ${project.server_ready === false ? tag('启动器未安装') : ''}</div><dl class="kv"><dt>工程目录</dt><dd class="mono">${esc(project.directory)}</dd><dt>入口</dt><dd class="mono">${esc(project.entry)}</dd>${project.runtime === 'python' ? `<dt>启动方式</dt><dd>${esc(project.python_server === 'uwsgi' ? 'uWSGI' : project.python_server === 'gunicorn' ? 'Gunicorn' : '直接运行')}${project.python_server && project.python_server !== 'direct' ? ` · ${esc(project.python_callable || 'app')} · ${esc(project.python_workers || 2)} 进程 · ${esc(project.python_threads || 1)} 线程/进程` : ''}</dd>` : ''}<dt>端口</dt><dd>${esc(project.port || '未指定')}</dd></dl>`,
-      `${button('编辑', 'projects.edit', `data-index="${index}"`)}${button('文件', 'projects.files', `data-index="${index}"`)}${button('日志', 'projects.log', `data-index="${index}"`)}${project.use_venv ? button(project.venv_ready ? '安装依赖' : '创建虚拟环境', 'projects.venv', `data-index="${index}"`) : ''}${project.runtime === 'python' && project.python_server && project.python_server !== 'direct' && project.venv_ready && project.server_ready === false ? button(`安装 ${project.python_server === 'uwsgi' ? 'uWSGI' : 'Gunicorn'}`, 'projects.server', `data-index="${index}"`) : ''}${button(project.active_state === 'active' ? '停止' : '启动', 'projects.toggle', `data-index="${index}"`)}${project.active_state === 'active' ? button('重启', 'projects.restart', `data-index="${index}"`) : ''}${button(project.enabled ? '取消自启' : '开机自启', 'projects.enable', `data-index="${index}"`)}${button('删除', 'projects.delete', `data-index="${index}"`, 'danger')}`);
+    return card(project.name, `<div class="inline">${tag(project.active_state === 'active' ? '运行中' : project.active_state === 'failed' ? '启动失败' : '已停止', project.active_state === 'active')} ${tag(project.enabled ? '开机启动' : '不自启')} ${tag(`${runtime?.name || project.runtime} ${project.runtime_version || ''}`)} ${!project.runtime_ready ? tag('运行环境缺失') : ''} ${project.use_venv && !project.venv_ready ? tag('虚拟环境未就绪') : ''} ${project.server_ready === false ? tag('启动器未安装') : ''}</div><dl class="kv"><dt>工程目录</dt><dd class="mono">${esc(project.directory)}</dd><dt>入口</dt><dd class="mono">${esc(project.entry)}</dd>${project.runtime === 'python' ? `<dt>启动方式</dt><dd>${esc(project.python_server === 'uwsgi' ? 'uWSGI' : project.python_server === 'uvicorn' ? 'Uvicorn' : project.python_server === 'gunicorn' ? 'Gunicorn' : '直接运行')}${project.python_server && project.python_server !== 'direct' ? ` · ${esc(project.python_callable || 'app')} · ${esc(project.python_workers || 2)} 进程${project.python_server === 'gunicorn' ? ` · ${esc(project.python_worker || (project.python_threads > 1 ? 'gthread' : 'sync'))} worker` : ''}` : ''}</dd>` : ''}<dt>端口</dt><dd>${esc(project.port || '未指定')}</dd></dl>`,
+      `${button('编辑', 'projects.edit', `data-index="${index}"`)}${button('文件', 'projects.files', `data-index="${index}"`)}${button('日志', 'projects.log', `data-index="${index}"`)}${project.use_venv ? button(project.venv_ready ? '安装依赖' : '创建虚拟环境', 'projects.venv', `data-index="${index}"`) : ''}${project.runtime === 'python' && project.python_server && project.python_server !== 'direct' && project.venv_ready && project.server_ready === false ? button(`安装 ${project.python_server === 'uwsgi' ? 'uWSGI' : project.python_server === 'uvicorn' ? 'Uvicorn' : 'Gunicorn'}`, 'projects.server', `data-index="${index}"`) : ''}${button(project.active_state === 'active' ? '停止' : '启动', 'projects.toggle', `data-index="${index}"`)}${project.active_state === 'active' ? button('重启', 'projects.restart', `data-index="${index}"`) : ''}${button(project.enabled ? '取消自启' : '开机自启', 'projects.enable', `data-index="${index}"`)}${button('删除', 'projects.delete', `data-index="${index}"`, 'danger')}`);
   }).join('') || empty('尚无服务器项目；可先上传项目文件，再创建项目配置');
 };
 function projectForm(project) {
@@ -342,23 +342,25 @@ function projectForm(project) {
     { name: 'entry', label: '入口（相对于工程目录）', value: project?.entry || defaultEntries[first], required: true, full: true, browse: 'entry' },
     { name: 'port', label: 'PORT 环境变量', type: 'number', value: project?.port ?? 3000 },
     { name: 'use_venv', label: '使用 Python 虚拟环境', type: 'checkbox', value: project?.use_venv ?? first === 'python' },
-    { name: 'python_server', label: 'Python 启动方式', type: 'select', options: [['gunicorn', 'Gunicorn（WSGI）'], ['uwsgi', 'uWSGI（WSGI）'], ['direct', '直接运行脚本']], value: project?.python_server || 'gunicorn' },
-    { name: 'python_callable', label: 'WSGI callable（例如 app）', value: project?.python_callable || 'app' },
+    { name: 'python_server', label: 'Python 启动方式', type: 'select', options: [['gunicorn', 'Gunicorn'], ['uvicorn', 'Uvicorn（ASGI）'], ['uwsgi', 'uWSGI（WSGI）'], ['direct', '直接运行脚本']], value: project?.python_server || 'gunicorn' },
+    { name: 'python_worker', label: 'Gunicorn worker class', type: 'select', options: [['sync', 'sync（WSGI）'], ['gthread', 'gthread（WSGI）'], ['uvicorn', 'uvicorn_worker.UvicornWorker（ASGI）']], value: project?.python_worker || (project?.python_threads > 1 ? 'gthread' : 'sync') },
+    { name: 'python_callable', label: 'Python 应用对象（例如 app）', value: project?.python_callable || 'app' },
     { name: 'python_workers', label: '进程数（1–32）', type: 'number', value: project?.python_workers || 2 },
     { name: 'python_threads', label: '每进程线程数（1–64）', type: 'number', value: project?.python_threads || 1 }
   ], async (values) => {
-    const wsgi = values.runtime === 'python' && values.python_server !== 'direct';
-    if (wsgi && (!values.use_venv || Number(values.port) < 1)) throw new Error('Gunicorn/uWSGI 需要虚拟环境和监听端口');
-    if (wsgi && (!Number.isInteger(Number(values.python_workers)) || Number(values.python_workers) < 1 || Number(values.python_workers) > 32 ||
+    const hasServer = values.runtime === 'python' && values.python_server !== 'direct';
+    if (hasServer && (!values.use_venv || Number(values.port) < 1)) throw new Error('Python 启动器需要虚拟环境和监听端口');
+    if (hasServer && (!Number.isInteger(Number(values.python_workers)) || Number(values.python_workers) < 1 || Number(values.python_workers) > 32 ||
       !Number.isInteger(Number(values.python_threads)) || Number(values.python_threads) < 1 || Number(values.python_threads) > 64))
       throw new Error('进程数须为 1–32，线程数须为 1–64');
     const payload = { id: project?.id || values.id.trim(), name: values.name.trim(), runtime: values.runtime,
       runtime_version: values.runtime_version, directory: values.directory.trim(), entry: values.entry.trim(),
       port: Number(values.port || 0), use_venv: values.runtime === 'python' && values.use_venv,
       python_server: values.runtime === 'python' ? values.python_server : '',
-      python_callable: wsgi ? values.python_callable.trim() : '',
-      python_workers: wsgi ? Number(values.python_workers) : 0,
-      python_threads: wsgi ? Number(values.python_threads) : 0 };
+      python_worker: values.runtime === 'python' && values.python_server === 'gunicorn' ? values.python_worker : '',
+      python_callable: hasServer ? values.python_callable.trim() : '',
+      python_workers: hasServer ? Number(values.python_workers) : 0,
+      python_threads: hasServer ? Number(values.python_threads) : 0 };
     await api(project ? 'projects.update' : 'projects.create', project
       ? { id: project.id, project: payload } : { project: payload });
     await refresh(false);
@@ -374,12 +376,17 @@ function projectForm(project) {
     updatePythonFields();
   });
   $('#field-python_server').addEventListener('change', updatePythonFields);
+  $('#field-python_worker').addEventListener('change', updatePythonFields);
   function updatePythonFields() {
     const python = $('#field-runtime').value === 'python';
-    const wsgi = python && $('#field-python_server').value !== 'direct';
+    const hasServer = python && $('#field-python_server').value !== 'direct';
+    const gunicorn = hasServer && $('#field-python_server').value === 'gunicorn';
     for (const name of ['use_venv', 'python_server']) $('#field-' + name).closest('.field').hidden = !python;
-    for (const name of ['python_callable', 'python_workers', 'python_threads']) $('#field-' + name).closest('.field').hidden = !wsgi;
-    if (wsgi) $('#field-use_venv').checked = true;
+    for (const name of ['python_callable', 'python_workers']) $('#field-' + name).closest('.field').hidden = !hasServer;
+    $('#field-python_worker').closest('.field').hidden = !gunicorn;
+    $('#field-python_threads').closest('.field').hidden = !(hasServer &&
+      ($('#field-python_server').value === 'uwsgi' || (gunicorn && $('#field-python_worker').value === 'gthread')));
+    if (hasServer) $('#field-use_venv').checked = true;
   }
   updatePythonFields();
 }
@@ -512,8 +519,9 @@ async function environmentAction(action, index, partIndex) {
 
 renders.store = () => {
   $('#page-actions').innerHTML = '';
-  const items = list(S.data), search = (S.searchStore || '').toLowerCase();
-  $('#content').innerHTML = `<div class="toolbar"><input id="store-search" placeholder="搜索软件" value="${esc(S.searchStore || '')}"><span class="small muted">共 ${items.length} 款 · 已安装 ${items.filter((item) => item.state === 'installed' || item.state === 'multiple_versions').length} 款</span></div><section class="card"><table class="table"><thead><tr><th>软件</th><th>类别</th><th>版本</th><th>状态</th><th></th></tr></thead><tbody>${items.map((item, index) => ({ item, index })).filter(({ item }) => !search || `${item.name} ${item.category} ${item.description}`.toLowerCase().includes(search)).map(({ item, index }) => `<tr><td><strong>${esc(item.name)}</strong><div class="small muted">${esc(item.description)}</div></td><td>${esc(item.category || '其他')}</td><td>${esc(item.version)}</td><td>${tag(item.state === 'installed' ? '已安装' : item.state === 'installing' ? '安装中' : item.state === 'uninstalling' ? '卸载中' : item.state === 'multiple_versions' ? '多版本' : '未安装', item.state === 'installed')}</td><td class="actions-cell"><div class="actions">${item.state === 'installed' ? button('卸载', 'software.uninstall', `data-index="${index}"`, 'danger') : item.install_available !== false && item.supported && !['installing', 'uninstalling', 'multiple_versions'].includes(item.state) ? button('安装', 'software.install', `data-index="${index}"`) : ''}${button('日志', 'software.log', `data-index="${index}"`)}</div></td></tr>`).join('')}</tbody></table></section>`;
+  const items = list(S.data[0]), jobs = list(S.data[1]), search = (S.searchStore || '').toLowerCase();
+  $('#content').innerHTML = `<div class="toolbar"><input id="store-search" placeholder="搜索软件" value="${esc(S.searchStore || '')}"><span class="small muted">共 ${items.length} 款 · 已安装 ${items.filter((item) => item.state === 'installed' || item.state === 'multiple_versions').length} 款</span></div><section class="card"><table class="table"><thead><tr><th>软件</th><th>类别</th><th>版本</th><th>状态</th><th></th></tr></thead><tbody>${items.map((item, index) => ({ item, index })).filter(({ item }) => !search || `${item.name} ${item.category} ${item.description}`.toLowerCase().includes(search)).map(({ item, index }) => `<tr><td><strong>${esc(item.name)}</strong><div class="small muted">${esc(item.description)}</div></td><td>${esc(item.category || '其他')}</td><td>${esc(item.version)}</td><td>${tag(item.state === 'installed' ? '已安装' : item.state === 'installing' ? '安装中' : item.state === 'uninstalling' ? '卸载中' : item.state === 'queued' ? '排队中' : item.state === 'cancelling' ? '停止中' : item.state === 'cancelled' ? '已停止' : item.state === 'multiple_versions' ? '多版本' : '未安装', item.state === 'installed')}</td><td class="actions-cell"><div class="actions">${item.state === 'installed' ? button('卸载', 'software.uninstall', `data-index="${index}"`, 'danger') : item.install_available !== false && item.supported && !['queued', 'installing', 'uninstalling', 'cancelling', 'multiple_versions'].includes(item.state) ? button('安装', 'software.install', `data-index="${index}"`) : ''}${button('日志', 'software.log', `data-index="${index}"`)}</div></td></tr>`).join('')}</tbody></table></section>`;
+  $('#content').insertAdjacentHTML('afterbegin', `<section class="card"><h3>任务列表</h3>${jobs.length ? jobs.map((job) => `<div class="inline"><strong>${esc(items.find((item) => item.id === job.id)?.name || job.id)}</strong> ${esc(job.operation === 'install' ? '安装' : '卸载')} · ${esc(({ queued: '排队中', installing: '安装中', uninstalling: '卸载中', cancelling: '停止中', cancelled: '已停止', installed: '已完成', not_installed: '已完成', failed: '失败', needs_attention: '需处理' })[job.state] || job.state)} · ${esc(job.message)} ${['queued', 'installing', 'uninstalling'].includes(job.state) ? button('停止任务', 'software.cancel', `data-id="${esc(job.id)}"`) : ''}</div>`).join('') : '<p class="muted">暂无任务</p>'}</section>`);
 };
 renders.services = () => {
   $('#page-actions').innerHTML = '';
@@ -529,7 +537,8 @@ async function softwareAction(action, index, command) {
     if (confirm(`${command} ${service.name}？`)) await mutate('services.action', { name: service.name, action: command });
     return;
   }
-  const item = action.startsWith('services.') ? S.installedServices[index] : list(S.data)[index];
+  if (action === 'software.cancel') { await mutate('software.cancel', { id: command }, '已请求停止任务'); return; }
+  const item = action.startsWith('services.') ? S.installedServices[index] : list(S.data[0])[index];
   if (action === 'software.install' && confirm(`安装 ${item.name}？`)) await mutate('software.install', { id: item.id }, '安装任务已开始');
   else if (action === 'software.uninstall') {
     const mode = confirm(`卸载 ${item.name} 并备份目录？\n确定：备份；取消：继续选择彻底删除。`) ? 'backup'
@@ -615,10 +624,10 @@ function renderDatabaseDetail(instance) {
   if (!instance.installed) return card(instance.name, empty('请先从软件商店安装此数据库'));
   if (S.catalog) {
     const databases = S.catalog.databases || [], users = S.catalog.users || [];
-    return card(`${instance.name} · 数据库与账户`, `<div class="split"><div><h3>数据库</h3>${databases.map((name, index) => row(`<span class="mono">${esc(name)}</span>`, button('删除', 'databases.db.delete', `data-index="${index}"`, 'danger'))).join('') || empty('暂无数据库')}</div><div><h3>账户</h3>${users.map((user, index) => row(`<span class="mono">${esc(user.name)}${user.host ? `@${esc(user.host)}` : ''}</span>`, `${button('重置密码', 'databases.user.reset', `data-index="${index}"`)}${button('删除', 'databases.user.delete', `data-index="${index}"`, 'danger')}`)).join('') || empty('暂无账户')}</div></div>`, `${button('建库', 'databases.db.create')}${button('建用户', 'databases.user.create')}${button('授权', 'databases.grant')}${engine === 'mysql' ? button('设置管理密码', 'databases.mysql.password') : ''}${engine === 'postgresql' && instance.auth_state !== 'local_password' ? button('启用本机密码连接', 'databases.pg.access') : ''}`);
+    return card(`${instance.name} · 数据库与账户`, `<div class="split"><div><h3>数据库</h3>${databases.map((name, index) => row(`<span class="mono">${esc(name)}</span>`, button('删除', 'databases.db.delete', `data-index="${index}"`, 'danger'))).join('') || empty('暂无数据库')}</div><div><h3>账户</h3>${users.map((user, index) => row(`<span class="mono">${esc(user.name)}${user.host ? `@${esc(user.host)}` : ''}</span>`, `${button('查看密码', 'databases.user.password', `data-index="${index}"`)}${button('重置密码', 'databases.user.reset', `data-index="${index}"`)}${button('删除', 'databases.user.delete', `data-index="${index}"`, 'danger')}`)).join('') || empty('暂无账户')}</div></div>`, `${button('建库', 'databases.db.create')}${button('建用户', 'databases.user.create')}${button('授权', 'databases.grant')}${engine === 'mysql' ? button('设置管理密码', 'databases.mysql.password') + button('查看管理密码', 'databases.mysql.saved') + button('修改管理密码', 'databases.mysql.change') : ''}${engine === 'postgresql' && instance.auth_state !== 'local_password' ? button('启用本机密码连接', 'databases.pg.access') : ''}`);
   }
   if (S.acl) {
-    return card(`${instance.name} · ACL`, `<p class="help">${S.acl.persistent ? 'ACL 已持久化' : 'ACL 尚未持久化'}</p>${(S.acl.users || []).map((user, index) => row(`<span class="mono">${esc(user.name)}</span> ${tag(user.enabled ? '启用' : '停用', user.enabled)} ${tag(user.level === 'readwrite' ? '读写' : '只读')}`, `${button('重置密码', 'databases.acl.reset', `data-index="${index}"`)}${button(user.enabled ? '停用' : '启用', 'databases.acl.toggle', `data-index="${index}"`)}${button(user.level === 'readwrite' ? '设为只读' : '设为读写', 'databases.acl.level', `data-index="${index}"`)}${button('删除', 'databases.acl.delete', `data-index="${index}"`, 'danger')}`)).join('') || empty('暂无 ACL 用户')}`, `${!S.acl.persistent ? button('启用持久化 ACL', 'databases.acl.enable') : ''}${button('建用户', 'databases.acl.create')}${button('设置默认账户密码', 'databases.acl.credential')}`);
+    return card(`${instance.name} · ACL`, `<p class="help">${S.acl.persistent ? 'ACL 已持久化' : 'ACL 尚未持久化'}</p>${(S.acl.users || []).map((user, index) => row(`<span class="mono">${esc(user.name)}</span> ${tag(user.enabled ? '启用' : '停用', user.enabled)} ${tag(user.level === 'readwrite' ? '读写' : '只读')}`, `${button('查看密码', 'databases.acl.password', `data-index="${index}"`)}${button('重置密码', 'databases.acl.reset', `data-index="${index}"`)}${button(user.enabled ? '停用' : '启用', 'databases.acl.toggle', `data-index="${index}"`)}${button(user.level === 'readwrite' ? '设为只读' : '设为读写', 'databases.acl.level', `data-index="${index}"`)}${button('删除', 'databases.acl.delete', `data-index="${index}"`, 'danger')}`)).join('') || empty('暂无 ACL 用户')}`, `${!S.acl.persistent ? button('启用持久化 ACL', 'databases.acl.enable') : ''}${button('建用户', 'databases.acl.create')}${button('设置默认账户密码', 'databases.acl.credential')}${button('查看默认账户密码', 'databases.acl.saved')}`);
   }
   return card(`${instance.name} · 实例状态`, `<div class="inline">${tag(instance.running ? '运行中' : '已停止', instance.running)} ${tag(instance.auth_state || '状态未知')}</div><p class="help">此数据库当前提供实例状态总览。</p>`);
 }
@@ -641,6 +650,10 @@ async function databaseAction(action, index, id) {
     await mutate('databases.delete', { engine, name: dbs[index] });
   else if (action === 'databases.user.delete' && confirm(`删除账户 ${users[index].name}？`))
     await mutate('databases.user.delete', { engine, name: users[index].name });
+  else if (action === 'databases.user.password') {
+    const result = await api('databases.user.password', { engine, name: users[index].name });
+    info('已保存的密码', `${result.user}\n${result.password}`);
+  }
   else if (action === 'databases.user.reset' && confirm(`重置 ${users[index].name} 的密码？`)) {
     const result = await api('databases.user.reset', { engine, name: users[index].name });
     info('新密码（仅显示一次）', `${result.user}\n${result.password}`);
@@ -650,6 +663,11 @@ async function databaseAction(action, index, id) {
     { name: 'level', label: '权限', type: 'select', options: [['readwrite', '读写'], ['read', '只读']] },
     { name: 'revoke', label: '撤销权限', type: 'checkbox', value: false }
   ], async (values) => { await api('databases.grant', { engine, ...values }); await refresh(false); });
+  else if (action === 'databases.mysql.change') modal('修改 MySQL 管理密码', [
+    { name: 'current', label: '当前密码（服务端已保存时可留空）', type: 'password' },
+    { name: 'next', label: '新密码（至少 8 位）', type: 'password', required: true }
+  ], async ({ current, next }) => { await api('databases.mysql.change', { current, next }); await refresh(false); });
+  else if (action === 'databases.mysql.saved') { const result = await api('databases.mysql.saved'); info('已保存的管理密码', result.password); }
   else if (action === 'databases.mysql.password') modal('保存 MySQL 管理密码', [
     { name: 'password', label: '已有管理密码（留空则尝试安装时的临时密码）', type: 'password' }
   ], async ({ password }) => {
@@ -661,6 +679,8 @@ async function databaseAction(action, index, id) {
     await mutate('databases.postgresql.localAccess');
   else if (action === 'databases.acl.enable' && confirm('启用持久化 ACL 并重启服务？'))
     await mutate('databases.acl.enable', { engine });
+  else if (action === 'databases.acl.saved') { const result = await api('databases.acl.saved', { engine }); info('已保存的默认账户密码', result.password); }
+  else if (action === 'databases.acl.password') { const result = await api('databases.acl.password', { engine, name: aclUsers[index].name }); info('已保存的密码', `${result.user}\n${result.password}`); }
   else if (action === 'databases.acl.credential') modal('保存默认账户密码', [
     { name: 'password', label: '现有密码', type: 'password', required: true }
   ], async ({ password }) => { await api('databases.acl.credential', { engine, password }); await refresh(false); });
@@ -724,7 +744,7 @@ renders.domains = () => {
   }
   $('#content').innerHTML = `${card('域名', `<div class="grid">${S.dnsDomains.map((domain, index) => `<button class="card" style="text-align:left;color:inherit" data-action="domains.select" data-index="${index}"><strong>${esc(domain.DomainName)}</strong><p class="small">${esc(domain.RecordCount || 0)} 条记录 · ${esc(domain.VersionName || '')}</p></button>`).join('') || empty('此账号没有域名')}</div>`)}
     ${S.dnsSelected ? card(`${S.dnsSelected} · 解析记录`, `<table class="table"><thead><tr><th>主机</th><th>类型</th><th>值</th><th>TTL</th><th>状态</th><th></th></tr></thead><tbody>${S.dnsRecords.map((record, index) => `<tr><td class="mono">${esc(record.RR)}</td><td>${esc(record.Type)}</td><td class="mono">${esc(record.Value)}</td><td>${esc(record.TTL)}</td><td>${tag(record.Status === 'ENABLE' ? '启用' : '停用', record.Status === 'ENABLE')}</td><td class="actions-cell">${button('编辑', 'domains.edit', `data-index="${index}"`)} ${button('删除', 'domains.delete', `data-index="${index}"`, 'danger')}</td></tr>`).join('')}</tbody></table>${S.dnsRecords.length ? '' : empty('没有解析记录')}`, button('新增记录', 'domains.add')) : ''}
-    ${card('证书', `<p class="help">使用当前阿里云账号自动添加 DNS-01 TXT 记录，向 Let’s Encrypt 申请证书。续期可再次申请；证书文件存于本机应用数据目录，部署到服务器由管理员完成。</p>${(S.certificates || []).map((cert) => row(`<strong>${esc(cert.domains.join('、'))}</strong><div class="small muted">到期 ${esc(String(cert.notAfter || '').slice(0, 10))} · ${esc(cert.keyType)}</div><div class="mono small muted">${esc(cert.fullchainPath)}<br>${esc(cert.privateKeyPath)}</div>`, button('复制证书路径', 'domains.cert.copy', `data-cert="${esc(cert.id)}"`))).join('') || empty('尚未申请证书')}`)}`;
+    ${card('证书', `<p class="help">使用当前阿里云账号自动添加 DNS-01 TXT 记录，向 Let’s Encrypt 申请证书。续期可再次申请；证书文件存于本机应用数据目录；部署后网站将启用 HTTPS 443。</p>${(S.certificates || []).map((cert) => row(`<strong>${esc(cert.domains.join('、'))}</strong><div class="small muted">到期 ${esc(String(cert.notAfter || '').slice(0, 10))} · ${esc(cert.keyType)}</div><div class="mono small muted">${esc(cert.fullchainPath)}<br>${esc(cert.privateKeyPath)}</div>`, `${button('部署到网站', 'domains.cert.deploy', `data-cert="${esc(cert.id)}"`)}${button('复制证书路径', 'domains.cert.copy', `data-cert="${esc(cert.id)}"`)}`)).join('') || empty('尚未申请证书')}`)}`;
 };
 function dnsRecordForm(record) {
   modal(record ? '编辑解析记录' : '新增解析记录', [
@@ -776,6 +796,16 @@ async function domainAction(action, index, certId) {
     renders.domains();
     info('证书申请成功', `全链：${result.fullchainPath}\n私钥：${result.privateKeyPath}`);
   }, '开始申请');
+  else if (action === 'domains.cert.deploy') {
+    const sites = list(await api('sites.list')).filter((site) => site.enabled);
+    if (!sites.length) throw new Error('请先在当前服务器创建并启用网站');
+    modal('部署证书到网站', [{ name: 'site', label: '网站', type: 'select',
+      options: sites.map((site) => [`${site.provider}/${site.id}`, `${(site.domains || []).join('、')} · ${site.provider}`]) }],
+    async ({ site }) => { const selected = sites.find((item) => `${item.provider}/${item.id}` === site);
+      if (!selected) throw new Error('请选择网站');
+      await window.sera.deployCertificate(certId, selected.provider, selected.id);
+      await refresh(false); setNotice('证书已部署，网站 HTTPS 已启用'); }, '部署');
+  }
   else if (action === 'domains.cert.copy') {
     const cert = (S.certificates || []).find((entry) => entry.id === certId);
     if (cert) await window.sera.clipboardWrite(`${cert.fullchainPath}\n${cert.privateKeyPath}`);
@@ -824,7 +854,7 @@ document.addEventListener('click', async (event) => {
     else if (action.startsWith('projects.')) await projectAction(action, index);
     else if (action.startsWith('environments.')) await environmentAction(action, index, part);
     else if (action.startsWith('software.') || action.startsWith('services.'))
-      await softwareAction(action, index, target.dataset.command);
+      await softwareAction(action, index, target.dataset.command || target.dataset.id);
     else if (action.startsWith('firewall.')) await firewallAction(action, index);
     else if (action.startsWith('tasks.')) await taskAction(action, index);
     else if (action.startsWith('databases.')) await databaseAction(action, index, target.dataset.id);
@@ -909,5 +939,19 @@ setInterval(async () => {
     }
   } catch (error) { setNotice(error.message || String(error), true); }
   finally { statusPolling = false; }
+}, 5000);
+let storePolling = false;
+setInterval(async () => {
+  if (storePolling || S.section !== 'store' || !selectedConnection() || S.busy || $('#modal').open || document.hidden || document.activeElement?.id === 'store-search') return;
+  storePolling = true;
+  const connectionID = S.doc.selectedID;
+  try {
+    const snapshot = await Promise.all([api('software.list'), api('software.jobs')]);
+    if (S.section === 'store' && S.doc.selectedID === connectionID) {
+      S.data = snapshot;
+      renders.store();
+    }
+  } catch (error) { setNotice(error.message || String(error), true); }
+  finally { storePolling = false; }
 }, 5000);
 loadConnections().then(() => refresh()).catch((error) => setNotice(error.message, true));

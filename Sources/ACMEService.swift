@@ -46,9 +46,10 @@ struct ACMECertificate: Identifiable {
 
     var id: String { domain }
 
-    var keyPath: String { "\(home)/\(domain)_ecc/\(domain).key" }
-    var fullchainPath: String { "\(home)/\(domain)_ecc/fullchain.cer" }
-    var certPath: String { "\(home)/\(domain)_ecc/\(domain).cer" }
+    private var certificateDirectory: String { keyLength.hasPrefix("ec-") ? "\(home)/\(domain)_ecc" : "\(home)/\(domain)" }
+    var keyPath: String { "\(certificateDirectory)/\(domain).key" }
+    var fullchainPath: String { "\(certificateDirectory)/fullchain.cer" }
+    var certPath: String { "\(certificateDirectory)/\(domain).cer" }
 }
 
 // MARK: - 服务

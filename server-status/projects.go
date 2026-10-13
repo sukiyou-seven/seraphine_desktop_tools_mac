@@ -46,6 +46,7 @@ type project struct {
 	RuntimeVersion string `json:"runtime_version,omitempty"`
 	UseVenv        bool   `json:"use_venv,omitempty"`
 	PythonServer   string `json:"python_server,omitempty"`
+	PythonWorker   string `json:"python_worker,omitempty"`
 	PythonCallable string `json:"python_callable,omitempty"`
 	PythonWorkers  int    `json:"python_workers,omitempty"`
 	PythonThreads  int    `json:"python_threads,omitempty"`
@@ -85,7 +86,7 @@ func pythonModule(entry string) (string, error) {
 	}
 	for _, part := range parts {
 		if !pythonIdentifierPattern.MatchString(part) {
-			return "", errors.New("WSGI 入口路径每一层都须是有效的 Python 模块名")
+			return "", errors.New("Python 入口路径每一层都须是有效的 Python 模块名")
 		}
 	}
 	return strings.Join(parts, "."), nil
@@ -160,15 +161,28 @@ func (pm *projectManager) normalize(item project) (project, error) {
 		if item.PythonServer == "" {
 			item.PythonServer = "direct" // Existing projects keep their previous behavior.
 		}
-		if item.PythonServer != "direct" && item.PythonServer != "gunicorn" && item.PythonServer != "uwsgi" {
-			return project{}, errors.New("Python 启动方式只能是直接运行、Gunicorn 或 uWSGI")
+		if item.PythonServer != "direct" && item.PythonServer != "gunicorn" && item.PythonServer != "uwsgi" && item.PythonServer != "uvicorn" {
+			return project{}, errors.New("不支持此 Python 启动方式")
+		}
+		if item.PythonServer == "gunicorn" {
+			if item.PythonWorker == "" {
+				item.PythonWorker = "sync"
+				if item.PythonThreads > 1 {
+					item.PythonWorker = "gthread"
+				}
+			}
+			if item.PythonWorker != "sync" && item.PythonWorker != "gthread" && item.PythonWorker != "uvicorn" {
+				return project{}, errors.New("不支持此 Gunicorn worker class")
+			}
+		} else if item.PythonWorker != "" {
+			return project{}, errors.New("只有 Gunicorn 可以配置 worker class")
 		}
 		if item.PythonServer != "direct" {
 			if !item.UseVenv {
-				return project{}, errors.New("Gunicorn 和 uWSGI 需要启用项目虚拟环境")
+				return project{}, errors.New("Python 启动器需要启用项目虚拟环境")
 			}
 			if item.Port < 1 {
-				return project{}, errors.New("WSGI 项目须配置监听端口")
+				return project{}, errors.New("Python 服务须配置监听端口")
 			}
 			if _, err := pythonModule(item.Entry); err != nil {
 				return project{}, err
@@ -177,7 +191,7 @@ func (pm *projectManager) normalize(item project) (project, error) {
 				item.PythonCallable = "app"
 			}
 			if !pythonIdentifierPattern.MatchString(item.PythonCallable) {
-				return project{}, errors.New("WSGI callable 须为有效的 Python 标识符")
+				return project{}, errors.New("Python callable 须为有效的 Python 标识符")
 			}
 			if item.PythonWorkers == 0 {
 				item.PythonWorkers = 2
@@ -189,7 +203,7 @@ func (pm *projectManager) normalize(item project) (project, error) {
 				return project{}, errors.New("进程数须为 1–32，线程数须为 1–64")
 			}
 		}
-	} else if item.PythonServer != "" || item.PythonCallable != "" || item.PythonWorkers != 0 || item.PythonThreads != 0 {
+	} else if item.PythonServer != "" || item.PythonWorker != "" || item.PythonCallable != "" || item.PythonWorkers != 0 || item.PythonThreads != 0 {
 		return project{}, errors.New("Python 启动配置只能用于 Python 项目")
 	}
 	if !validProjectEntry(item.Runtime, item.Entry) {
@@ -423,7 +437,23 @@ func (pm *projectManager) unit(item project) []byte {
 		binary = filepath.Join(pm.venvDir(item.ID), "bin", item.PythonServer)
 		address := "127.0.0.1:" + strconv.Itoa(item.Port)
 		if item.PythonServer == "gunicorn" {
-			args = []string{binary, "--bind", address, "--workers", strconv.Itoa(item.PythonWorkers), "--threads", strconv.Itoa(item.PythonThreads), module + ":" + item.PythonCallable}
+			worker := item.PythonWorker
+			if worker == "" {
+				worker = "sync"
+				if item.PythonThreads > 1 {
+					worker = "gthread"
+				}
+			}
+			if worker == "uvicorn" {
+				worker = "uvicorn_worker.UvicornWorker"
+			}
+			args = []string{binary, "--bind", address, "--workers", strconv.Itoa(item.PythonWorkers), "--worker-class", worker}
+			if worker == "gthread" {
+				args = append(args, "--threads", strconv.Itoa(item.PythonThreads))
+			}
+			args = append(args, module+":"+item.PythonCallable)
+		} else if item.PythonServer == "uvicorn" {
+			args = []string{binary, module + ":" + item.PythonCallable, "--host", "127.0.0.1", "--port", strconv.Itoa(item.Port), "--workers", strconv.Itoa(item.PythonWorkers)}
 		} else {
 			args = []string{binary, "--master", "--http-socket", address, "--processes", strconv.Itoa(item.PythonWorkers), "--threads", strconv.Itoa(item.PythonThreads), "--module", module, "--callable", item.PythonCallable, "--need-app", "--die-on-term"}
 		}

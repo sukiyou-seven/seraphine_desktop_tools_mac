@@ -80,8 +80,11 @@ func TestSoftwareAPIInstallAndService(t *testing.T) {
 		t.Fatalf("install not accepted: %d", got)
 	}
 	<-started
-	if got := request("POST", "/v1/software/mysql/install", "", "secret").Code; got != 409 {
-		t.Fatalf("parallel installation accepted: %d", got)
+	if got := request("POST", "/v1/software/mysql/install", "", "secret").Code; got != 202 {
+		t.Fatalf("parallel installation not queued: %d", got)
+	}
+	if got := request("POST", "/v1/software/mysql/cancel", "", "secret").Code; got != 204 {
+		t.Fatalf("queued cancellation: %d", got)
 	}
 	installing := request("GET", "/v1/software", "", "secret")
 	if !strings.Contains(installing.Body.String(), `"state":"installing"`) ||
@@ -125,6 +128,48 @@ func TestSoftwareAPIInstallAndService(t *testing.T) {
 	if log.Code != http.StatusOK || !strings.Contains(log.Body.String(), "测试安装中") {
 		t.Fatalf("install log unavailable: %d %s", log.Code, log.Body.String())
 	}
+}
+
+func TestSoftwareQueueAndCancelRunningJob(t *testing.T) {
+	sm := newSoftwareManager(t.TempDir())
+	sm.supported = func(string) bool { return true }
+	started := make(chan struct{})
+	sm.run = func(ctx context.Context, id, version string, output io.Writer) error {
+		if id == "nginx" {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		prefix := sm.prefix(id)
+		if err := os.MkdirAll(prefix, 0755); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(prefix, ".sera-installed"), []byte(version), 0600)
+	}
+	if err := sm.install("nginx", ""); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := sm.install("mysql", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := sm.jobs["mysql"].state; got != "queued" {
+		t.Fatalf("not queued: %s", got)
+	}
+	if err := sm.cancelJob("nginx"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		sm.mu.Lock()
+		first, second := sm.jobs["nginx"].state, sm.jobs["mysql"].state
+		sm.mu.Unlock()
+		if first == "cancelled" && second == "installed" {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("queued job did not run after cancellation")
 }
 
 func TestSoftwareStoreDefaultRuntimeVersion(t *testing.T) {
@@ -232,8 +277,11 @@ func TestSoftwareUninstallBackupAndPurge(t *testing.T) {
 	if got := sm.item(context.Background(), softwareCatalog[0]); got.State != "uninstalling" {
 		t.Fatalf("uninstall progress missing: %+v", got)
 	}
-	if got := request("/v1/software/mysql/install", "", "secret").Code; got != http.StatusConflict {
-		t.Fatalf("parallel install accepted: %d", got)
+	if got := request("/v1/software/mysql/install", "", "secret").Code; got != http.StatusAccepted {
+		t.Fatalf("parallel install not queued: %d", got)
+	}
+	if got := request("/v1/software/mysql/cancel", "", "secret").Code; got != http.StatusNoContent {
+		t.Fatalf("queued cancellation: %d", got)
 	}
 	if got := request("/v1/software/nginx/service", `{"action":"start"}`, "secret").Code; got != http.StatusConflict {
 		t.Fatalf("service action during uninstall accepted: %d", got)

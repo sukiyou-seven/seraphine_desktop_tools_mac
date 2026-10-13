@@ -130,6 +130,38 @@ func TestProjectsLifecycleAndIsolation(t *testing.T) {
 	}
 }
 
+func TestPythonASGIUnitsAndWorkerValidation(t *testing.T) {
+	_, pm := projectTestAPI(t)
+	base := project{ID: "asgi", Name: "ASGI", Runtime: "python", UseVenv: true,
+		Entry: "service/main.py", Port: 8123, PythonCallable: "app", PythonWorkers: 2}
+	for _, test := range []struct{ server, worker, command string }{
+		{"uvicorn", "", `"service.main:app" "--host" "127.0.0.1" "--port" "8123" "--workers" "2"`},
+		{"gunicorn", "uvicorn", `"--worker-class" "uvicorn_worker.UvicornWorker" "service.main:app"`},
+		{"gunicorn", "gthread", `"--worker-class" "gthread" "--threads" "1" "service.main:app"`},
+	} {
+		item := base
+		item.PythonServer, item.PythonWorker = test.server, test.worker
+		item, err := pm.normalize(item)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(pm.unit(item)), test.command) {
+			t.Fatalf("%s/%s missing %q", test.server, test.worker, test.command)
+		}
+	}
+	invalid := base
+	invalid.PythonServer, invalid.PythonWorker = "uvicorn", "gthread"
+	if _, err := pm.normalize(invalid); err == nil {
+		t.Fatal("accepted worker class for Uvicorn")
+	}
+	legacy := base
+	legacy.PythonServer, legacy.PythonThreads = "gunicorn", 3
+	legacy, err := pm.normalize(legacy)
+	if err != nil || legacy.PythonWorker != "gthread" {
+		t.Fatalf("legacy threads lost: %+v %v", legacy, err)
+	}
+}
+
 func TestProjectsRejectTraversalAndSymlinkEscape(t *testing.T) {
 	a, pm := projectTestAPI(t)
 	for _, body := range []string{
@@ -259,7 +291,7 @@ func TestPythonWSGIServersValidateAndGenerateUnits(t *testing.T) {
 			t.Fatalf("accepted invalid WSGI configuration %s: %d", body, got)
 		}
 	}
-	created := projectRequest(a, "POST", "/v1/projects", `{"id":"web","name":"Web","runtime":"python","entry":"site/app.py","port":8080,"use_venv":true,"python_server":"gunicorn","python_callable":"application","python_workers":3,"python_threads":2}`, true)
+	created := projectRequest(a, "POST", "/v1/projects", `{"id":"web","name":"Web","runtime":"python","entry":"site/app.py","port":8080,"use_venv":true,"python_server":"gunicorn","python_worker":"gthread","python_callable":"application","python_workers":3,"python_threads":2}`, true)
 	if created.Code != 201 {
 		t.Fatalf("create Gunicorn project: %d %s", created.Code, created.Body.String())
 	}
@@ -267,7 +299,7 @@ func TestPythonWSGIServersValidateAndGenerateUnits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{"/data/venv/bin/gunicorn", "\"--bind\" \"127.0.0.1:8080\"", "\"--workers\" \"3\"", "\"--threads\" \"2\"", "\"site.app:application\""} {
+	for _, expected := range []string{"/data/venv/bin/gunicorn", "\"--bind\" \"127.0.0.1:8080\"", "\"--workers\" \"3\"", "\"--worker-class\" \"gthread\"", "\"--threads\" \"2\"", "\"site.app:application\""} {
 		if !strings.Contains(string(unit), expected) {
 			t.Fatalf("Gunicorn unit missing %q: %s", expected, unit)
 		}

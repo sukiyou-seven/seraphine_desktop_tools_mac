@@ -31,6 +31,9 @@ struct RemoteSoftware: Decodable, Identifiable {
         case "multiple_versions": return "多版本已安装"
         case "installing": return "安装中"
         case "uninstalling": return "卸载中"
+        case "queued": return "排队中"
+        case "cancelling": return "停止中"
+        case "cancelled": return "已停止"
         case "failed": return "安装失败"
         case "needs_attention": return "需要处理"
         default: return "未安装"
@@ -56,6 +59,16 @@ enum RemoteSoftwareUninstallMode: String {
 struct RemoteSoftwareListing: Decodable {
     let items: [RemoteSoftware]
 }
+
+struct RemoteSoftwareJob: Decodable, Identifiable {
+    let id: String
+    let operation: String
+    let state: String
+    let message: String
+    let createdAt: String
+}
+
+struct RemoteSoftwareJobs: Decodable { let items: [RemoteSoftwareJob] }
 
 enum ServerSoftwareError: LocalizedError {
     case invalidResponse
@@ -133,6 +146,25 @@ enum ServerSoftwareAPI {
         let (data, response) = try await session.data(for: request(connection: connection, token: token,
                                                                       path: "/v1/software/\(id)/install", method: "POST", json: body))
         try check(response, data: data, expected: 202)
+    }
+
+    static func jobs(connection: ServerConnection, token: String) async throws -> [RemoteSoftwareJob] {
+        let session = try session(connection: connection)
+        defer { session.invalidateAndCancel() }
+        let (data, response) = try await session.data(for: request(connection: connection, token: token,
+                                                                      path: "/v1/software/jobs", method: "GET"))
+        try check(response, data: data, expected: 200)
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(RemoteSoftwareJobs.self, from: data).items
+    }
+
+    static func cancel(connection: ServerConnection, token: String, id: String) async throws {
+        let session = try session(connection: connection)
+        defer { session.invalidateAndCancel() }
+        let (data, response) = try await session.data(for: request(connection: connection, token: token,
+                                                                      path: "/v1/software/\(id)/cancel", method: "POST"))
+        try check(response, data: data, expected: 204)
     }
 
     static func uninstall(connection: ServerConnection, token: String, id: String,

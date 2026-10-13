@@ -29,6 +29,7 @@ type site struct {
 	PHPVersion string   `json:"php_version,omitempty"`
 	Root       string   `json:"root"`
 	Enabled    bool     `json:"enabled"`
+	TLS        bool     `json:"tls,omitempty"`
 }
 
 type siteProvider struct {
@@ -453,10 +454,20 @@ func siteConfig(item site, port int, phpTarget string) []byte {
 			fmt.Fprintf(&body, "    ProxyPreserveHost On\n    ProxyPass / %q\n    ProxyPassReverse / %q\n", item.Upstream+"/", item.Upstream+"/")
 		}
 		body.WriteString("</VirtualHost>\n")
+		if item.TLS {
+			certificate, key := siteCertificatePaths(item)
+			secure := strings.Replace(body.String(), fmt.Sprintf("<VirtualHost *:%d>", port), "<VirtualHost *:443>", 1)
+			secure = strings.Replace(secure, "    ErrorLog", fmt.Sprintf("    SSLEngine on\n    SSLCertificateFile %q\n    SSLCertificateKeyFile %q\n    ErrorLog", certificate, key), 1)
+			body.WriteString(secure)
+		}
 		return []byte(body.String())
 	}
 	var body strings.Builder
 	fmt.Fprintf(&body, "server {\n    listen %d;\n    server_name %s;\n", port, domains)
+	if item.TLS {
+		certificate, key := siteCertificatePaths(item)
+		fmt.Fprintf(&body, "    listen 443 ssl;\n    ssl_certificate %s;\n    ssl_certificate_key %s;\n", certificate, key)
+	}
 	fmt.Fprintf(&body, "    access_log %s;\n    error_log %s warn;\n", access, problem)
 	if item.Kind == "static" || item.Kind == "php" {
 		fmt.Fprintf(&body, "    root %s;\n", item.Root)
@@ -474,6 +485,69 @@ func siteConfig(item site, port int, phpTarget string) []byte {
 	}
 	body.WriteString("}\n")
 	return []byte(body.String())
+}
+
+func siteCertificatePaths(item site) (string, string) {
+	root := filepath.Dir(filepath.Dir(filepath.Dir(item.Root)))
+	base := filepath.Join(root, "sites", "certificates", item.Provider, item.ID)
+	return filepath.Join(base, "fullchain.pem"), filepath.Join(base, "privkey.pem")
+}
+
+func siteTLSBase(base, provider string, enabled bool) string {
+	if provider != "apache" {
+		return base
+	}
+	const begin = "# Seraphim managed TLS begin\n"
+	const end = "# Seraphim managed TLS end\n"
+	if start := strings.Index(base, begin); start >= 0 {
+		if stop := strings.Index(base[start:], end); stop >= 0 {
+			base = base[:start] + base[start+stop+len(end):]
+		}
+	}
+	// Migrate the unmarked lines written by earlier versions immediately before our include.
+	base = strings.Replace(base, "LoadModule ssl_module modules/mod_ssl.so\nListen 443\nIncludeOptional ", "IncludeOptional ", 1)
+	if !enabled {
+		return base
+	}
+	var additions strings.Builder
+	if !regexp.MustCompile(`(?m)^\s*LoadModule ssl_module\s+`).MatchString(base) {
+		additions.WriteString("LoadModule ssl_module modules/mod_ssl.so\n")
+	}
+	if !regexp.MustCompile(`(?m)^\s*Listen 443\s*$`).MatchString(base) {
+		additions.WriteString("Listen 443\n")
+	}
+	if additions.Len() == 0 {
+		return base
+	}
+	managed := begin + additions.String() + end
+	if index := strings.Index(base, "IncludeOptional "); index >= 0 {
+		return base[:index] + managed + base[index:]
+	}
+	base += "\n" + managed
+	return base
+}
+
+func (sm *siteManager) otherTLS(provider, excludedID string) (bool, error) {
+	files, err := os.ReadDir(sm.siteDir(provider))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	for _, file := range files {
+		if !strings.HasSuffix(file.Name(), ".json") || file.Name() == excludedID+".json" {
+			continue
+		}
+		other, err := sm.read(provider, strings.TrimSuffix(file.Name(), ".json"))
+		if err != nil {
+			return false, err
+		}
+		if other.TLS && other.Enabled {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func siteInclude(base, provider, root string, php bool) ([]byte, error) {
@@ -618,6 +692,10 @@ func (sm *siteManager) apply(input site, deleteSite, creating bool) (site, error
 		if err := os.Remove(sm.confPath(input.Provider, input.ID)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return site{}, err
 		}
+		certificate, _ := siteCertificatePaths(input)
+		if err := os.RemoveAll(filepath.Dir(certificate)); err != nil {
+			return site{}, err
+		}
 		return input, nil
 	}
 	if !deleteSite {
@@ -652,6 +730,11 @@ func (sm *siteManager) apply(input site, deleteSite, creating bool) (site, error
 	if !snapshots[0].exists {
 		return site{}, errors.New("Web 服务主配置不存在")
 	}
+	otherTLS, err := sm.otherTLS(input.Provider, input.ID)
+	if err != nil {
+		return site{}, err
+	}
+	needsTLS := otherTLS || (!deleteSite && input.TLS && input.Enabled)
 	if err := os.MkdirAll(sm.siteDir(input.Provider), 0755); err != nil {
 		return site{}, err
 	}
@@ -672,6 +755,11 @@ func (sm *siteManager) apply(input site, deleteSite, creating bool) (site, error
 		if err := os.Remove(paths[2]); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return site{}, err
 		}
+		if input.Provider == "apache" {
+			if err := atomicSiteWrite(basePath, []byte(siteTLSBase(string(snapshots[0].data), input.Provider, needsTLS)), snapshots[0].mode); err != nil {
+				return site{}, err
+			}
+		}
 	} else {
 		if input.Kind == "static" || input.Kind == "php" {
 			if err := ensureSiteRoot(sm.root, input.Provider, input.ID); err != nil {
@@ -682,6 +770,7 @@ func (sm *siteManager) apply(input site, deleteSite, creating bool) (site, error
 		if err != nil {
 			return site{}, err
 		}
+		base = []byte(siteTLSBase(string(base), input.Provider, needsTLS))
 		changed = true
 		if err := atomicSiteWrite(basePath, base, snapshots[0].mode); err != nil {
 			return site{}, err
@@ -732,6 +821,12 @@ func (sm *siteManager) apply(input site, deleteSite, creating bool) (site, error
 		}
 	}
 	changed = false
+	if deleteSite {
+		certificate, _ := siteCertificatePaths(input)
+		if err := os.RemoveAll(filepath.Dir(certificate)); err != nil {
+			return site{}, err
+		}
+	}
 	return input, nil
 }
 
@@ -787,6 +882,22 @@ func (a *api) sitesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/sites/"), "/")
+	if len(parts) == 3 && parts[2] == "certificate" && r.Method == http.MethodPost && validSiteProvider(parts[0]) && validSiteDomain(parts[1]) {
+		var input struct {
+			Certificate string `json:"certificate"`
+			PrivateKey  string `json:"private_key"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256<<10)).Decode(&input); err != nil {
+			http.Error(w, "证书参数无效", http.StatusBadRequest)
+			return
+		}
+		if err := a.sites.deployCertificate(parts[0], parts[1], input.Certificate, input.PrivateKey); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if len(parts) != 2 || !validSiteProvider(parts[0]) || !validSiteDomain(parts[1]) {
 		http.NotFound(w, r)
 		return
@@ -805,6 +916,7 @@ func (a *api) sitesHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		input.ID, input.Provider, input.Root = current.ID, current.Provider, current.Root
+		input.TLS = current.TLS
 		if _, err := a.sites.normalize(input); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return

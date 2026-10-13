@@ -66,6 +66,12 @@ app.whenReady().then(() => {
   ipcMain.handle('dns:save', (_event, settings) => dns.save(store.read().selectedID, settings));
   ipcMain.handle('dns:call', (_event, action, params) => dns.call(store.read().selectedID, action, params));
   ipcMain.handle('certificates:list', () => certificates.list(store.read().selectedID));
+  ipcMain.handle('certificates:deploy', async (_event, certificateID, provider, siteID) => {
+    const { connection, token } = store.selected();
+    if (!/^(nginx|apache|openresty)$/.test(provider) || !/^[a-z0-9.-]{1,253}$/.test(siteID)) throw new Error('网站标识无效');
+    const pair = certificates.pair(store.read().selectedID, certificateID);
+    await request(connection, token, 'POST', `/v1/sites/${provider}/${siteID}/certificate`, { body: pair });
+  });
   ipcMain.handle('certificates:issue', async (_event, input) => {
     if (certificateJob) throw new Error('另一个证书申请正在进行');
     certificateJob = true;

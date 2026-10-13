@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -89,9 +90,14 @@ type softwareItem struct {
 }
 
 type installJob struct {
+	id        string
 	operation string
 	state     string
 	message   string
+	version   string
+	mode      string
+	cancel    context.CancelFunc
+	created   time.Time
 }
 
 type softwareManager struct {
@@ -99,6 +105,8 @@ type softwareManager struct {
 	unitDir   string
 	mu        sync.Mutex
 	jobs      map[string]*installJob
+	queue     []*installJob
+	current   *installJob
 	busy      bool
 	run       func(context.Context, string, string, io.Writer) error
 	systemctl func(context.Context, ...string) ([]byte, error)
@@ -147,6 +155,9 @@ func runInstaller(ctx context.Context, id, version string, output io.Writer) err
 		return err
 	}
 	command := exec.CommandContext(ctx, "/bin/sh", "-c", string(common)+"\n"+string(script))
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	command.Cancel = func() error { return syscall.Kill(-command.Process.Pid, syscall.SIGKILL) }
+	command.WaitDelay = 3 * time.Second
 	command.Env = append(os.Environ(), "SERA_SELECTED_VERSION="+version)
 	command.Stdout = output
 	command.Stderr = output
@@ -237,6 +248,9 @@ func (sm *softwareManager) item(ctx context.Context, spec softwareSpec) software
 		item.Message = latestStage(item.LogPath, fallback)
 		return item
 	}
+	if job != nil && (job.state == "queued" || job.state == "cancelling") {
+		return item
+	}
 	if _, err := os.Stat(filepath.Join(prefix, ".sera-installed")); err == nil {
 		item.State = "installed"
 		if marker, openErr := os.Open(filepath.Join(prefix, ".sera-installed")); openErr == nil {
@@ -312,8 +326,8 @@ func (sm *softwareManager) install(id, requestedVersion string) error {
 	}
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	if sm.busy {
-		return errors.New("another installation is running")
+	if job := sm.jobs[id]; job != nil && (job.state == "queued" || job.state == "installing" || job.state == "uninstalling") {
+		return errors.New("此软件已有进行中的任务")
 	}
 	if _, err := os.Stat(sm.prefix(id)); err == nil {
 		return errors.New("installation directory already exists")
@@ -327,21 +341,81 @@ func (sm *softwareManager) install(id, requestedVersion string) error {
 			return err
 		}
 	}
-	sm.busy = true
-	sm.jobs[id] = &installJob{operation: "install", state: "installing", message: "准备安装 " + version}
-	go sm.installInBackground(id, version)
+	job := &installJob{id: id, operation: "install", state: "queued", message: "等待前一个任务完成", version: version, created: time.Now()}
+	sm.jobs[id] = job
+	sm.queue = append(sm.queue, job)
+	sm.startNextLocked()
 	return nil
 }
 
-func (sm *softwareManager) installInBackground(id, version string) {
+func (sm *softwareManager) startNextLocked() {
+	if sm.busy || len(sm.queue) == 0 {
+		return
+	}
+	job := sm.queue[0]
+	sm.queue = sm.queue[1:]
+	sm.busy = true
+	sm.current = job
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Minute)
+	job.cancel = cancel
+	if job.operation == "install" {
+		job.state, job.message = "installing", "准备安装 "+job.version
+		go sm.installInBackground(ctx, job)
+	} else {
+		job.state, job.message = "uninstalling", "准备卸载"
+		go sm.uninstallInBackground(ctx, job)
+	}
+}
+
+func (sm *softwareManager) finishJob(job *installJob, result, message string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if job.cancel != nil {
+		job.cancel()
+		job.cancel = nil
+	}
+	if job.state == "cancelling" {
+		result, message = "cancelled", "任务已停止；请检查安装目录与日志"
+	}
+	job.state, job.message = result, message
+	sm.current = nil
+	sm.busy = false
+	sm.startNextLocked()
+}
+
+func (sm *softwareManager) cancelJob(id string) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	job := sm.jobs[id]
+	if job == nil {
+		return os.ErrNotExist
+	}
+	if job.state == "queued" {
+		for i, pending := range sm.queue {
+			if pending == job {
+				sm.queue = append(sm.queue[:i], sm.queue[i+1:]...)
+				break
+			}
+		}
+		job.state, job.message = "cancelled", "排队任务已取消"
+		return nil
+	}
+	if sm.current != job || (job.state != "installing" && job.state != "uninstalling") {
+		return errors.New("任务当前不能停止")
+	}
+	job.state, job.message = "cancelling", "正在停止任务"
+	job.cancel()
+	return nil
+}
+
+func (sm *softwareManager) installInBackground(ctx context.Context, job *installJob) {
+	id, version := job.id, job.version
 	logPath := sm.logPath(id)
 	result := "failed"
 	message := "安装失败，请查看安装日志"
 	if err := os.MkdirAll(filepath.Dir(logPath), 0750); err == nil {
 		if logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600); err == nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 180*time.Minute)
 			err = sm.run(ctx, id, version, logFile)
-			cancel()
 			_ = logFile.Close()
 			if err == nil {
 				if _, statErr := os.Stat(filepath.Join(sm.prefix(id), ".sera-installed")); statErr == nil {
@@ -354,10 +428,7 @@ func (sm *softwareManager) installInBackground(id, version string) {
 			}
 		}
 	}
-	sm.mu.Lock()
-	sm.jobs[id] = &installJob{operation: "install", state: result, message: message}
-	sm.busy = false
-	sm.mu.Unlock()
+	sm.finishJob(job, result, message)
 }
 
 func (sm *softwareManager) installedPrefix(id string) (string, error) {
@@ -395,8 +466,8 @@ func (sm *softwareManager) uninstall(id, mode string) error {
 	}
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	if sm.busy {
-		return errors.New("another software operation is running")
+	if job := sm.jobs[id]; job != nil && (job.state == "queued" || job.state == "installing" || job.state == "uninstalling") {
+		return errors.New("此软件已有进行中的任务")
 	}
 	if _, err := sm.installedPrefix(id); err != nil {
 		return err
@@ -410,9 +481,10 @@ func (sm *softwareManager) uninstall(id, mode string) error {
 			return errors.New("service unit is not a regular file")
 		}
 	}
-	sm.busy = true
-	sm.jobs[id] = &installJob{operation: "uninstall", state: "uninstalling", message: "准备卸载"}
-	go sm.uninstallInBackground(id, mode)
+	job := &installJob{id: id, operation: "uninstall", state: "queued", message: "等待前一个任务完成", mode: mode, created: time.Now()}
+	sm.jobs[id] = job
+	sm.queue = append(sm.queue, job)
+	sm.startNextLocked()
 	return nil
 }
 
@@ -535,16 +607,15 @@ func (sm *softwareManager) uninstallNow(ctx context.Context, id, mode string, ou
 	return backupPath, nil
 }
 
-func (sm *softwareManager) uninstallInBackground(id, mode string) {
+func (sm *softwareManager) uninstallInBackground(ctx context.Context, job *installJob) {
+	id, mode := job.id, job.mode
 	result := "needs_attention"
 	message := "卸载失败，请查看操作日志"
 	logPath := sm.logPath(id)
 	if err := os.MkdirAll(filepath.Dir(logPath), 0750); err == nil {
 		if logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600); err == nil {
 			_, _ = fmt.Fprintln(logFile, "SERA_STAGE:准备卸载")
-			ctx, cancel := context.WithTimeout(context.Background(), 180*time.Minute)
 			backupPath, runErr := sm.uninstallNow(ctx, id, mode, logFile)
-			cancel()
 			if runErr == nil {
 				result = "not_installed"
 				message = "卸载完成"
@@ -559,10 +630,7 @@ func (sm *softwareManager) uninstallInBackground(id, mode string) {
 			_ = logFile.Close()
 		}
 	}
-	sm.mu.Lock()
-	sm.jobs[id] = &installJob{operation: "uninstall", state: result, message: message}
-	sm.busy = false
-	sm.mu.Unlock()
+	sm.finishJob(job, result, message)
 }
 
 func (sm *softwareManager) beginServiceAction() bool {
@@ -578,6 +646,7 @@ func (sm *softwareManager) beginServiceAction() bool {
 func (sm *softwareManager) endServiceAction() {
 	sm.mu.Lock()
 	sm.busy = false
+	sm.startNextLocked()
 	sm.mu.Unlock()
 }
 
@@ -603,6 +672,18 @@ func (a *api) softwareHandler(w http.ResponseWriter, r *http.Request) {
 		}{items})
 		return
 	}
+	if r.URL.Path == "/v1/software/jobs" && r.Method == http.MethodGet {
+		a.software.mu.Lock()
+		jobs := make([]map[string]any, 0, len(a.software.jobs))
+		for _, job := range a.software.jobs {
+			jobs = append(jobs, map[string]any{"id": job.id, "operation": job.operation, "state": job.state, "message": job.message, "created_at": job.created.Format(time.RFC3339)})
+		}
+		a.software.mu.Unlock()
+		sort.Slice(jobs, func(i, j int) bool { return jobs[i]["created_at"].(string) > jobs[j]["created_at"].(string) })
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": jobs})
+		return
+	}
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/software/"), "/")
 	if len(parts) != 2 {
 		http.NotFound(w, r)
@@ -623,6 +704,12 @@ func (a *api) softwareHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch parts[1] {
+	case "cancel":
+		if err := a.software.cancelJob(spec.id); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	case "install":
 		var command struct {
 			Version string `json:"version"`

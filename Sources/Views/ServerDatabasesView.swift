@@ -31,6 +31,9 @@ struct ServerDatabasesView: View {
     @State private var showPostgresAccess = false
     @State private var showCredential = false
     @State private var credential = ""
+    @State private var showChangeCredential = false
+    @State private var currentCredential = ""
+    @State private var newCredential = ""
     @State private var keyValueLevel = "readwrite"
     @State private var keyValueCredential = ""
     @State private var showKeyValueCredential = false
@@ -127,6 +130,7 @@ struct ServerDatabasesView: View {
             Text("将仅允许服务器本机通过密码连接 PostgreSQL，并保留管理账户的本机认证。服务会重启一次。")
         }
         .sheet(isPresented: $showCredential) { credentialSheet }
+        .sheet(isPresented: $showChangeCredential) { changeCredentialSheet }
         .sheet(isPresented: $showKeyValueCredential) { keyValueCredentialSheet }
         .confirmationDialog("启用持久化 ACL 账户管理？", isPresented: $showEnableKeyValueACL) {
             Button("更新配置并重启") { enableKeyValueACL() }
@@ -238,6 +242,8 @@ struct ServerDatabasesView: View {
                                 .disabled(working || instance.authState == "configured")
                             Button("设置已有管理密码…") { credential = ""; showCredential = true }
                                 .disabled(working)
+                            Button("查看已保存密码") { revealPassword(engine: "mysql") }.disabled(working)
+                            Button("修改管理密码…") { currentCredential = ""; newCredential = ""; showChangeCredential = true }.disabled(working)
                             if instance.authState == "initial" {
                                 Text("安装时的临时密码尚未初始化").font(.caption).foregroundStyle(.orange)
                             }
@@ -313,6 +319,7 @@ struct ServerDatabasesView: View {
                             .font(.system(.body, design: .monospaced))
                         Spacer()
                         if availableUsers.contains(where: { $0.id == user.id }) {
+                            Button("查看密码") { revealPassword(engine: instance.id, user: user.name) }.disabled(working)
                             Button("重置密码…") { pendingReset = user.name }.disabled(working)
                             Button("删除…", role: .destructive) { pendingDelete = ("user", user.name) }
                                 .disabled(working)
@@ -372,6 +379,7 @@ struct ServerDatabasesView: View {
                 Spacer()
                 Button("设置已有管理员密码…") { keyValueCredential = ""; showKeyValueCredential = true }
                     .disabled(working)
+                Button("查看已保存密码") { revealPassword(engine: instance.id) }.disabled(working)
             }
             if let keyValueACL {
                 if !keyValueACL.persistent {
@@ -402,6 +410,7 @@ struct ServerDatabasesView: View {
                         Spacer()
                         if canManageKeyValueUser(user.name) && keyValueACL.persistent &&
                             ["read", "readwrite"].contains(user.level) {
+                            Button("查看密码") { revealPassword(engine: instance.id, user: user.name) }.disabled(working)
                             Button(user.enabled ? "停用" : "启用") {
                                 updateKeyValueUser(user, level: user.level, enabled: !user.enabled)
                             }.disabled(working)
@@ -470,6 +479,23 @@ struct ServerDatabasesView: View {
                 Spacer()
                 Button("取消") { showCredential = false }
                 Button("验证并保存") { saveCredential() }.disabled(credential.isEmpty || working)
+            }
+        }
+        .padding(20)
+        .frame(width: 500)
+    }
+
+    private var changeCredentialSheet: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("修改 MySQL root 密码").font(.title3.weight(.semibold))
+            SecureField("当前密码（已保存在服务端时可留空）", text: $currentCredential)
+            SecureField("新密码（至少 8 位）", text: $newCredential)
+            Text("服务端先验证当前密码，再修改数据库中的密码并保存新值；不允许单引号和反斜杠。")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("取消") { showChangeCredential = false }
+                Button("修改") { changeCredential() }.disabled(working || newCredential.count < 8)
             }
         }
         .padding(20)
@@ -652,6 +678,37 @@ struct ServerDatabasesView: View {
                 working = false
                 await refresh()
                 message = "MySQL 管理密码已验证并保存"
+                hasError = false
+            } catch { working = false; message = error.localizedDescription; hasError = true }
+        }
+    }
+
+    private func revealPassword(engine: String, user: String? = nil) {
+        Task { @MainActor in
+            do {
+                let result = try await ServerDatabaseAPI.savedPassword(connection: connection, token: token, engine: engine, user: user)
+                secretSheet = DatabaseSecretSheet(title: "已保存的密码", username: result.user, password: result.password)
+            } catch {
+                message = error.localizedDescription
+                hasError = true
+            }
+        }
+    }
+
+    private func changeCredential() {
+        let current = currentCredential
+        let next = newCredential
+        working = true
+        Task { @MainActor in
+            do {
+                try await ServerDatabaseAPI.changeMySQLCredential(connection: connection, token: token,
+                                                                 current: current, next: next)
+                currentCredential = ""
+                newCredential = ""
+                showChangeCredential = false
+                working = false
+                await refresh()
+                message = "MySQL 管理密码已修改并保存"
                 hasError = false
             } catch { working = false; message = error.localizedDescription; hasError = true }
         }

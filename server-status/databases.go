@@ -409,7 +409,13 @@ func (dm *databaseManager) createUser(ctx context.Context, engine, name string) 
 		sql = "CREATE USER " + quoteDatabaseUser(engine, name) + " IDENTIFIED BY '" + password + "'"
 	}
 	_, err = dm.query(ctx, engine, sql, "")
-	return password, err
+	if err != nil {
+		return "", err
+	}
+	if err := dm.saveUserSecret(engine, name, password); err != nil {
+		return password, fmt.Errorf("账户已创建，但保存密码失败：%w", err)
+	}
+	return password, nil
 }
 
 func (dm *databaseManager) deleteUser(ctx context.Context, engine, name string) error {
@@ -423,6 +429,9 @@ func (dm *databaseManager) deleteUser(ctx context.Context, engine, name string) 
 		sql = "DROP USER " + quoteDatabaseUser(engine, name)
 	}
 	_, err := dm.query(ctx, engine, sql, "")
+	if err == nil {
+		dm.deleteUserSecret(engine, name)
+	}
 	return err
 }
 
@@ -441,7 +450,13 @@ func (dm *databaseManager) resetUserPassword(ctx context.Context, engine, name s
 		sql = "ALTER USER " + quoteDatabaseUser(engine, name) + " IDENTIFIED BY '" + password + "'"
 	}
 	_, err = dm.query(ctx, engine, sql, "")
-	return password, err
+	if err != nil {
+		return "", err
+	}
+	if err := dm.saveUserSecret(engine, name, password); err != nil {
+		return password, fmt.Errorf("密码已更改，但保存密码失败：%w", err)
+	}
+	return password, nil
 }
 
 func (dm *databaseManager) grant(ctx context.Context, engine, database, username, level string, revoke bool) error {
@@ -558,6 +573,33 @@ func (dm *databaseManager) setMySQLCredential(ctx context.Context, password stri
 		return err
 	}
 	return atomicSiteWrite(dm.adminPath(), []byte(password+"\n"), 0600)
+}
+
+func (dm *databaseManager) changeMySQLCredential(ctx context.Context, current, next string) error {
+	if len(next) < 8 || len(next) > 512 || strings.ContainsAny(next, "'\\\r\n\x00") {
+		return errors.New("新密码须为 8 至 512 字符，不能包含单引号、反斜杠或换行")
+	}
+	if current == "" {
+		var err error
+		current, err = dm.mysqlPassword()
+		if err != nil {
+			return errors.New("请填写当前管理密码")
+		}
+	}
+	if _, err := dm.run(ctx, "mysql", "SELECT 1", "", current); err != nil {
+		return errors.New("当前管理密码验证失败")
+	}
+	if err := atomicSiteWrite(dm.pendingAdminPath(), []byte(next+"\n"), 0600); err != nil {
+		return err
+	}
+	if _, err := dm.run(ctx, "mysql", "ALTER USER 'root'@'localhost' IDENTIFIED BY '"+next+"'", "", current); err != nil {
+		_ = os.Remove(dm.pendingAdminPath())
+		return err
+	}
+	if err := os.Rename(dm.pendingAdminPath(), dm.adminPath()); err != nil {
+		return fmt.Errorf("密码已更改，待完成的密码保存在受限文件中：%w", err)
+	}
+	return nil
 }
 
 func databaseConfigSnapshot(path string) ([]byte, os.FileInfo, error) {
@@ -690,6 +732,25 @@ func (a *api) databasesHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if r.Method == http.MethodGet && ((len(parts) == 2 && parts[1] == "credential" && engine == "mysql") ||
+		(len(parts) == 3 && parts[1] == "users" && strings.HasSuffix(parts[2], ":password"))) {
+		var name, password string
+		var err error
+		if parts[1] == "credential" {
+			name = "root"
+			password, err = readDatabasePassword(a.databases.adminPath())
+		} else {
+			name = strings.TrimSuffix(parts[2], ":password")
+			password, err = a.databases.userSecret(engine, name)
+		}
+		if err != nil {
+			http.Error(w, "没有已保存的密码", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(databasePasswordResponse{User: name, Password: password})
+		return
+	}
 	if !a.software.beginServiceAction() {
 		http.Error(w, "另一个软件操作正在进行", http.StatusConflict)
 		return
@@ -697,6 +758,22 @@ func (a *api) databasesHandler(w http.ResponseWriter, r *http.Request) {
 	defer a.software.endServiceAction()
 	a.databases.mu.Lock()
 	defer a.databases.mu.Unlock()
+	if engine == "mysql" && len(parts) == 3 && parts[1] == "credential" && parts[2] == "change" && r.Method == http.MethodPost {
+		var input struct {
+			Current string `json:"current_password"`
+			Next    string `json:"new_password"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&input); err != nil {
+			http.Error(w, "密码参数无效", http.StatusBadRequest)
+			return
+		}
+		if err := a.databases.changeMySQLCredential(r.Context(), input.Current, input.Next); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if err := a.databases.ready(r.Context(), engine); err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return

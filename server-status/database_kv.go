@@ -383,6 +383,9 @@ func (dm *databaseManager) keyValueCreateUser(ctx context.Context, engine, name,
 		cancel()
 		return "", err
 	}
+	if err := dm.saveUserSecret(engine, name, password); err != nil {
+		return password, fmt.Errorf("ACL 账户已创建，但保存密码失败：%w", err)
+	}
 	return password, nil
 }
 
@@ -410,6 +413,7 @@ func (dm *databaseManager) keyValueDeleteUser(ctx context.Context, engine, name 
 		cancel()
 		return err
 	}
+	dm.deleteUserSecret(engine, name)
 	return nil
 }
 
@@ -440,6 +444,9 @@ func (dm *databaseManager) keyValueResetUser(ctx context.Context, engine, name s
 		dm.keyValueRestoreUser(rollback, engine, name, rule)
 		cancel()
 		return "", err
+	}
+	if err := dm.saveUserSecret(engine, name, password); err != nil {
+		return password, fmt.Errorf("ACL 密码已更改，但保存密码失败：%w", err)
 	}
 	return password, nil
 }
@@ -489,6 +496,27 @@ func (a *api) keyValueDatabaseHandler(w http.ResponseWriter, r *http.Request, pa
 	a.databases.mu.Lock()
 	defer a.databases.mu.Unlock()
 	engine := parts[0]
+	if r.Method == http.MethodGet && len(parts) == 4 && parts[1] == "acl" && parts[2] == "users" && strings.HasSuffix(parts[3], ":password") {
+		name := strings.TrimSuffix(parts[3], ":password")
+		password, err := a.databases.userSecret(engine, name)
+		if err != nil {
+			http.Error(w, "没有已保存的密码", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(databasePasswordResponse{User: name, Password: password})
+		return
+	}
+	if r.Method == http.MethodGet && len(parts) == 3 && parts[1] == "acl" && parts[2] == "credential" {
+		password, err := readDatabasePassword(a.databases.keyValueAdminPath(engine))
+		if err != nil {
+			http.Error(w, "没有已保存的密码", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(databasePasswordResponse{User: "default", Password: password})
+		return
+	}
 	if err := a.databases.keyValueReady(r.Context(), engine); err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return

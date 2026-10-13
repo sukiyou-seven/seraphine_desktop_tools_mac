@@ -29,15 +29,15 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o ../
 | `/www/seraphim/logs` | 服务日志；API 服务写入 `sera.log`，计划任务日志位于 `tasks/` |
 | `/www/seraphim/tmp` | 临时工作目录 |
 
-软件商店中的 35 款软件分别安装到 `/www/seraphim/server/{id}`。持久化数据保存在对应软件目录的 `data/`，下载包放在 `/www/seraphim/download`，安装与运行日志放在 `/www/seraphim/logs`。编译依赖和共享库可能由系统的 apt 或 dnf 安装；软件本体和自带运行环境位于指定目录。常驻服务的 systemd 单元作为启动入口，保存在 `/etc/systemd/system`；工具链与 Podman 没有常驻服务。卸载先停止并禁用服务，再移除该软件的安装目录和服务单元；可选择把完整目录移到 `/www/seraphim/backup/software`（仍占用磁盘空间），或连同配置和数据彻底删除。系统依赖包、下载缓存及共享日志不会随卸载删除。
+软件商店中的 35 款软件分别安装到 `/www/seraphim/server/{id}`。持久化数据保存在对应软件目录的 `data/`，下载包放在 `/www/seraphim/download`，安装与运行日志放在 `/www/seraphim/logs`。安装和卸载进入串行任务队列，任务列表显示进度，并允许停止排队或正在运行的任务；停止后如留下部分安装目录，需先清理再重新安装。编译依赖和共享库可能由系统的 apt 或 dnf 安装；软件本体和自带运行环境位于指定目录。常驻服务的 systemd 单元作为启动入口，保存在 `/etc/systemd/system`；工具链与 Podman 没有常驻服务。卸载先停止并禁用服务，再移除该软件的安装目录和服务单元；可选择把完整目录移到 `/www/seraphim/backup/software`（仍占用磁盘空间），或连同配置和数据彻底删除。系统依赖包、下载缓存及共享日志不会随卸载删除。
 
-网站管理要求先从软件商店安装 Nginx、Apache 或 OpenResty。三者分别监听 HTTP 80、8082、8083 端口。静态和 PHP 网站使用 `/www/seraphim/web/{服务}/{首个域名}`；PHP 网站需先安装相应版本的 PHP，网站配置会将 `.php` 请求转发到该版本的 FPM。启用网站时会启动所选 Web 服务及 PHP-FPM。静态网站拒绝直接读取 `.php` 源码。反向代理可指向 HTTP/HTTPS 上游。每次变更都会先检查 Web 服务配置，再在服务运行时重载；检查或重载失败则恢复原配置。删除网站仅删除站点定义和 Web 服务配置，保留网站目录。网站证书尚未由此页面部署，当前创建的是 HTTP 站点。
+网站管理要求先从软件商店安装 Nginx、Apache 或 OpenResty。三者分别监听 HTTP 80、8082、8083 端口。静态和 PHP 网站使用 `/www/seraphim/web/{服务}/{首个域名}`；PHP 网站需先安装相应版本的 PHP，网站配置会将 `.php` 请求转发到该版本的 FPM。启用网站时会启动所选 Web 服务及 PHP-FPM。静态网站拒绝直接读取 `.php` 源码。反向代理可指向 HTTP/HTTPS 上游。每次变更都会先检查 Web 服务配置，再在服务运行时重载；检查或重载失败则恢复原配置。删除网站仅删除站点定义和 Web 服务配置，保留网站目录。证书可在桌面端「域名管理」签发后选择服务器和网站部署；服务端验证证书、私钥及全部网站域名，写入 `/www/seraphim/sites/certificates/{服务}/{网站}`，在 443 端口启用 HTTPS 并重载。不同 Web 服务不能同时占用 443；证书续期后需再次部署。删除网站会删除服务端证书，网站文件保留。
 
 环境管理从各软件官方发布源读取版本和下载校验值，查询结果缓存 15 分钟。新版本安装在 `/www/seraphim/server/{id}/versions/{version}`，可与同种环境的其他版本并存；升级前的 `/www/seraphim/server/{id}` 仍被识别为旧版安装。安装包下载后验证发布源提供的 SHA-256 或 SHA-512，客户端仅选择版本，不传下载地址或命令。项目管理可指定已安装的运行环境版本；旧项目继续使用原有路径。PHP 每个新版本拥有独立的 FPM 服务和 Unix socket。环境管理不会修改系统全局 PATH。
 
-项目管理支持 Python、Node.js、Go、Java JAR、.NET DLL、Ruby、Bun 和 Deno 常驻项目。可以先创建项目配置，再安装运行环境并选择版本。工程目录默认是 `/www/seraphim/projects/{项目标识}`，也可以指定服务器上已有的绝对目录；入口相对于工程目录。Go 的入口可为 `.` 或 `.go` 文件。Python 项目可使用位于管理目录 `data/venv` 的独立虚拟环境，并通过接口安装工程目录中的 `requirements.txt`。新建 Python Web 项目默认使用 Gunicorn，也可选择 uWSGI；两者都要求项目虚拟环境、端口和 WSGI callable。入口写 `app.py` 或 `package/app.py`，服务端转换为 Python 模块路径，再以 `module:callable` 启动；可配置 1–32 个进程、每进程 1–64 个线程，固定监听 `127.0.0.1:{端口}`。创建虚拟环境后可单独安装所选启动器，或者将其写入 `requirements.txt`；服务端会在启动前检查可执行文件。旧 Python 项目继续直接运行脚本，编辑后可切换。`PORT` 仍作为环境变量传入项目，反向代理可在网站管理中手动指向 `http://127.0.0.1:{端口}`。项目由独立的 `sera-project` 系统账户运行，工程目录在服务中只读，项目 `data/` 可写；服务日志位于 `/www/seraphim/logs/projects`。可以查看运行状态、启停、重启、设置开机启动及读取日志。删除项目会停用服务并删除项目定义，但保留源文件、数据和日志。客户端只传结构化项目配置和固定动作，服务端生成 systemd 单元，不接受任意命令文本。
+项目管理支持 Python、Node.js、Go、Java JAR、.NET DLL、Ruby、Bun 和 Deno 常驻项目。可以先创建项目配置，再安装运行环境并选择版本。工程目录默认是 `/www/seraphim/projects/{项目标识}`，也可以指定服务器上已有的绝对目录；入口相对于工程目录。Go 的入口可为 `.` 或 `.go` 文件。Python 项目可使用位于管理目录 `data/venv` 的独立虚拟环境，并通过接口安装工程目录中的 `requirements.txt`。新建 Python Web 项目默认使用 Gunicorn，也可选择 Uvicorn（ASGI）或 uWSGI（WSGI）；三者都要求项目虚拟环境、端口和应用对象。Gunicorn 可选择 `sync`、`gthread` 或 `uvicorn_worker.UvicornWorker`，后者会同时安装 `uvicorn-worker` 与 `uvicorn`。入口写 `app.py` 或 `package/app.py`，服务端转换为 Python 模块路径，再以 `module:callable` 启动；可配置 1–32 个进程、每进程 1–64 个线程，固定监听 `127.0.0.1:{端口}`。创建虚拟环境后可单独安装所选启动器，或者将其写入 `requirements.txt`；服务端会在启动前检查可执行文件。旧 Python 项目继续直接运行脚本，编辑后可切换。`PORT` 仍作为环境变量传入项目，反向代理可在网站管理中手动指向 `http://127.0.0.1:{端口}`。项目由独立的 `sera-project` 系统账户运行，工程目录在服务中只读，项目 `data/` 可写；服务日志位于 `/www/seraphim/logs/projects`。可以查看运行状态、启停、重启、设置开机启动及读取日志。删除项目会停用服务并删除项目定义，但保留源文件、数据和日志。客户端只传结构化项目配置和固定动作，服务端生成 systemd 单元，不接受任意命令文本。
 
-数据库管理显示 MySQL、MariaDB、PostgreSQL、MongoDB、Redis、Valkey、SQLite 七种实例的安装与运行状态。MySQL、MariaDB、PostgreSQL 可建库、删库、建用户、重置密码、删除用户、授予只读或读写权限以及撤销权限。用户密码由服务端随机生成，创建或重置时返回一次；管理接口只接收结构化字段，服务端执行固定数据库客户端与限定的 SQL 模板。MySQL 首次使用时可把安装生成的临时 root 密码更换为管理密码，保存在 `/www/seraphim/server/mysql/sera-admin-password`，权限为 `0600`；已有密码也可验证后保存。PostgreSQL 新安装默认支持本机 SCRAM 密码连接，旧安装可在界面显式启用并重启；不会对外网开放数据库端口。PostgreSQL 对现有表、序列和 `public` schema 授权，其他 schema 与未来由别的账户创建的对象需要另行配置。Redis、Valkey 支持 ACL 账户创建、删除、停用、密码重置及只读/读写权限切换；权限作用于该实例的全部键，默认账户和自定义 ACL 账户在界面中受保护。新安装默认把 ACL 文件放在各自的 `data/users.acl`；旧安装可在界面启用持久化，服务会重启一次。ACL 文件和数据目录分别限制为 `0600` 与 `0700`，普通账户密码仅在创建或重置时显示一次。若已有默认账户密码，须先在界面验证并保存。MongoDB、SQLite 目前只提供实例总览。
+数据库管理显示 MySQL、MariaDB、PostgreSQL、MongoDB、Redis、Valkey、SQLite 七种实例的安装与运行状态。MySQL、MariaDB、PostgreSQL 可建库、删库、建用户、重置密码、删除用户、授予只读或读写权限以及撤销权限。用户密码由服务端随机生成，创建或重置时返回并保存到权限为 `0600` 的 `/www/seraphim/server/.sera-credentials/{engine}/{user}`，之后可显式查看；管理接口只接收结构化字段，服务端执行固定数据库客户端与限定的 SQL 模板。MySQL 首次使用时可把安装生成的临时 root 密码更换为管理密码，保存在 `/www/seraphim/server/mysql/sera-admin-password`，权限为 `0600`；已有密码也可验证后保存。PostgreSQL 新安装默认支持本机 SCRAM 密码连接，旧安装可在界面显式启用并重启；不会对外网开放数据库端口。PostgreSQL 对现有表、序列和 `public` schema 授权，其他 schema 与未来由别的账户创建的对象需要另行配置。Redis、Valkey 支持 ACL 账户创建、删除、停用、密码重置及只读/读写权限切换；权限作用于该实例的全部键，默认账户和自定义 ACL 账户在界面中受保护。新安装默认把 ACL 文件放在各自的 `data/users.acl`；旧安装可在界面启用持久化，服务会重启一次。ACL 文件和数据目录分别限制为 `0600` 与 `0700`，普通账户密码保存于上述受限目录，之后可显式查看。若已有默认账户密码，须先在界面验证并保存。MongoDB、SQLite 目前只提供实例总览。
 
 防火墙规则页支持正在运行的 firewalld 或 ufw，展示当前活动区域中的直接端口规则，支持添加、删除 TCP/UDP 入站端口。firewalld 会同时写入运行配置与持久配置，不触发全量重载；ufw 使用自身规则命令。SSH 默认端口 22 和 API 端口 27520 的规则禁止从此页删除。界面只删除 ufw 对所有来源开放的简单规则，不会更改限定来源的规则；firewalld 服务规则、富规则及云安全组不在本页管理。防火墙服务启停仍位于「软件管理」。
 
@@ -73,7 +73,7 @@ sudo /tmp/sera-new install -host 203.0.113.10
 ExecStart=/www/seraphim/server/sera serve -listen 0.0.0.0:27520 -dir /www/seraphim/server/config -files-root / -cert-file /www/seraphim/server/config/tls/fullchain.pem -key-file /www/seraphim/server/config/tls/privkey.pem -domain status.example.com
 ```
 
-将域名换成实际值，运行 `systemctl daemon-reload && systemctl restart server-status`。启动时会检查证书、私钥和域名是否匹配。续期后替换文件并重启服务。桌面端填写 `https://status.example.com:27520`；受 macOS 信任的正式证书可留空指纹，自签证书必须填写指纹。域名管理页的 acme.sh 在 Mac 上运行，证书文件用于服务器时仍需手动安装。
+将域名换成实际值，运行 `systemctl daemon-reload && systemctl restart server-status`。启动时会检查证书、私钥和域名是否匹配。续期后替换文件并重启服务。桌面端填写 `https://status.example.com:27520`；受 macOS 信任的正式证书可留空指纹，自签证书必须填写指纹。域名管理页的 acme.sh 在 Mac 上运行；网站证书可在该页部署到已连接的 Seraphim 网站。此节的手动步骤只适用于 27520 管理 API 的证书。
 
 ## 桌面端连接
 
@@ -108,7 +108,9 @@ MySQL 默认只监听 `127.0.0.1:3306`；初始化的临时 root 密码保存在
 | `GET /v1/services` | 最多返回一个受支持的防火墙 systemd 服务及其状态 |
 | `POST /v1/services` | 只接受当前选中的防火墙 `.service` 单元；`action` 仅可为 `start`、`stop`、`restart`、`enable`、`disable`，不接受命令文本 |
 | `GET /v1/software` | 分类软件目录、安装可用性、安装阶段、运行状态、日志位置 |
-| `POST /v1/software/{id}/install` | 启动单个后台安装任务；运行环境可传 JSON `version`，只接受服务端列出的版本，省略时使用默认版本；返回 202 |
+| `GET /v1/software/jobs` | 查看当前进程中的软件任务列表与状态 |
+| `POST /v1/software/{id}/cancel` | 取消排队任务或停止正在运行的安装、卸载 |
+| `POST /v1/software/{id}/install` | 进入串行后台安装队列；运行环境可传 JSON `version`，只接受服务端列出的版本，省略时使用默认版本；返回 202 |
 | `POST /v1/software/{id}/uninstall` | JSON `mode` 为 `backup` 或 `purge`，启动后台卸载任务，返回 202 |
 | `GET /v1/software/{id}/log` | 读取该软件最近一次安装或卸载操作日志的末尾 16 KiB |
 | `POST /v1/software/{id}/service` | JSON `action` 为固定的启动、停止、重启、启用或禁用动作；仅操作已安装且有常驻服务的 `sera-*.service` |
@@ -122,12 +124,13 @@ MySQL 默认只监听 `127.0.0.1:3306`；初始化的临时 root 密码保存在
 | `GET /v1/sites` | 列出网站和 Nginx、Apache、OpenResty 的安装、运行及端口状态 |
 | `POST /v1/sites` | 创建网站；JSON `provider`、`domains`、`kind`（`static` 或 `proxy`）、`upstream`、`enabled`；返回 201 |
 | `PUT /v1/sites/{provider}/{id}` | 修改域名、类型、上游或启用状态；配置检查通过后生效 |
-| `DELETE /v1/sites/{provider}/{id}` | 删除网站配置，保留 `/www/seraphim/web` 下的文件 |
+| `DELETE /v1/sites/{provider}/{id}` | 删除网站配置和服务端证书，保留 `/www/seraphim/web` 下的文件 |
+| `POST /v1/sites/{provider}/{id}/certificate` | 上传 PEM `certificate` 与 `private_key`，验证后启用 HTTPS 443 |
 | `GET /v1/projects` | 列出项目及八种运行环境的安装状态 |
 | `POST /v1/projects` | 创建项目，接收 `id`、`name`、`runtime`、`runtime_version`、`directory`、`entry`、`port` 和 Python 的 `use_venv`；运行环境可稍后安装 |
 | `PUT /v1/projects/{id}` | 更新项目；运行中的项目自动重启，失败时恢复原配置 |
 | `POST /v1/projects/{id}/action` | 仅接受 `start`、`stop`、`restart`、`enable`、`disable` |
-| `POST /v1/projects/{id}/venv` | Python 项目虚拟环境操作，`action` 为 `create`、`install_requirements` 或 `install_server`；安装启动器时只接受项目配置中的 Gunicorn/uWSGI 名称，不接受命令文本 |
+| `POST /v1/projects/{id}/venv` | Python 项目虚拟环境操作，`action` 为 `create`、`install_requirements` 或 `install_server`；安装启动器时只接受项目配置中的 Gunicorn/Uvicorn/uWSGI 名称，不接受命令文本 |
 | `GET /v1/projects/{id}/log` | 读取最近 64 KiB 项目日志 |
 | `DELETE /v1/projects/{id}` | 删除项目服务和定义，保留项目文件及日志 |
 | `GET /v1/databases` | 七种数据库实例的安装、运行、端口和认证状态 |
@@ -136,15 +139,20 @@ MySQL 默认只监听 `127.0.0.1:3306`；初始化的临时 root 密码保存在
 | `DELETE /v1/databases/{engine}/databases/{name}` | 删除非系统数据库及其中数据 |
 | `POST /v1/databases/{engine}/users` | 创建账户并返回一次随机密码 |
 | `POST /v1/databases/{engine}/users/{name}:reset` | 重置账户密码并返回新密码 |
+| `GET /v1/databases/{engine}/users/{name}:password` | 显式读取已保存的账户密码 |
 | `DELETE /v1/databases/{engine}/users/{name}` | 删除非系统账户 |
 | `POST /v1/databases/{engine}/grants` | 给账户授予指定数据库的只读或读写权限 |
 | `DELETE /v1/databases/{engine}/grants` | 撤销指定账户在数据库上的权限 |
 | `POST /v1/databases/mysql/bootstrap` | 用安装时的临时密码初始化 MySQL 管理密码 |
 | `POST /v1/databases/mysql/credential` | 验证并保存已有 MySQL 管理密码 |
+| `GET /v1/databases/mysql/credential` | 显式读取已保存的 MySQL 管理密码 |
+| `POST /v1/databases/mysql/credential/change` | 验证当前密码后修改并保存新密码 |
 | `POST /v1/databases/postgresql/local-access` | 为旧版安装启用本机密码连接并重启 PostgreSQL |
 | `GET /v1/databases/{redis|valkey}/acl` | 列出 ACL 账户与持久化状态，不返回密码哈希 |
 | `POST /v1/databases/{redis|valkey}/acl/enable` | 为旧安装启用 ACL 文件并重启服务 |
 | `POST /v1/databases/{redis|valkey}/acl/credential` | 验证并保存已有默认账户密码 |
+| `GET /v1/databases/{redis|valkey}/acl/credential` | 显式读取已保存的默认账户密码 |
+| `GET /v1/databases/{redis|valkey}/acl/users/{name}:password` | 显式读取已保存的 ACL 账户密码 |
 | `POST /v1/databases/{redis|valkey}/acl/users` | 创建只读或读写账户，返回一次随机密码 |
 | `PUT /v1/databases/{redis|valkey}/acl/users/{name}` | 更新账户启用状态和权限 |
 | `POST /v1/databases/{redis|valkey}/acl/users/{name}:reset` | 重置密码并返回一次新密码 |

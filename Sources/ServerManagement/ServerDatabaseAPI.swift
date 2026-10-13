@@ -158,6 +158,28 @@ enum ServerDatabaseAPI {
                            body: JSONEncoder().encode(Payload(password: password)), expected: 204)
     }
 
+    static func changeMySQLCredential(connection: ServerConnection, token: String,
+                                      current: String, next: String) async throws {
+        struct Payload: Encodable {
+            let currentPassword: String
+            let newPassword: String
+            enum CodingKeys: String, CodingKey { case currentPassword = "current_password"; case newPassword = "new_password" }
+        }
+        _ = try await call(connection: connection, token: token, path: "/v1/databases/mysql/credential/change",
+                           method: "POST", body: JSONEncoder().encode(Payload(currentPassword: current, newPassword: next)), expected: 204)
+    }
+
+    static func savedPassword(connection: ServerConnection, token: String, engine: String, user: String? = nil) async throws -> RemoteDatabasePassword {
+        let path: String
+        if let user {
+            path = ["redis", "valkey"].contains(engine) ? "/v1/databases/\(engine)/acl/users/\(user):password" : "/v1/databases/\(engine)/users/\(user):password"
+        } else {
+            path = ["redis", "valkey"].contains(engine) ? "/v1/databases/\(engine)/acl/credential" : "/v1/databases/\(engine)/credential"
+        }
+        let data = try await call(connection: connection, token: token, path: path, method: "GET", expected: 200)
+        return try decoder().decode(RemoteDatabasePassword.self, from: data)
+    }
+
     static func enablePostgresLocalAccess(connection: ServerConnection, token: String) async throws {
         _ = try await call(connection: connection, token: token, path: "/v1/databases/postgresql/local-access",
                            method: "POST", expected: 204)

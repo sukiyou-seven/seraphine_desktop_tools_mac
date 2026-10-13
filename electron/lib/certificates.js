@@ -100,7 +100,16 @@ function createCertificates(base, dns) {
       }
     }
   }
-  return { list, issue };
+  function pair(id, certificateID) {
+    const entry = list(id).find((item) => item.id === certificateID);
+    if (!entry) throw new Error('证书不存在');
+    const folder = fs.realpathSync(directory(id));
+    for (const filename of [entry.fullchainPath, entry.privateKeyPath]) {
+      if (!fs.realpathSync(filename).startsWith(folder + path.sep)) throw new Error('证书文件不在应用数据目录');
+    }
+    return { certificate: fs.readFileSync(entry.fullchainPath, 'utf8'), private_key: fs.readFileSync(entry.privateKeyPath, 'utf8') };
+  }
+  return { list, issue, pair };
 }
 
 module.exports = { createCertificates, normalizeDomains };

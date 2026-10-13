@@ -9,6 +9,7 @@ struct RemoteSite: Codable, Identifiable {
     let phpVersion: String?
     let root: String
     let enabled: Bool
+    let tls: Bool?
     var uniqueID: String { "\(provider)/\(id)" }
     var primaryDomain: String { domains.first ?? id }
 }
@@ -136,6 +137,22 @@ enum ServerSiteAPI {
         let (data, response) = try await session.data(for: request(connection: connection, token: token,
                                                                      path: "/v1/sites/\(site.provider)/\(site.id)",
                                                                      method: "DELETE"))
+        try check(response, data: data, expected: 204)
+    }
+
+    static func deployCertificate(connection: ServerConnection, token: String, site: RemoteSite,
+                                  certificate: String, privateKey: String) async throws {
+        struct Payload: Encodable {
+            let certificate: String
+            let privateKey: String
+            enum CodingKeys: String, CodingKey { case certificate; case privateKey = "private_key" }
+        }
+        let body = try JSONEncoder().encode(Payload(certificate: certificate, privateKey: privateKey))
+        let session = try session(connection: connection)
+        defer { session.invalidateAndCancel() }
+        let (data, response) = try await session.data(for: request(connection: connection, token: token,
+                                                                     path: "/v1/sites/\(site.provider)/\(site.id)/certificate",
+                                                                     method: "POST", body: body))
         try check(response, data: data, expected: 204)
     }
 }

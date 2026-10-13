@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld('sera', Object.freeze({
   saveDNS: (settings) => ipcRenderer.invoke('dns:save', settings),
   dnsCall: (action, params = {}) => ipcRenderer.invoke('dns:call', action, params),
   certificates: () => ipcRenderer.invoke('certificates:list'),
+  deployCertificate: (certificateID, provider, siteID) => ipcRenderer.invoke('certificates:deploy', certificateID, provider, siteID),
   issueCertificate: (input) => ipcRenderer.invoke('certificates:issue', input),
   chooseUpload: (kind) => ipcRenderer.invoke('files:choose-upload', kind),
   registerDropped: (files) => ipcRenderer.invoke('files:register-drop', Array.from(files, (file) => webUtils.getPathForFile(file)).filter(Boolean)),

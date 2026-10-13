@@ -44,7 +44,27 @@ func (pm *projectManager) pythonServerReady(item project) bool {
 	}
 	path := filepath.Join(pm.venvDir(item.ID), "bin", item.PythonServer)
 	info, err := os.Stat(path)
-	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0111 != 0
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
+		return false
+	}
+	if item.PythonServer == "gunicorn" && item.PythonWorker == "uvicorn" {
+		worker := filepath.Join(pm.venvDir(item.ID), "bin", "uvicorn")
+		info, err = os.Stat(worker)
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
+			return false
+		}
+		packages, err := filepath.Glob(filepath.Join(pm.venvDir(item.ID), "lib", "python*", "site-packages", "uvicorn_worker"))
+		if err != nil {
+			return false
+		}
+		for _, path := range packages {
+			if info, err := os.Stat(path); err == nil && info.IsDir() {
+				return true
+			}
+		}
+		return false
+	}
+	return true
 }
 
 func (pm *projectManager) runAsProject(ctx context.Context, item project, binary string, args []string, log *os.File) error {
@@ -125,8 +145,11 @@ func (pm *projectManager) manageVenv(ctx context.Context, id, action string) err
 		if !pm.venvReady(item) {
 			return errors.New("请先创建与所选 Python 版本匹配的虚拟环境")
 		}
-		err := pm.runAsProject(work, item, filepath.Join(pm.venvDir(id), "bin", "python3"),
-			[]string{"-m", "pip", "install", "--no-input", item.PythonServer}, log)
+		packages := []string{"-m", "pip", "install", "--no-input", item.PythonServer}
+		if item.PythonServer == "gunicorn" && item.PythonWorker == "uvicorn" {
+			packages = append(packages, "uvicorn", "uvicorn-worker")
+		}
+		err := pm.runAsProject(work, item, filepath.Join(pm.venvDir(id), "bin", "python3"), packages, log)
 		if err != nil {
 			return fmt.Errorf("安装 Python 启动器失败：%w；请查看项目日志", err)
 		}

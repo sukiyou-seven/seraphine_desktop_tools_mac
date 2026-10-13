@@ -27,6 +27,8 @@ function route(action, p = {}) {
   case 'services.action': return ['POST', '/v1/services', { name: p.name,
     action: choice(p.action, ['start', 'stop', 'restart', 'enable', 'disable']) }];
   case 'software.list': return ['GET', '/v1/software'];
+  case 'software.jobs': return ['GET', '/v1/software/jobs'];
+  case 'software.cancel': return ['POST', `/v1/software/${segment(p.id)}/cancel`, {}];
   case 'software.install': return ['POST', `/v1/software/${segment(p.id)}/install`, p.version ? { version: p.version } : {}];
   case 'software.uninstall': return ['POST', `/v1/software/${segment(p.id)}/uninstall`,
     { mode: choice(p.mode, ['backup', 'purge']) }];
@@ -56,7 +58,7 @@ function route(action, p = {}) {
   case 'projects.action': return ['POST', `/v1/projects/${segment(p.id)}/action`,
     { action: choice(p.action, ['start', 'stop', 'restart', 'enable', 'disable']) }];
   case 'projects.venv': return ['POST', `/v1/projects/${segment(p.id)}/venv`,
-    { action: choice(p.action, ['create', 'install_requirements']) }];
+    { action: choice(p.action, ['create', 'install_requirements', 'install_server']) }];
   case 'projects.log': return ['GET', `/v1/projects/${segment(p.id)}/log`];
   case 'databases.list': return ['GET', '/v1/databases'];
   case 'databases.catalog': return ['GET', `/v1/databases/${segment(p.engine)}/catalog`];
@@ -65,14 +67,19 @@ function route(action, p = {}) {
   case 'databases.user.create': return ['POST', `/v1/databases/${segment(p.engine)}/users`, { name: p.name }];
   case 'databases.user.delete': return ['DELETE', `/v1/databases/${segment(p.engine)}/users/${segment(p.name)}`];
   case 'databases.user.reset': return ['POST', `/v1/databases/${segment(p.engine)}/users/${segment(p.name)}:reset`];
+  case 'databases.user.password': return ['GET', `/v1/databases/${segment(p.engine)}/users/${segment(p.name)}:password`];
   case 'databases.grant': return [p.revoke ? 'DELETE' : 'POST', `/v1/databases/${segment(p.engine)}/grants`,
     { database: p.database, user: p.user, level: choice(p.level, ['read', 'readwrite']) }];
   case 'databases.mysql.bootstrap': return ['POST', '/v1/databases/mysql/bootstrap'];
   case 'databases.mysql.credential': return ['POST', '/v1/databases/mysql/credential', { password: p.password }];
+  case 'databases.mysql.change': return ['POST', '/v1/databases/mysql/credential/change', { current_password: p.current, new_password: p.next }];
+  case 'databases.mysql.saved': return ['GET', '/v1/databases/mysql/credential'];
   case 'databases.postgresql.localAccess': return ['POST', '/v1/databases/postgresql/local-access'];
   case 'databases.acl': return ['GET', `/v1/databases/${segment(p.engine)}/acl`];
   case 'databases.acl.enable': return ['POST', `/v1/databases/${segment(p.engine)}/acl/enable`];
   case 'databases.acl.credential': return ['POST', `/v1/databases/${segment(p.engine)}/acl/credential`, { password: p.password }];
+  case 'databases.acl.saved': return ['GET', `/v1/databases/${segment(p.engine)}/acl/credential`];
+  case 'databases.acl.password': return ['GET', `/v1/databases/${segment(p.engine)}/acl/users/${segment(p.name)}:password`];
   case 'databases.acl.create': return ['POST', `/v1/databases/${segment(p.engine)}/acl/users`,
     { name: p.name, level: choice(p.level, ['read', 'readwrite']) }];
   case 'databases.acl.update': return ['PUT', `/v1/databases/${segment(p.engine)}/acl/users/${segment(p.name)}`,

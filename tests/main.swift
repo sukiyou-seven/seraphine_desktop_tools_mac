@@ -611,6 +611,8 @@ check("附加域名解析", parsedCerts.last?.sanDomains == "*.api.example.com")
 check("证书路径拼接正确",
       parsedCerts.first?.fullchainPath == "/Users/x/.acme.sh/example.com_ecc/fullchain.cer",
       parsedCerts.first?.fullchainPath ?? "")
+check("RSA 证书目录不使用 _ecc 后缀",
+      parsedCerts.last?.fullchainPath == "/Users/x/.acme.sh/api.example.com/fullchain.cer")
 check("空输出不崩", ACMEService.parseList("", home: "/tmp").isEmpty)
 
 

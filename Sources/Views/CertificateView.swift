@@ -357,6 +357,7 @@ private struct ACMManualCard: View {
 
 private struct ACMECertificatesCard: View {
     @EnvironmentObject var model: AppModel
+    @State private var deployingCertificate: ACMECertificate?
 
     var body: some View {
         Card(title: "已签发的证书") {
@@ -375,7 +376,7 @@ private struct ACMECertificatesCard: View {
                         Text("类型").font(.caption).frame(width: 80, alignment: .leading)
                         Text("下次续期").font(.caption).frame(width: 200, alignment: .leading)
                         Text("证书路径").font(.caption).frame(maxWidth: .infinity, alignment: .leading)
-                        Spacer().frame(width: 70)
+                        Spacer().frame(width: 150)
                     }
                     .padding(.vertical, 4)
                     Divider()
@@ -405,7 +406,9 @@ private struct ACMECertificatesCard: View {
                             Button("续期") { model.renewCertificate(certificate.domain) }
                                 .buttonStyle(.borderless)
                                 .font(.caption)
-                                .frame(width: 70)
+                            Button("部署到网站") { deployingCertificate = certificate }
+                                .buttonStyle(.borderless)
+                                .font(.caption)
                         }
                         .padding(.vertical, 5)
                         Divider()
@@ -413,5 +416,74 @@ private struct ACMECertificatesCard: View {
                 }
             }
         }
+        .sheet(item: $deployingCertificate) { certificate in
+            CertificateDeploymentSheet(certificate: certificate)
+        }
+    }
+}
+
+private struct CertificateDeploymentSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let certificate: ACMECertificate
+    @State private var connections = ServerConnectionStore.load().filter { !$0.endpoint.isEmpty }
+    @State private var connectionID = ServerConnectionStore.selectedID
+    @State private var sites: [RemoteSite] = []
+    @State private var siteID = ""
+    @State private var working = false
+    @State private var message = ""
+
+    private var connection: ServerConnection? { connections.first { $0.id == connectionID } }
+    private var selectedSite: RemoteSite? { sites.first { $0.uniqueID == siteID } }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("部署证书到网站").font(.title3.weight(.semibold))
+            Text(verbatim: certificate.domain).font(.system(.body, design: .monospaced))
+            Picker("服务器", selection: $connectionID) {
+                ForEach(connections) { entry in Text(entry.label).tag(entry.id) }
+            }
+            Picker("网站", selection: $siteID) {
+                ForEach(sites) { site in Text("\(site.domains.joined(separator: ", ")) · \(site.provider)").tag(site.uniqueID) }
+            }
+            Text("部署会验证证书覆盖网站所有域名，并启用该网站的 HTTPS 443 端口。续期后需要再次部署新证书。")
+                .font(.caption).foregroundStyle(.secondary)
+            if !message.isEmpty { Text(verbatim: message).foregroundStyle(.orange) }
+            HStack {
+                Spacer()
+                Button("取消") { dismiss() }
+                Button("部署") { Task { await deploy() } }.disabled(working || selectedSite == nil)
+            }
+        }
+        .padding(20)
+        .frame(width: 560)
+        .task { await loadSites() }
+        .onChange(of: connectionID) { _ in Task { await loadSites() } }
+    }
+
+    @MainActor private func loadSites() async {
+        guard let connection else { sites = []; return }
+        let token = ServerConnectionStore.token(for: connectionID)
+        guard !token.isEmpty else { message = "此服务器没有连接令牌"; sites = []; return }
+        working = true
+        defer { working = false }
+        do {
+            sites = try await ServerSiteAPI.list(connection: connection, token: token).items.filter(\.enabled)
+            siteID = sites.first?.uniqueID ?? ""
+            message = sites.isEmpty ? "此服务器没有已启用的网站" : ""
+        } catch { message = error.localizedDescription; sites = [] }
+    }
+
+    @MainActor private func deploy() async {
+        guard let connection, let site = selectedSite else { return }
+        working = true
+        defer { working = false }
+        do {
+            let fullchain = try String(contentsOfFile: certificate.fullchainPath, encoding: .utf8)
+            let key = try String(contentsOfFile: certificate.keyPath, encoding: .utf8)
+            try await ServerSiteAPI.deployCertificate(connection: connection,
+                                                      token: ServerConnectionStore.token(for: connectionID),
+                                                      site: site, certificate: fullchain, privateKey: key)
+            dismiss()
+        } catch { message = error.localizedDescription }
     }
 }

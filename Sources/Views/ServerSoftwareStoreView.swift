@@ -17,6 +17,7 @@ struct ServerSoftwareStoreView: View {
     let token: String
 
     @State private var items: [RemoteSoftware] = []
+    @State private var jobs: [RemoteSoftwareJob] = []
     @State private var pendingAction: (id: String, action: String)?
     @State private var logSheet: SoftwareLogSheet?
     @State private var working = false
@@ -43,7 +44,7 @@ struct ServerSoftwareStoreView: View {
             switch filter {
             case .all: matchesFilter = true
             case .available: matchesFilter = item.canInstall && item.supported &&
-                (item.state == "not_installed" || item.state == "failed")
+                (item.state == "not_installed" || item.state == "failed" || item.state == "cancelled")
             case .installed: matchesFilter = item.isInstalled
             }
             return matchesSearch && matchesCategory && matchesFilter
@@ -74,6 +75,24 @@ struct ServerSoftwareStoreView: View {
                     .font(.callout)
                     .foregroundStyle(hasError ? Color.orange : Color.secondary)
                     .lineLimit(3)
+            }
+
+            if !jobs.isEmpty {
+                DisclosureGroup("任务列表 · \(jobs.filter { ["queued", "installing", "uninstalling", "cancelling"].contains($0.state) }.count) 进行中") {
+                    ForEach(jobs) { job in
+                        HStack {
+                            Text(items.first(where: { $0.id == job.id })?.name ?? job.id).fontWeight(.medium)
+                            Text(job.operation == "install" ? "安装" : "卸载")
+                            Text(job.state == "queued" ? "排队中" : job.state == "installing" ? "安装中" : job.state == "uninstalling" ? "卸载中" : job.state == "cancelling" ? "停止中" : job.state == "cancelled" ? "已停止" : job.state == "installed" || job.state == "not_installed" ? "已完成" : "失败")
+                                .foregroundStyle(.secondary)
+                            Text(verbatim: job.message).font(.caption).lineLimit(1)
+                            Spacer()
+                            if ["queued", "installing", "uninstalling"].contains(job.state) {
+                                Button("停止任务") { Task { await cancel(job.id) } }.disabled(working)
+                            }
+                        }
+                    }
+                }
             }
 
             HStack(spacing: 12) {
@@ -123,7 +142,7 @@ struct ServerSoftwareStoreView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onAppear { Task { await refresh() } }
         .onReceive(Timer.publish(every: 3, on: .main, in: .common).autoconnect()) { _ in
-            if items.contains(where: { $0.state == "installing" || $0.state == "uninstalling" }) && !working {
+            if jobs.contains(where: { ["queued", "installing", "uninstalling", "cancelling"].contains($0.state) }) && !working {
                 Task { await refresh() }
             }
         }
@@ -249,9 +268,12 @@ struct ServerSoftwareStoreView: View {
             }
             .frame(width: 85, alignment: .trailing)
 
-            if item.canInstall && (item.state == "not_installed" || item.state == "failed") {
+            if item.canInstall && (item.state == "not_installed" || item.state == "failed" || item.state == "cancelled") {
                 Button("安装") { pendingAction = (item.id, "install") }
                     .disabled(working || !item.supported)
+            }
+            if ["queued", "installing", "uninstalling"].contains(item.state) {
+                Button("停止") { Task { await cancel(item.id) } }.disabled(working)
             }
             if item.isInstalled && item.hasService {
                 Menu("运行操作") {
@@ -287,8 +309,19 @@ struct ServerSoftwareStoreView: View {
         defer { working = false }
         do {
             items = try await ServerSoftwareAPI.list(connection: connection, token: token)
+            jobs = try await ServerSoftwareAPI.jobs(connection: connection, token: token)
             message = ""
             hasError = false
+        } catch {
+            message = error.localizedDescription
+            hasError = true
+        }
+    }
+
+    @MainActor private func cancel(_ id: String) async {
+        do {
+            try await ServerSoftwareAPI.cancel(connection: connection, token: token, id: id)
+            await refresh()
         } catch {
             message = error.localizedDescription
             hasError = true

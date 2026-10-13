@@ -27,6 +27,7 @@ struct ServerProjectsView: View {
     @State private var runtimeVersionInput = ""
     @State private var useVenvInput = true
     @State private var pythonServerInput = "gunicorn"
+    @State private var pythonWorkerInput = "sync"
     @State private var pythonCallableInput = "app"
     @State private var pythonWorkersInput = "2"
     @State private var pythonThreadsInput = "1"
@@ -152,9 +153,10 @@ struct ServerProjectsView: View {
             InfoRow(label: "目录", value: project.directory)
             InfoRow(label: "入口", value: project.entry)
             if project.runtime == "python" {
-                InfoRow(label: "启动方式", value: (project.pythonServer ?? "direct") == "direct" ? "直接运行" : (project.pythonServer == "uwsgi" ? "uWSGI" : "Gunicorn"))
+                InfoRow(label: "启动方式", value: (project.pythonServer ?? "direct") == "direct" ? "直接运行" : (project.pythonServer == "uwsgi" ? "uWSGI" : (project.pythonServer == "uvicorn" ? "Uvicorn" : "Gunicorn")))
                 if project.pythonServer != nil && project.pythonServer != "direct" {
-                    InfoRow(label: "WSGI", value: "\(project.pythonCallable ?? "app") · \(project.pythonWorkers ?? 2) 进程 · \(project.pythonThreads ?? 1) 线程/进程")
+                    InfoRow(label: "应用", value: "\(project.pythonCallable ?? "app") · \(project.pythonWorkers ?? 2) 进程")
+                    if project.pythonServer == "gunicorn" { InfoRow(label: "Worker class", value: project.pythonWorker ?? ((project.pythonThreads ?? 1) > 1 ? "gthread" : "sync")) }
                 }
             }
             if project.usesVenv {
@@ -170,7 +172,7 @@ struct ServerProjectsView: View {
                             Button("安装 requirements.txt") { venv(project, "install_requirements") }
                                 .disabled(working || project.running)
                             if project.pythonServer != "direct" && !project.hasReadyServer {
-                                Button("安装 \(project.pythonServer == "uwsgi" ? "uWSGI" : "Gunicorn")") { venv(project, "install_server") }
+                                Button("安装 \(project.pythonServer == "uwsgi" ? "uWSGI" : (project.pythonServer == "uvicorn" ? "Uvicorn" : "Gunicorn"))") { venv(project, "install_server") }
                                     .disabled(working || project.running)
                             }
                         }
@@ -231,6 +233,7 @@ struct ServerProjectsView: View {
                     Toggle("使用项目虚拟环境", isOn: $useVenvInput)
                     Picker("启动方式", selection: $pythonServerInput) {
                         Text("Gunicorn（WSGI）").tag("gunicorn")
+                        Text("Uvicorn（ASGI）").tag("uvicorn")
                         Text("uWSGI（WSGI）").tag("uwsgi")
                         Text("直接运行脚本").tag("direct")
                     }
@@ -238,12 +241,21 @@ struct ServerProjectsView: View {
                         if newValue != "direct" { useVenvInput = true }
                     }
                     if pythonServerInput != "direct" {
-                        TextField("WSGI callable（例如 app 或 application）", text: $pythonCallableInput)
+                        if pythonServerInput == "gunicorn" {
+                            Picker("Worker class", selection: $pythonWorkerInput) {
+                                Text("sync（WSGI）").tag("sync")
+                                Text("gthread（WSGI）").tag("gthread")
+                                Text("uvicorn_worker.UvicornWorker（ASGI）").tag("uvicorn")
+                            }
+                        }
+                        TextField("应用对象（例如 app 或 application）", text: $pythonCallableInput)
                         HStack {
                             TextField("进程数", text: $pythonWorkersInput)
-                            TextField("每进程线程数", text: $pythonThreadsInput)
+                            if pythonServerInput == "uwsgi" || (pythonServerInput == "gunicorn" && pythonWorkerInput == "gthread") {
+                                TextField("每进程线程数", text: $pythonThreadsInput)
+                            }
                         }
-                        Text("入口填写定义 WSGI callable 的 .py 文件；服务仅监听 127.0.0.1。")
+                        Text("入口填写定义应用对象的 .py 文件；服务仅监听 127.0.0.1。")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -340,6 +352,7 @@ struct ServerProjectsView: View {
         runtimeVersionInput = installedRuntimes.first?.legacyInstalled == true ? "" : (installedRuntimes.first?.versions?.first ?? "")
         useVenvInput = runtimeInput == "python"
         pythonServerInput = "gunicorn"
+        pythonWorkerInput = "sync"
         pythonCallableInput = "app"
         pythonWorkersInput = "2"
         pythonThreadsInput = "1"
@@ -359,6 +372,7 @@ struct ServerProjectsView: View {
         runtimeVersionInput = project.runtimeVersion ?? ""
         useVenvInput = project.usesVenv
         pythonServerInput = project.pythonServer ?? "direct"
+        pythonWorkerInput = project.pythonWorker ?? ((project.pythonThreads ?? 1) > 1 ? "gthread" : "sync")
         pythonCallableInput = project.pythonCallable ?? "app"
         pythonWorkersInput = String(project.pythonWorkers ?? 2)
         pythonThreadsInput = String(project.pythonThreads ?? 1)
@@ -390,15 +404,15 @@ struct ServerProjectsView: View {
             hasError = true
             return
         }
-        let isWSGI = runtimeInput == "python" && pythonServerInput != "direct"
-        guard !isWSGI || (number > 0 && useVenvInput) else {
-            message = "Gunicorn/uWSGI 需要虚拟环境和监听端口"
+        let hasServer = runtimeInput == "python" && pythonServerInput != "direct"
+        guard !hasServer || (number > 0 && useVenvInput) else {
+            message = "Python 启动器需要虚拟环境和监听端口"
             hasError = true
             return
         }
         let workers = Int(pythonWorkersInput) ?? 0
         let threads = Int(pythonThreadsInput) ?? 0
-        guard !isWSGI || ((1...32).contains(workers) && (1...64).contains(threads)) else {
+        guard !hasServer || ((1...32).contains(workers) && (1...64).contains(threads)) else {
             message = "进程数须为 1–32，线程数须为 1–64"
             hasError = true
             return
@@ -409,9 +423,10 @@ struct ServerProjectsView: View {
                                            runtimeVersion: runtimeVersionInput,
                                            useVenv: runtimeInput == "python" && useVenvInput,
                                            pythonServer: runtimeInput == "python" ? pythonServerInput : "",
-                                           pythonCallable: isWSGI ? pythonCallableInput.trimmingCharacters(in: .whitespacesAndNewlines) : "",
-                                           pythonWorkers: isWSGI ? workers : 0,
-                                           pythonThreads: isWSGI ? threads : 0,
+                                           pythonWorker: runtimeInput == "python" && pythonServerInput == "gunicorn" ? pythonWorkerInput : "",
+                                           pythonCallable: hasServer ? pythonCallableInput.trimmingCharacters(in: .whitespacesAndNewlines) : "",
+                                           pythonWorkers: hasServer ? workers : 0,
+                                           pythonThreads: hasServer ? threads : 0,
                                            entry: entryInput.trimmingCharacters(in: .whitespacesAndNewlines),
                                            port: number,
                                            directory: directoryInput.trimmingCharacters(in: .whitespacesAndNewlines))

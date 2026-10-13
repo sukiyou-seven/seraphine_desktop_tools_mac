@@ -53,6 +53,50 @@ func databaseTestAPI(t *testing.T) (*api, *[]string) {
 	return &api{token: "secret", software: software, databases: dm}, &queries
 }
 
+func TestDatabasePasswordsPersistAndMatchAPI(t *testing.T) {
+	a, _ := databaseTestAPI(t)
+	created := databaseRequest(a, "POST", "/v1/databases/mysql/users", `{"name":"webuser"}`, true)
+	if created.Code != 201 {
+		t.Fatalf("create: %d %s", created.Code, created.Body.String())
+	}
+	var first databasePasswordResponse
+	if err := json.Unmarshal(created.Body.Bytes(), &first); err != nil {
+		t.Fatal(err)
+	}
+	revealed := databaseRequest(a, "GET", "/v1/databases/mysql/users/webuser:password", "", true)
+	if revealed.Code != 200 || !strings.Contains(revealed.Body.String(), first.Password) {
+		t.Fatalf("reveal: %d %s", revealed.Code, revealed.Body.String())
+	}
+	path, _ := a.databases.userSecretPath("mysql", "webuser")
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("secret mode: %v %v", info, err)
+	}
+	reset := databaseRequest(a, "POST", "/v1/databases/mysql/users/webuser:reset", "", true)
+	var second databasePasswordResponse
+	if err := json.Unmarshal(reset.Body.Bytes(), &second); err != nil {
+		t.Fatal(err)
+	}
+	if second.Password == first.Password {
+		t.Fatal("reset reused password")
+	}
+	if got := databaseRequest(a, "GET", "/v1/databases/mysql/users/webuser:password", "", true); !strings.Contains(got.Body.String(), second.Password) {
+		t.Fatalf("reset not persisted: %s", got.Body.String())
+	}
+	changed := databaseRequest(a, "POST", "/v1/databases/mysql/credential/change", `{"current_password":"initial-secret","new_password":"chosen-password-123"}`, true)
+	if changed.Code != 204 {
+		t.Fatalf("change: %d %s", changed.Code, changed.Body.String())
+	}
+	if got := databaseRequest(a, "GET", "/v1/databases/mysql/credential", "", true); !strings.Contains(got.Body.String(), "chosen-password-123") {
+		t.Fatalf("admin reveal: %s", got.Body.String())
+	}
+	if got := databaseRequest(a, "DELETE", "/v1/databases/mysql/users/webuser", "", true); got.Code != 204 {
+		t.Fatalf("delete: %d", got.Code)
+	}
+	if got := databaseRequest(a, "GET", "/v1/databases/mysql/users/webuser:password", "", true); got.Code != 404 {
+		t.Fatalf("deleted secret revealed: %d", got.Code)
+	}
+}
+
 func TestPostgresLocalAccessMigrationAndRollback(t *testing.T) {
 	a, _ := databaseTestAPI(t)
 	dir := filepath.Join(a.databases.root, "server/postgresql/data")
