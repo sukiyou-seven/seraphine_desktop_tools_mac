@@ -246,15 +246,17 @@ final class MySQLService: @unchecked Sendable {
         Paths.ensureDirectory(forFile: logPath)
         try? FileManager.default.createDirectory(atPath: Paths.runDir.path, withIntermediateDirectories: true)
 
-        var args = [server, "--daemonize",
+        var args = [server]
+        // MySQL only recognizes --defaults-file when it is the first option.
+        if FileTools.exists(confPath) { args.append("--defaults-file=\(confPath)") }
+        args += ["--daemonize",
                     "--datadir=\(dataDir)",
                     "--port=\(port)",
                     "--bind-address=\(host)",
                     "--socket=\(socketPath)",
                     "--pid-file=\(pidFile)",
                     "--log-error=\(logPath)"]
-        // 有配置文件就交给它（命令行的这几项仍会覆盖，保证路径可控）
-        if FileTools.exists(confPath) { args.append("--defaults-file=\(confPath)") }
+        // 命令行中的路径和端口仍覆盖配置文件，保证使用用户选定的实例。
 
         Diag.log("启动 MySQL：\(server) --daemonize --datadir=\(dataDir)")
         let result = Shell.run(args, timeout: 120)
