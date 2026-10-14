@@ -5,13 +5,14 @@ struct ServerSitesView: View {
     let token: String
     let openFiles: (String) -> Void
     let openStore: () -> Void
+    let openDomains: () -> Void
 
     @State private var listing = RemoteSiteListing(items: [], providers: [], phpVersions: [])
     @State private var working = false
     @State private var message = ""
     @State private var hasError = false
     @State private var editing: RemoteSite?
-    @State private var showingEditor = false
+    @State private var sheet: SiteSheet?
     @State private var pendingDelete: RemoteSite?
     @State private var provider = "nginx"
     @State private var domainInput = ""
@@ -19,6 +20,19 @@ struct ServerSitesView: View {
     @State private var upstream = ""
     @State private var phpVersion = ""
     @State private var enabled = true
+
+    /// 同一个视图上挂多个 sheet 会互相顶掉，编辑与部署证书共用一个。
+    private enum SiteSheet: Identifiable {
+        case editor
+        case certificate(RemoteSite)
+
+        var id: String {
+            switch self {
+            case .editor: return "editor"
+            case .certificate(let site): return "certificate:" + site.uniqueID
+            }
+        }
+    }
 
     private var installedProviders: [RemoteSiteProvider] {
         listing.providers.filter(\.installed)
@@ -34,7 +48,7 @@ struct ServerSitesView: View {
                     .disabled(working || installedProviders.isEmpty)
                 if working { ProgressView().controlSize(.small) }
             }
-            Text("管理 Nginx、Apache 和 OpenResty 的静态、PHP 与反向代理网站。网站文件在 /www/seraphim/web，日志在 /www/seraphim/logs。")
+            Text("管理 Nginx、Apache 和 OpenResty 的静态、PHP 与反向代理网站。网站文件在 /www/seraphim/web，日志在 /www/seraphim/logs。证书在「域名管理」申请后可就地部署到网站，启用 443 的 HTTPS。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             if !message.isEmpty {
@@ -84,7 +98,20 @@ struct ServerSitesView: View {
         .onReceive(NotificationCenter.default.publisher(for: .serverManagementRefresh)) { _ in
             Task { await refresh() }
         }
-        .sheet(isPresented: $showingEditor) { editor }
+        .sheet(item: $sheet) { entry in
+            switch entry {
+            case .editor:
+                editor
+            case .certificate(let site):
+                SiteCertificateSheet(site: site, connection: connection, token: token,
+                                     openDomains: openDomains,
+                                     onDeployed: {
+                                         message = "证书已部署，\(site.primaryDomain) 已启用 HTTPS"
+                                         hasError = false
+                                         Task { await refresh() }
+                                     })
+            }
+        }
         .confirmationDialog("删除网站 \(pendingDelete?.primaryDomain ?? "")？",
                             isPresented: Binding(get: { pendingDelete != nil },
                                                  set: { if !$0 { pendingDelete = nil } })) {
@@ -115,16 +142,24 @@ struct ServerSitesView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             VStack(alignment: .trailing, spacing: 3) {
-                Text("\(webServer?.name ?? site.provider) · :\(webServer?.port ?? 80)")
+                Text("\(webServer?.name ?? site.providerLabel) · :\(webServer?.port ?? 80)")
                     .font(.callout)
                 Text(site.enabled ? "已启用" : "已停用")
                     .font(.caption)
                     .foregroundStyle(site.enabled ? Color.green : Color.secondary)
+                Text(tlsStatus(site))
+                    .font(.caption)
+                    .foregroundStyle(site.tlsEnabled ? Color.green : Color.orange)
             }
-            .frame(width: 155, alignment: .trailing)
+            .frame(width: 175, alignment: .trailing)
             if site.kind != "proxy" {
                 Button("文件") { openFiles(site.root) }
             }
+            Button(site.tlsEnabled ? "更换证书" : "部署证书") { sheet = .certificate(site) }
+                .disabled(working || !site.enabled || webServer?.installed != true)
+                .help(site.enabled
+                      ? "从本机已签发的证书里挑一张部署到该网站，启用 443 的 HTTPS"
+                      : "网站已停用，先启用再部署证书")
             Button("编辑") { beginEdit(site) }
                 .disabled(working || webServer?.installed != true)
             Button(site.enabled ? "停用" : "启用") { toggle(site) }
@@ -132,6 +167,13 @@ struct ServerSitesView: View {
             Button("删除…", role: .destructive) { pendingDelete = site }.disabled(working)
         }
         .padding(.vertical, 12)
+    }
+
+    /// 行内显示的 HTTPS 状态。证书文件读得到时带上到期日期，续期前一眼能看出来。
+    private func tlsStatus(_ site: RemoteSite) -> String {
+        guard site.tlsEnabled else { return "HTTPS 未部署" }
+        guard let expiry = site.tlsExpiryDate else { return "HTTPS 443" }
+        return "HTTPS 至 \(expiry)"
     }
 
     private var editor: some View {
@@ -183,7 +225,7 @@ struct ServerSitesView: View {
             }
             HStack {
                 Spacer()
-                Button("取消") { showingEditor = false }.disabled(working)
+                Button("取消") { sheet = nil }.disabled(working)
                 Button("保存网站") { save() }.disabled(working)
                     .keyboardShortcut(.defaultAction)
             }
@@ -206,7 +248,7 @@ struct ServerSitesView: View {
         upstream = ""
         phpVersion = listing.phpVersions?.first ?? ""
         enabled = true
-        showingEditor = true
+        sheet = .editor
     }
 
     private func beginEdit(_ site: RemoteSite) {
@@ -219,7 +261,7 @@ struct ServerSitesView: View {
         upstream = site.upstream
         phpVersion = site.phpVersion ?? listing.phpVersions?.first ?? ""
         enabled = site.enabled
-        showingEditor = true
+        sheet = .editor
     }
 
     @MainActor private func refresh() async {
@@ -264,7 +306,7 @@ struct ServerSitesView: View {
                                                        payload: payload)
                 }
                 working = false
-                showingEditor = false
+                sheet = nil
                 await refresh()
                 message = "网站配置已保存"
                 hasError = false

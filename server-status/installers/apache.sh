@@ -9,10 +9,11 @@ sera_stage '编译 Apache HTTP Server'
     --enable-proxy=shared --enable-proxy-http=shared --enable-proxy-fcgi=shared \
     --with-mpm=event --with-ssl
 make -j1
-sera_create_user seraphim-apache
+sera_create_user sera
 sera_create_prefix
 make install
-sed -i 's/^Listen 80$/Listen 8082/; s/^User daemon$/User seraphim-apache/; s/^Group daemon$/Group seraphim-apache/' "$sera_prefix/conf/httpd.conf"
+# worker 以 sera 运行（面板唯一的业务账户），才读得到归 sera 所有的站点目录。
+sed -i 's/^Listen 80$/Listen 8082/; s/^User daemon$/User sera/; s/^Group daemon$/Group sera/' "$sera_prefix/conf/httpd.conf"
 cat >> "$sera_prefix/conf/httpd.conf" <<'EOF'
 ServerName localhost
 DocumentRoot "/www/seraphim/web"

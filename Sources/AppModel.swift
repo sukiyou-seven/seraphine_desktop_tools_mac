@@ -1274,13 +1274,14 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func renewCertificate(_ domain: String) {
+    /// - Parameter ecc: ECC 证书要带 `--ecc`，否则 acme.sh 会去续同名的 RSA 证书。
+    func renewCertificate(_ domain: String, ecc: Bool = false) {
         syncACMESettings()
         let service = acme
         let accessKey = settings.dns.aliKey
         let accessSecret = settings.dns.aliSecret
         perform("正在续期 \(domain)…") {
-            service.renew(domain: domain, accessKey: accessKey, accessSecret: accessSecret)
+            service.renew(domain: domain, ecc: ecc, accessKey: accessKey, accessSecret: accessSecret)
         } after: {
             self.loadCertificates()
         }

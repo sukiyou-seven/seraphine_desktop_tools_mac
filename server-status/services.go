@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os/exec"
@@ -146,35 +147,16 @@ func (a *api) servicesHandler(w http.ResponseWriter, r *http.Request) {
 		}{services})
 	case http.MethodPost:
 		var command serviceCommand
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&command); err != nil ||
-			!validServiceName(command.Name) || protectedService(command.Name) ||
-			!validServiceAction(command.Action) {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&command); err != nil {
 			http.Error(w, "invalid or protected service action", http.StatusBadRequest)
 			return
 		}
-		visible, err := a.services.list(r.Context())
-		if err != nil {
-			http.Error(w, "service list unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		if len(visible) != 1 || visible[0].Name != command.Name {
-			http.Error(w, "service is not managed", http.StatusBadRequest)
-			return
-		}
-		a.services.mu.Lock()
-		defer a.services.mu.Unlock()
-		ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
-		defer cancel()
-		output, err := a.services.run(ctx, command.Action, command.Name)
-		if err != nil {
-			message := strings.TrimSpace(string(output))
-			if message == "" {
-				message = "systemctl action failed"
+		if err := a.applyServiceAction(r.Context(), command.Name, command.Action); err != nil {
+			code := http.StatusConflict
+			if errors.Is(err, errUnmanagedService) {
+				code = http.StatusBadRequest
 			}
-			if len(message) > 1000 {
-				message = message[:1000]
-			}
-			http.Error(w, message, http.StatusConflict)
+			http.Error(w, err.Error(), code)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -182,6 +164,48 @@ func (a *api) servicesHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Allow", "GET, POST")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// errUnmanagedService 表示这个服务不在面板的管理范围内。客户端与 MCP 都靠它
+// 区分「参数不对」和「systemctl 执行失败」。
+var errUnmanagedService = errors.New("service is not managed")
+
+// applyServiceAction 执行一次服务操作。HTTP 接口和 MCP 工具都走这里：
+// 校验、可见范围、超时、错误裁剪只有一份实现，两边的行为才不会分叉。
+func (a *api) applyServiceAction(ctx context.Context, name, action string) error {
+	if !validServiceName(name) || protectedService(name) || !validServiceAction(action) {
+		return fmt.Errorf("invalid or protected service action: %w", errUnmanagedService)
+	}
+	visible, err := a.services.list(ctx)
+	if err != nil {
+		return errors.New("service list unavailable")
+	}
+	managed := false
+	for _, entry := range visible {
+		if entry.Name == name {
+			managed = true
+			break
+		}
+	}
+	if !managed {
+		return fmt.Errorf("面板不管这个服务：%s: %w", name, errUnmanagedService)
+	}
+	a.services.mu.Lock()
+	defer a.services.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	output, err := a.services.run(ctx, action, name)
+	if err != nil {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			message = "systemctl action failed"
+		}
+		if len(message) > 1000 {
+			message = message[:1000]
+		}
+		return errors.New(message)
+	}
+	return nil
 }
 
 func validServiceAction(action string) bool {

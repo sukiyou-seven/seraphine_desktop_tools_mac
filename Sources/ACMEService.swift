@@ -44,12 +44,62 @@ struct ACMECertificate: Identifiable {
     var renewAt: String
     var home: String = ""
 
-    var id: String { domain }
+    /// 同一个域名可能同时有 RSA 和 ECC 两份证书（目录不同），id 得带上算法才不会撞。
+    var id: String { "\(domain)|\(keyLength)" }
 
-    private var certificateDirectory: String { keyLength.hasPrefix("ec-") ? "\(home)/\(domain)_ecc" : "\(home)/\(domain)" }
+    /// acme.sh 的判据：密钥长度不是 1024/2048/3072/4096/8192 就算 ECC。
+    var isECC: Bool { ACMECertificate.isECCKeyLength(keyLength) }
+
+    var keyLabel: String { "\(isECC ? "ECC" : "RSA") \(keyLength)" }
+
+    static func isECCKeyLength(_ value: String) -> Bool {
+        let text = value.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !text.isEmpty else { return false }
+        return !["1024", "2048", "3072", "4096", "8192"].contains(text)
+    }
+
+    /// acme.sh 按密钥算法分目录：ECDSA 放 `<域名>_ecc`，RSA 放 `<域名>`。
+    /// 一般按算法判定就够；但算法字段来自 `--list` 的文本输出、目录也可能被人手工搬过，
+    /// 所以**磁盘上只存在哪一个就以哪一个为准**——acme.sh 自己也是这个回退顺序。
+    private var certificateDirectory: String {
+        let ecc = "\(home)/\(domain)_ecc"
+        let plain = "\(home)/\(domain)"
+        let hasECC = FileManager.default.fileExists(atPath: ecc)
+        let hasPlain = FileManager.default.fileExists(atPath: plain)
+        if hasECC != hasPlain { return hasECC ? ecc : plain }
+        return isECC ? ecc : plain
+    }
+
     var keyPath: String { "\(certificateDirectory)/\(domain).key" }
     var fullchainPath: String { "\(certificateDirectory)/fullchain.cer" }
     var certPath: String { "\(certificateDirectory)/\(domain).cer" }
+
+    /// 读出部署要用的两个文件。失败时把**具体路径**报出来，
+    /// 因为这里最容易踩的坑就是 ECC 证书的 `_ecc` 目录没拼上。
+    func readDeploymentFiles() throws -> (certificate: String, privateKey: String) {
+        func read(_ path: String) throws -> String {
+            do {
+                return try String(contentsOfFile: path, encoding: .utf8)
+            } catch {
+                throw ACMEFileError.unreadable(path: path)
+            }
+        }
+        return (try read(fullchainPath), try read(keyPath))
+    }
+}
+
+enum ACMEFileError: LocalizedError {
+    case unreadable(path: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .unreadable(let path):
+            return "读不到证书文件：\(path)\n"
+                 + "证书可能已被删除，或 acme.sh 的目录与预期不一致"
+                 + "（ECC 证书在「<域名>_ecc」目录，RSA 在「<域名>」目录）。\n"
+                 + "可在「证书」页点「刷新」重新读取列表，再试一次。"
+        }
+    }
 }
 
 // MARK: - 服务
@@ -153,11 +203,22 @@ final class ACMEService: @unchecked Sendable {
 
     private func baseArgs(_ domains: [String], email: String) -> [String] {
         var args = ["--issue", "--server", "letsencrypt",
-                    "--keylength", settings.keylength.isEmpty ? "ec-256" : settings.keylength]
+                    "--keylength", issueKeyLength]
         for domain in domains { args += ["-d", domain] }
         let mail = email.trimmingCharacters(in: .whitespaces)
         if !mail.isEmpty { args += ["--accountemail", mail] }
         return args
+    }
+
+    /// 申请时用的密钥算法，默认 ECDSA P-256（acme.sh 3.x 的默认值）。
+    private var issueKeyLength: String {
+        settings.keylength.trimmingCharacters(in: .whitespaces).isEmpty ? "ec-256" : settings.keylength
+    }
+
+    /// 申请完成后证书落在哪个目录：ECDSA 是 `<域名>_ecc`，RSA 是 `<域名>`。
+    /// 提示里直接拼这个后缀，免得文案与实际目录对不上。
+    private var issueDirectorySuffix: String {
+        ACMECertificate.isECCKeyLength(issueKeyLength) ? "_ecc" : ""
     }
 
     /// 阿里云 DNS 自动验证（DNS-01）：acme.sh 自动写 TXT 记录、验证、再删掉。
@@ -187,7 +248,7 @@ final class ACMEService: @unchecked Sendable {
         }
         return ActionResult(ok: true,
                             message: "证书已签发：\(list.joined(separator: ", "))",
-                            detail: "证书目录：\(home)/\(list[0])_ecc/\n\n"
+                            detail: "证书目录：\(home)/\(list[0])\(issueDirectorySuffix)/\n\n"
                                   + String(result.stdout.suffix(400)))
     }
 
@@ -230,7 +291,7 @@ final class ACMEService: @unchecked Sendable {
                                   + "\n\n提示：DNS 记录生效需要时间（通常 1–10 分钟），稍等再点一次即可。")
         }
         return ActionResult(ok: true, message: "证书已签发：\(list.joined(separator: ", "))",
-                            detail: "证书目录：\(home)/\(list[0])_ecc/")
+                            detail: "证书目录：\(home)/\(list[0])\(issueDirectorySuffix)/")
     }
 
     // MARK: 已签发的证书
@@ -247,27 +308,54 @@ final class ACMEService: @unchecked Sendable {
     }
 
     /// 解析 `acme.sh --list` 的输出。它是「空格/制表符对齐」的表：
-    ///   Main_Domain   KeyLength  SAN_Domains  CA              Created              Renew
-    ///   example.com   ec-256     no           LetsEncrypt.org 2026-09-23T...       2026-12-22T...
+    ///   Main_Domain  KeyLength  SAN_Domains  Profile  CA  Created  Renew
+    ///   example.com  "ec-256"   no                   LetsEncrypt.org  2026-09-23T...  2026-12-22T...
+    ///
+    /// 有两个坑（acme.sh 3.1.x 起）：
+    ///   1. KeyLength 会带引号（`"ec-256"`）。不剥掉的话「是不是 ECC」判定就会失败，
+    ///      拼出来的证书路径少一层 `_ecc`，部署时读不到文件。
+    ///   2. 表头多了 `Profile` 列，这一列有值时后面的字段会整体右移，
+    ///      所以 Created/Renew 用 ISO 时间戳定位，CA 取它前面那个字段，不能写死下标。
     static func parseList(_ output: String, home: String) -> [ACMECertificate] {
         var result: [ACMECertificate] = []
         for line in output.lines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.isEmpty { continue }
-            let fields = trimmed
-                .components(separatedBy: .whitespaces)
+            let fields = line
+                .split(whereSeparator: { $0 == " " || $0 == "\t" })
+                .map { unquoted(String($0)) }
                 .filter { !$0.isEmpty }
-            guard fields.count >= 2 else { continue }
-            if fields[0] == "Main_Domain" { continue }        // 表头
+            guard fields.count >= 2, fields[0] != "Main_Domain" else { continue }
+            let stamps = fields.indices.filter { isTimestamp(fields[$0]) }
+            let createdIndex = stamps.first
+            let caIndex = createdIndex.map { $0 - 1 } ?? -1
             result.append(ACMECertificate(domain: fields[0],
                                           keyLength: fields[1],
-                                          sanDomains: fields.count > 2 ? fields[2] : "no",
-                                          ca: fields.count > 3 ? fields[3] : "",
-                                          created: fields.count > 4 ? fields[4] : "",
-                                          renewAt: fields.count > 5 ? fields[5] : "",
+                                          sanDomains: fields.count > 2 && caIndex > 2 ? fields[2] : "no",
+                                          ca: caIndex >= 3 && caIndex < fields.count ? fields[caIndex] : "",
+                                          created: createdIndex.map { fields[$0] } ?? "",
+                                          renewAt: stamps.count > 1 ? fields[stamps[1]] : "",
                                           home: home))
         }
         return result
+    }
+
+    /// 去掉 acme.sh 输出里给字符串字段加的引号（`"ec-256"` → `ec-256`）。
+    private static func unquoted(_ value: String) -> String {
+        var text = value
+        while text.count >= 2, let first = text.first, let last = text.last {
+            if (first == "\"" && last == "\"") || (first == "'" && last == "'") {
+                text = String(text.dropFirst().dropLast())
+            } else {
+                break
+            }
+        }
+        return text
+    }
+
+    /// acme.sh 的时间列长这样：`2026-09-23T10:00:00Z`。
+    private static func isTimestamp(_ value: String) -> Bool {
+        guard value.count >= 20, value.hasSuffix("Z") else { return false }
+        let chars = Array(value)
+        return chars[4] == "-" && chars[7] == "-" && chars[10] == "T" && chars[13] == ":"
     }
 
     /// 从 acme.sh 手动模式输出里解析 TXT 记录：
@@ -292,7 +380,8 @@ final class ACMEService: @unchecked Sendable {
         return result
     }
 
-    func renew(domain: String, accessKey: String = "", accessSecret: String = "") -> ActionResult {
+    func renew(domain: String, ecc: Bool = false,
+               accessKey: String = "", accessSecret: String = "") -> ActionResult {
         guard let bin else { return .failure("找不到 acme.sh") }
         let name = domain.trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty else { return .failure("域名不能为空") }
@@ -305,9 +394,13 @@ final class ACMEService: @unchecked Sendable {
             env = ["Ali_Key": key, "Ali_Secret": secret, "Ali_Region": "cn-hangzhou"]
         }
 
-        Diag.log("续期证书：\(name)")
-        let result = Shell.run([bin, "--renew", "-d", name, "--server", "letsencrypt"],
-                               timeout: 600, extraEnv: env)
+        // ECC 证书必须显式带 --ecc，否则 acme.sh 可能去找 RSA 目录（`<域名>` 而不是 `<域名>_ecc`）。
+        // RSA 与 ECC 两份证书同时存在时，不带 --ecc 会续错那一份。
+        var args = [bin, "--renew", "-d", name, "--server", "letsencrypt"]
+        if ecc { args.append("--ecc") }
+
+        Diag.log("续期证书：\(name)\(ecc ? "（ECC）" : "（RSA）")")
+        let result = Shell.run(args, timeout: 600, extraEnv: env)
         guard result.ok else {
             return .failure("续期失败：\(result.message)", detail: String(result.stdout.suffix(700)))
         }

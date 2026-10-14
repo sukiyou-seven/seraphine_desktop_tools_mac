@@ -596,24 +596,93 @@ check("记录值去掉了引号", manualChallenges.first?.recordValue == "abc123
       manualChallenges.first?.recordValue ?? "nil")
 check("第二条记录也对", manualChallenges.last?.recordValue == "def456uvw")
 
+// acme.sh 3.1.5 的真实输出：KeyLength 带引号，表头多了 Profile 列。
+// 之前按空格切分后拿到的是 `"ec-256"`，`hasPrefix("ec-")` 判定失败，
+// 拼出来的证书路径少一层 `_ecc`，部署时读不到 fullchain.cer。
 let listOutput = """
-Main_Domain	KeyLength	SAN_Domains	CA	Created	Renew
-example.com	ec-256	no	LetsEncrypt.org	2026-09-23T10:00:00Z	2026-12-22T10:00:00Z
-api.example.com	2048	*.api.example.com	LetsEncrypt.org	2026-09-20T10:00:00Z	2026-12-19T10:00:00Z
+Main_Domain                   KeyLength  SAN_Domains            Profile          CA                    Created               Renew
+admin.rubyonly.cn             "ec-256"   ylpserver.rubyonly.cn  LetsEncrypt.org  2026-09-28T18:19:47Z  2026-11-26T20:47:57Z
+wechatserver.rubyonly.com.cn  "ec-256"   no                     LetsEncrypt.org  2026-10-13T04:59:49Z  2026-12-13T00:40:11Z
+rsa.example.com               2048       no                     LetsEncrypt.org  2026-09-20T10:00:00Z  2026-12-19T10:00:00Z
+short.example.com             "ec-256"   api.short.example.com  shortlived        LetsEncrypt.org  2026-10-01T00:00:00Z  2026-10-11T00:00:00Z
 """
 let parsedCerts = ACMEService.parseList(listOutput, home: "/Users/x/.acme.sh")
-check("证书列表跳过表头", parsedCerts.count == 2, "实际 \(parsedCerts.count)")
-check("域名与密钥算法解析正确",
-      parsedCerts.first?.domain == "example.com" && parsedCerts.first?.keyLength == "ec-256")
-check("下次续期时间解析", parsedCerts.first?.renewAt.hasPrefix("2026-12-22") == true,
+check("证书列表跳过表头", parsedCerts.count == 4, "实际 \(parsedCerts.count)")
+check("域名解析正确", parsedCerts.first?.domain == "admin.rubyonly.cn", parsedCerts.first?.domain ?? "")
+check("密钥算法去掉引号",
+      parsedCerts.first?.keyLength == "ec-256", parsedCerts.first?.keyLength ?? "")
+check("带引号的算法也判定为 ECC", parsedCerts.first?.isECC == true)
+check("下次续期时间解析", parsedCerts.first?.renewAt.hasPrefix("2026-11-26") == true,
       parsedCerts.first?.renewAt ?? "")
-check("附加域名解析", parsedCerts.last?.sanDomains == "*.api.example.com")
+check("签发时间解析", parsedCerts.first?.created.hasPrefix("2026-09-28") == true,
+      parsedCerts.first?.created ?? "")
+check("签发机构解析", parsedCerts.first?.ca == "LetsEncrypt.org", parsedCerts.first?.ca ?? "")
+check("附加域名解析", parsedCerts.first?.sanDomains == "ylpserver.rubyonly.cn",
+      parsedCerts.first?.sanDomains ?? "")
+check("没有附加域名时为 no", parsedCerts[1].sanDomains == "no", parsedCerts[1].sanDomains)
 check("证书路径拼接正确",
-      parsedCerts.first?.fullchainPath == "/Users/x/.acme.sh/example.com_ecc/fullchain.cer",
+      parsedCerts.first?.fullchainPath == "/Users/x/.acme.sh/admin.rubyonly.cn_ecc/fullchain.cer",
       parsedCerts.first?.fullchainPath ?? "")
-check("RSA 证书目录不使用 _ecc 后缀",
-      parsedCerts.last?.fullchainPath == "/Users/x/.acme.sh/api.example.com/fullchain.cer")
+check("私钥路径拼接正确",
+      parsedCerts.first?.keyPath == "/Users/x/.acme.sh/admin.rubyonly.cn_ecc/admin.rubyonly.cn.key",
+      parsedCerts.first?.keyPath ?? "")
+check("续期时间不受 Profile 列影响",
+      parsedCerts[1].renewAt.hasPrefix("2026-12-13") == true, parsedCerts[1].renewAt)
+// Profile 列有值时列会整体右移，写死下标就会把 CA 当成 Created。
+check("Profile 有值时签发机构仍解析正确",
+      parsedCerts[3].ca == "LetsEncrypt.org", parsedCerts[3].ca)
+check("Profile 有值时续期时间仍解析正确",
+      parsedCerts[3].renewAt.hasPrefix("2026-10-11") == true, parsedCerts[3].renewAt)
+check("Profile 有值时附加域名仍解析正确",
+      parsedCerts[3].sanDomains == "api.short.example.com", parsedCerts[3].sanDomains)
+check("RSA 证书目录不使用 _ecc 后缀", parsedCerts[2].isECC == false)
+check("RSA 证书路径不带 _ecc",
+      parsedCerts[2].fullchainPath == "/Users/x/.acme.sh/rsa.example.com/fullchain.cer",
+      parsedCerts[2].fullchainPath)
+check("类型标签区分 ECC / RSA",
+      parsedCerts[0].keyLabel == "ECC ec-256" && parsedCerts[2].keyLabel == "RSA 2048",
+      "\(parsedCerts[0].keyLabel) / \(parsedCerts[2].keyLabel)")
+// 同一域名同时有 RSA 与 ECC 两份证书时，id 不能撞（否则列表与弹窗里选不中）。
+check("id 带上算法", parsedCerts[0].id == "admin.rubyonly.cn|ec-256", parsedCerts[0].id)
 check("空输出不崩", ACMEService.parseList("", home: "/tmp").isEmpty)
+check("只有表头时为空", ACMEService.parseList("Main_Domain  KeyLength  SAN_Domains", home: "/tmp").isEmpty)
+
+// 磁盘上只存在哪一个目录，就以哪一个为准（acme.sh 自己也是这个回退顺序）。
+let acmeFixture = workRoot + "/acme-home"
+try? FileManager.default.createDirectory(atPath: acmeFixture + "/only-ecc.com_ecc",
+                                         withIntermediateDirectories: true)
+try? FileManager.default.createDirectory(atPath: acmeFixture + "/both.com_ecc",
+                                         withIntermediateDirectories: true)
+try? FileManager.default.createDirectory(atPath: acmeFixture + "/both.com",
+                                         withIntermediateDirectories: true)
+let fallbackOutput = """
+Main_Domain  KeyLength  SAN_Domains  Profile  CA               Created               Renew
+only-ecc.com 2048       no                    LetsEncrypt.org  2026-09-28T18:19:47Z  2026-11-26T20:47:57Z
+both.com     "ec-256"   no                    LetsEncrypt.org  2026-09-28T18:19:47Z  2026-11-26T20:47:57Z
+"""
+let fallback = ACMEService.parseList(fallbackOutput, home: acmeFixture)
+check("算法字段说是 RSA 但只有 _ecc 目录存在 → 用 _ecc",
+      fallback.first?.fullchainPath == acmeFixture + "/only-ecc.com_ecc/fullchain.cer",
+      fallback.first?.fullchainPath ?? "")
+check("两个目录都在时按算法选", fallback.last?.fullchainPath == acmeFixture + "/both.com_ecc/fullchain.cer",
+      fallback.last?.fullchainPath ?? "")
+// 真实场景：证书文件在就读得出来；文件没了要报出具体路径，而不是一句泛泛的错误。
+let realCert = fallback.last!
+try? "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+    .write(toFile: realCert.fullchainPath, atomically: true, encoding: .utf8)
+try? "-----BEGIN EC PRIVATE KEY-----\nMHc\n-----END EC PRIVATE KEY-----\n"
+    .write(toFile: realCert.keyPath, atomically: true, encoding: .utf8)
+let deploymentFiles = try? realCert.readDeploymentFiles()
+check("证书文件存在时可读出", deploymentFiles?.certificate.contains("BEGIN CERTIFICATE") == true,
+      deploymentFiles?.certificate ?? "nil")
+check("私钥文件存在时可读出", deploymentFiles?.privateKey.contains("PRIVATE KEY") == true,
+      deploymentFiles?.privateKey ?? "nil")
+try? FileManager.default.removeItem(atPath: realCert.fullchainPath)
+var missingMessage = ""
+do { _ = try realCert.readDeploymentFiles() } catch { missingMessage = error.localizedDescription }
+check("证书被删后报错带完整路径",
+      missingMessage.contains(realCert.fullchainPath) && missingMessage.contains("_ecc"),
+      missingMessage.isEmpty ? "没有报错" : missingMessage)
 
 
 
@@ -1824,9 +1893,243 @@ check("开关能往返保存", {
     settings.startup.autoStartRedis = true
     guard let data = try? JSONEncoder().encode(settings),
           let restored = try? JSONDecoder().decode(AppSettings.self, from: data) else { return false }
-    return restored.clipboard.enabled == false && restored.startup.autoStartRedis
+    return restored.clipboard.enabled == false         && restored.startup.autoStartRedis
         && restored.startup.autoStartMongo == false
 }())
+
+// 项目管理：服务端返回的运行状态要能解出来，并且翻成人话
+let projectDecoder = JSONDecoder()
+projectDecoder.keyDecodingStrategy = .convertFromSnakeCase
+let projectJSON = Data(#"""
+{"id":"wechats","name":"wechats","runtime":"python","runtime_version":"3.13.16","use_venv":true,
+ "python_server":"gunicorn","python_worker":"sync","python_callable":"app","python_workers":2,
+ "python_threads":1,"server_ready":true,"entry":"main.py","port":53200,
+ "directory":"/www/seraphim/web/python_projects/wechat_server",
+ "active_state":"activating","sub_state":"auto-restart","result":"exit-code","main_pid":0,
+ "exit_status":203,"restarts":5,"memory_bytes":125358080,"port_busy":true,
+ "env":{"DATABASE_URL":"mysql://db/app"},"env_file":true,
+ "enabled":true,"runtime_ready":true,"venv_ready":true}
+"""#.utf8)
+let crashed = try? projectDecoder.decode(RemoteProject.self, from: projectJSON)
+check("项目快照解码", crashed?.id == "wechats" && crashed?.port == 53200 && crashed?.restarts == 5)
+// systemd 在反复重启时 ActiveState 仍是 activating，只看它会把崩溃显示成「运行中」。
+check("反复重启不能被当成运行中",
+      crashed?.restarting == true && crashed?.stateText == "反复重启" && crashed?.needsAttention == true)
+check("内存转成人读的单位", crashed?.memoryText?.contains("MB") == true, crashed?.memoryText ?? "nil")
+check("环境变量按键排序输出",
+      crashed?.envEntries.map { $0.name } == ["DATABASE_URL"] && crashed?.envFile == true)
+check("端口被占用能读出来", crashed?.portBusy == true)
+check("没在运行时不算已运行时长", crashed?.uptimeText == nil)
+
+let failedJSON = Data(#"""
+{"id":"x","name":"X","runtime":"node","entry":"index.js","port":0,"directory":"/tmp/x",
+ "active_state":"failed","result":"exit-code","exit_status":1,"enabled":false,"runtime_ready":true}
+"""#.utf8)
+let failed = try? projectDecoder.decode(RemoteProject.self, from: failedJSON)
+check("启动失败的原因要说清楚", failed?.failureSummary == "启动后立即退出（退出码 1）",
+      failed?.failureSummary ?? "nil")
+
+let detailJSON = Data(#"""
+{"project":{"id":"x","name":"X","runtime":"python","entry":"main.py","port":8000,
+  "directory":"/tmp/x","active_state":"inactive","enabled":false,"runtime_ready":true},
+ "checks":[{"id":"deps","label":"项目依赖","level":"warning","detail":"尚未通过面板安装",
+            "hint":"点「安装依赖」执行 pip install","action":"deps"},
+           {"id":"runtime","label":"运行环境","level":"ok"}],
+ "dependency":{"manifest":"requirements.txt","present":true,"installed":false,
+               "command":"pip install -r requirements.txt","detail":"尚未通过面板安装"},
+ "log":"hello","journal":"boom"}
+"""#.utf8)
+let detail = try? projectDecoder.decode(RemoteProjectDetail.self, from: detailJSON)
+check("自检清单解码", detail?.checks.count == 2 && detail?.checks.first?.action == "deps"
+      && detail?.checks.first?.isError == false)
+check("依赖状态解码",
+      detail?.dependency.present == true && detail?.dependency.installed == false
+      && detail?.dependency.summary == "尚未通过面板安装")
+check("进程没起来时带上系统日志", detail?.journal == "boom" && detail?.log == "hello")
+
+// 环境变量管理：「环境变量管理」是独立模块里的一份公用值，项目默认不加载，
+// 勾上才加载，项目同名变量优先。
+let inheritJSON = Data(#"""
+{"id":"a","name":"A","runtime":"node","entry":"index.js","port":0,"directory":"/tmp/a",
+ "active_state":"inactive","enabled":false,"runtime_ready":true,
+ "use_global_env":false,"env":{"PROJECT_RUNTIME":"prod"}}
+"""#.utf8)
+let inheritOff = try? projectDecoder.decode(RemoteProject.self, from: inheritJSON)
+let inheritOn = try? projectDecoder.decode(RemoteProject.self,
+    from: Data(#"{"id":"b","name":"B","runtime":"node","entry":"index.js","port":0,"directory":"/tmp/b","active_state":"inactive","enabled":false,"runtime_ready":true,"use_global_env":true}"#.utf8))
+check("没写 use_global_env 时默认不加载", detail?.project.inheritsGlobalEnv == false)
+check("显式勾上才加载", inheritOn?.inheritsGlobalEnv == true)
+check("显式关掉就是不加载",
+      inheritOff?.inheritsGlobalEnv == false && inheritOff?.useGlobalEnv == false)
+check("项目的同名变量照常读出来",
+      inheritOff?.envEntries.map { $0.name } == ["PROJECT_RUNTIME"])
+
+let variableJSON = Data(#"""
+{"variables":[{"name":"API_BASE","value":"https://example.test"},
+              {"name":"PROJECT_RUNTIME","value":"dev"}],
+ "updated_at":"2026-10-14T03:00:00Z","file":"/www/seraphim/server/env",
+ "consumers":["勾选了「加载面板环境变量」的项目","计划任务"]}
+"""#.utf8)
+let variables = try? projectDecoder.decode(RemoteGlobalVariableListing.self, from: variableJSON)
+check("变量表解码",
+      variables?.items.count == 2 && variables?.items.first?.value == "https://example.test"
+      && variables?.consumers?.count == 2)
+// 代码自己读共用文件那条路：路径要能拿到，界面上才给得出。
+check("变量表带出共用文件路径", variables?.file == "/www/seraphim/server/env")
+// 服务端把列表解成 null 时不能崩，也不能显示成「有一项」。
+let emptyVariables = try? projectDecoder.decode(RemoteGlobalVariableListing.self,
+                                                from: Data(#"{"variables":[]}"#.utf8))
+check("空变量表解码", emptyVariables?.items.isEmpty == true && emptyVariables?.updatedAt == nil)
+
+let detailVariablesJSON = Data(#"""
+{"project":{"id":"x","name":"X","runtime":"node","entry":"index.js","port":0,
+  "directory":"/tmp/x","active_state":"inactive","enabled":false,"runtime_ready":true},
+ "checks":[],"dependency":{"manifest":"","present":false,"installed":false},
+ "global_variables":[{"name":"PROJECT_RUNTIME","value":"dev"}],
+ "log":"","journal":null}
+"""#.utf8)
+let withVariables = try? projectDecoder.decode(RemoteProjectDetail.self, from: detailVariablesJSON)
+check("详情带出加载到的面板变量",
+      withVariables?.globalVariables?.first?.name == "PROJECT_RUNTIME"
+      && withVariables?.globalVariables?.first?.value == "dev")
+// 依赖清单由服务端判断：Python 项目认 requirements.txt / pyproject.toml / setup.py，
+// Node 认 package.json 并按锁文件挑包管理器。面板只负责把结论原样显示出来。
+let pyprojectDependency = try? projectDecoder.decode(RemoteProjectDependency.self,
+    from: Data(#"{"manifest":"pyproject.toml","present":true,"installed":false,"command":"pip install .","level":"warning","detail":"尚未通过面板安装","hint":"点「安装依赖」执行 pip install .","action":"deps"}"#.utf8))
+check("依赖清单名与安装命令照服务端显示",
+      pyprojectDependency?.title == "pyproject.toml" && pyprojectDependency?.command == "pip install ."
+      && pyprojectDependency?.summary == "尚未通过面板安装")
+// 服务端说不出清单文件名时给中性占位：一律写成「无需安装」会误导
+// （Python 项目没开虚拟环境、以及不需要装依赖的运行环境都是这个形状）。
+check("没有清单文件名时用中性占位", withVariables?.dependency.title == "—")
+// 卡片上的那一行：识别到的清单名要直接写出来，否则扫一眼列表根本看不出
+// 面板支持 pyproject.toml / setup.py。
+check("卡片写清识别到的清单与安装命令",
+      pyprojectDependency?.cardSummary == "pyproject.toml · 尚未安装（pip install .）")
+let installedDependency = try? projectDecoder.decode(RemoteProjectDependency.self,
+    from: Data(#"{"manifest":"requirements.txt","present":true,"installed":true,"command":"pip install -r requirements.txt","level":"ok","detail":"已按当前 requirements.txt 安装"}"#.utf8))
+check("已安装时卡片只说已安装", installedDependency?.cardSummary == "requirements.txt · 已安装")
+// Python 没开虚拟环境：清单认出来了，但面板不会替它装，别挂一个点不动的「尚未安装」。
+let venvlessDependency = try? projectDecoder.decode(RemoteProjectDependency.self,
+    from: Data(#"{"manifest":"requirements.txt","present":false,"installed":false,"level":"warning","action":"edit","detail":"工程里有 requirements.txt；项目没有启用虚拟环境，面板不会把依赖装进共享的 Python"}"#.utf8))
+check("面板不装时卡片说明原因",
+      venvlessDependency?.cardSummary == "requirements.txt · 面板不会替它装，原因见详情")
+// 运行环境本来就不需要装依赖（Java 的 jar、.NET 的 dll）时，卡片不占这一行。
+let noDependencyNeeded = try? projectDecoder.decode(RemoteProjectDependency.self,
+    from: Data(#"{"present":false,"installed":false,"level":"ok","detail":"该运行环境不需要在服务器上安装依赖"}"#.utf8))
+check("不需要装依赖时卡片不显示这一行", noDependencyNeeded?.cardSummary == nil)
+// 说不出清单名又确实有问题时，原样转达服务端的结论，别只显示一个破折号。
+let namelessWarning = try? projectDecoder.decode(RemoteProjectDependency.self,
+    from: Data(#"{"present":false,"installed":false,"level":"warning","action":"edit","detail":"项目没有启用虚拟环境，面板不会把依赖装进共享的 Python"}"#.utf8))
+check("说不出清单名时卡片转达服务端结论",
+      namelessWarning?.cardSummary == "项目没有启用虚拟环境，面板不会把依赖装进共享的 Python")
+let listingWithDependency = try? projectDecoder.decode(RemoteProjectListing.self, from: Data(#"""
+{"items":[{"id":"pyapi","name":"PyApi","runtime":"python","entry":"main.py","port":0,
+  "directory":"/tmp/pyapi","active_state":"inactive","enabled":false,"runtime_ready":true,
+  "use_venv":true,"venv_ready":true,
+  "dependency":{"manifest":"pyproject.toml","present":true,"installed":false,"command":"pip install .","level":"warning"}},
+ {"id":"plain","name":"Plain","runtime":"java","entry":"app.jar","port":0,
+  "directory":"/tmp/plain","active_state":"inactive","enabled":false,"runtime_ready":true}],
+ "runtimes":[]}
+"""#.utf8))
+check("列表带上依赖结论",
+      listingWithDependency?.items.first?.dependency?.manifestName == "pyproject.toml")
+check("旧服务端没有依赖字段时解码不崩", listingWithDependency?.items.last?.dependency == nil)
+
+let savedVariables = try? projectDecoder.decode(RemoteGlobalVariableSaveResult.self,
+    from: Data(#"{"variables":[{"name":"PROJECT_RUNTIME","value":"prod"}],"applied":["wechats","blog"],"file":"/www/seraphim/server/env"}"#.utf8))
+check("保存结果带出被同步的项目与共用文件",
+      savedVariables?.variables?.first?.value == "prod"
+      && savedVariables?.appliedProjects == ["wechats", "blog"]
+      && savedVariables?.file == "/www/seraphim/server/env")
+
+// MARK: - API 设置
+
+// 服务端给的接入信息：接口列表 + 一把给脚本与 AI 用的 key。页面上的东西全部
+// 从这里出，少解一个字段就是「列表空着」或者「配置里少个地址」。
+//
+// 注意这里解的是 key 而不是面板凭据：这把是独立的一把，能重置。
+let apiDocument = try? ServerProjectAPI.decoder.decode(RemoteAPIDocument.self, from: Data("""
+{
+  "version": "1",
+  "endpoint": "https://192.168.0.103:27520",
+  "key": "e3b0c44298fc1c149afbf4c8996fb924",
+  "header": "Authorization: Bearer e3b0c44298fc1c149afbf4c8996fb924",
+  "sections": [
+    {"name": "接入", "endpoints": [
+      {"method": "GET", "path": "/v1/api", "summary": "本接口列表与当前的 API key"},
+      {"method": "POST", "path": "/v1/api/key", "summary": "重置 API key",
+       "example": "curl -k -X POST -H \\"Authorization: Bearer $API_KEY\\" https://HOST:27520/v1/api/key"}
+    ]},
+    {"name": "项目", "endpoints": [
+      {"method": "GET", "path": "/v1/projects", "summary": "项目列表"},
+      {"method": "POST", "path": "/v1/projects/{id}/action", "summary": "上传压缩包并一步建好项目",
+       "example": "curl -k --data-binary @demo.tar.gz"}
+    ]},
+    {"name": "给 AI 用", "endpoints": [
+      {"method": "POST", "path": "/v1/mcp", "summary": "MCP 端点"}
+    ]}
+  ],
+  "mcp": {
+    "path": "/v1/mcp",
+    "url": "https://192.168.0.103:27520/v1/mcp",
+    "headers": {"Authorization": "Bearer e3b0"},
+    "script": "https://192.168.0.103:27520/v1/mcp/script",
+    "tools": [
+      {"name": "list_projects", "description": "列出所有托管项目"},
+      {"name": "import_project", "description": "一步建好项目"}
+    ]
+  }
+}
+""".utf8))
+
+check("接入信息带出接口列表", apiDocument?.sections.count == 3 && apiDocument?.endpointCount == 5)
+check("带路径参数的接口被标出来",
+      apiDocument?.sections[1].endpoints[1].needsParameters == true
+      && apiDocument?.sections[1].endpoints[0].needsParameters == false)
+check("接口示例原样带出", apiDocument?.sections[1].endpoints[1].example == "curl -k --data-binary @demo.tar.gz")
+check("接入信息带出 key 与请求头",
+      apiDocument?.key == "e3b0c44298fc1c149afbf4c8996fb924"
+      && apiDocument?.header == "Authorization: Bearer e3b0c44298fc1c149afbf4c8996fb924")
+
+// 这把 key 是独立的一把，能在页面上重置——重置接口本身也要出现在接口列表里，
+// 用户才能从这一页抄到「脚本里那把怎么换」。
+check("接口列表带出重置 API key 的操作",
+      apiDocument?.sections.first?.name == "接入"
+      && apiDocument?.sections.first?.endpoints[1].path == "/v1/api/key"
+      && apiDocument?.sections.first?.endpoints[1].method == "POST")
+
+// 客户端打的三条路径：改错一个字符就是「刷新不出来」或者「重置 404」。
+check("客户端端点路径与服务端一致",
+      ServerAPIAccessAPI.documentPath == "/v1/api"
+      && ServerAPIAccessAPI.keyPath == "/v1/api/key"
+      && ServerAPIAccessAPI.scriptPath == "/v1/mcp/script")
+
+// 快速开始的示例要能直接粘贴：地址和 key 都得替换进去。
+check("快速开始示例里替换了地址与 key",
+      apiDocument?.curlExample.contains("export SERAPHIM=\"https://192.168.0.103:27520\"") == true
+      && apiDocument?.curlExample.contains("export API_KEY=\"e3b0c44298fc1c149afbf4c8996fb924\"") == true)
+
+check("MCP 的 HTTP 配置带上地址与 key",
+      apiDocument?.mcpHTTPConfiguration.contains("\"url\": \"https://192.168.0.103:27520/v1/mcp\"") == true
+      && apiDocument?.mcpHTTPConfiguration.contains("Bearer e3b0c44298fc1c149afbf4c8996fb924") == true)
+
+check("MCP 的 stdio 配置指向本机桥脚本",
+      apiDocument?.mcpStdioConfiguration(scriptPath: "/tmp/seraphim-mcp.py")
+        .contains("\"args\": [\"/tmp/seraphim-mcp.py\"]") == true
+      && apiDocument?.mcpStdioConfiguration(scriptPath: "/tmp/seraphim-mcp.py")
+        .contains("\"SERAPHIM_ENDPOINT\": \"https://192.168.0.103:27520\"") == true
+      // 这里填的也是那把能重置的 API key，重置后这段配置要跟着换。
+      && apiDocument?.mcpStdioConfiguration(scriptPath: "/tmp/seraphim-mcp.py")
+        .contains("\"SERAPHIM_TOKEN\": \"e3b0c44298fc1c149afbf4c8996fb924\"") == true)
+
+check("MCP 工具清单带出名称与说明",
+      apiDocument?.mcp.tools.map(\.name) == ["list_projects", "import_project"]
+      && apiDocument?.mcp.tools.first?.description == "列出所有托管项目")
+
+// 桥脚本默认落在用户的应用数据目录里，配置片段引用的就是它。
+check("桥脚本默认路径指向应用数据目录",
+      ServerAPIAccessAPI.bridgeScriptDestination.hasSuffix("Seraphim/seraphim-mcp.py"))
 
 print("")
 print(failures == 0 ? "全部通过：\(checks) 项" : "失败 \(failures)/\(checks) 项")

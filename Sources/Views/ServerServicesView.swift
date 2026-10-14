@@ -5,20 +5,66 @@ private struct SoftwareManagementAction {
     let name: String
     let id: String
     let action: String
-    let isFirewall: Bool
 }
 
+/// 软件管理页的筛选条件。运行环境没有常驻服务，"运行中/已停止" 对它没有意义，因此单列一类。
+private enum SoftwareManagementFilter: String, CaseIterable {
+    case all = "全部"
+    case running = "运行中"
+    case stopped = "已停止"
+    case runtime = "运行环境"
+}
+
+private struct SoftwareManagementLogSheet: Identifiable {
+    let id: String
+    let title: String
+    let content: String
+}
+
+/// 软件管理页只做一件事：管理已经装好的软件。
+/// 安装、卸载之外的"装"归软件商店，运行环境的版本归环境管理。
 struct ServerServicesView: View {
     let connection: ServerConnection
     let token: String
+    let openStore: () -> Void
+    let openEnvironments: () -> Void
 
-    @State private var firewall: RemoteService?
     @State private var software: [RemoteSoftware] = []
+    @State private var jobs: [RemoteSoftwareJob] = []
     @State private var softwareLoadFailed = false
     @State private var pendingAction: SoftwareManagementAction?
+    @State private var logSheet: SoftwareManagementLogSheet?
     @State private var working = false
     @State private var message = ""
     @State private var hasError = false
+    @State private var searchText = ""
+    @State private var filter: SoftwareManagementFilter = .all
+
+    /// 本页只关心卸载进度。安装进度属于软件商店，不在这里重复展示。
+    private var uninstallJobs: [RemoteSoftwareJob] {
+        jobs.filter { $0.operation == "uninstall" }
+    }
+
+    private var activeJobCount: Int {
+        uninstallJobs.filter { ["queued", "uninstalling", "cancelling"].contains($0.state) }.count
+    }
+
+    private var visibleSoftware: [RemoteSoftware] {
+        software.filter { item in
+            let matchesSearch = searchText.isEmpty ||
+                [item.name, item.version, item.installPath].contains {
+                    $0.localizedStandardContains(searchText)
+                }
+            let matchesFilter: Bool
+            switch filter {
+            case .all: matchesFilter = true
+            case .running: matchesFilter = item.hasService && item.isRunning
+            case .stopped: matchesFilter = item.hasService && !item.isRunning
+            case .runtime: matchesFilter = item.isRuntime
+            }
+            return matchesSearch && matchesFilter
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -26,10 +72,11 @@ struct ServerServicesView: View {
                 Text("软件管理")
                     .font(.title3.weight(.semibold))
                 Spacer()
+                Button("去软件商店安装") { openStore() }.disabled(working)
                 Button("刷新") { Task { await refresh() } }.disabled(working)
                 if working { ProgressView().controlSize(.small) }
             }
-            Text("管理已安装软件的运行状态、开机启动和卸载，以及服务器防火墙服务。")
+            Text("只管理已经装好的软件：运行状态、开机启动、日志和卸载。安装新软件到「软件商店」，运行环境的版本到「环境管理」。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -40,22 +87,55 @@ struct ServerServicesView: View {
                     .lineLimit(3)
             }
 
+            if !uninstallJobs.isEmpty {
+                DisclosureGroup("卸载任务 · \(activeJobCount) 进行中") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(uninstallJobs) { job in
+                            HStack(spacing: 8) {
+                                Text(software.first(where: { $0.id == job.id })?.name ?? job.id)
+                                    .fontWeight(.medium)
+                                Text(jobStateText(job.state))
+                                    .foregroundStyle(.secondary)
+                                Text(verbatim: job.message).font(.caption).lineLimit(1)
+                                Spacer(minLength: 0)
+                                if ["queued", "uninstalling"].contains(job.state) {
+                                    Button("停止任务") { Task { await cancel(job.id) } }.disabled(working)
+                                }
+                            }
+                        }
+                    }
+                    .padding(.top, 6)
+                }
+            }
+
+            HStack(spacing: 12) {
+                TextField("搜索已安装软件", text: $searchText)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 260)
+                Picker("状态", selection: $filter) {
+                    ForEach(SoftwareManagementFilter.allCases, id: \.self) { option in
+                        Text(option.rawValue).tag(option)
+                    }
+                }
+                .frame(width: 125)
+                Spacer(minLength: 0)
+                Text("已安装 \(software.count) 款")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             FlexibleScroll {
                 VStack(alignment: .leading, spacing: 14) {
-                    if let firewall {
-                        firewallCard(firewall)
-                    } else if !working && !hasError {
-                        EmptyHint(text: "此服务器没有找到受支持的防火墙服务")
-                    }
-
-                    Text("已安装软件")
-                        .font(.headline)
-                        .padding(.top, 4)
-                    if software.isEmpty && !working && !softwareLoadFailed {
-                        EmptyHint(text: "尚未安装软件，请到「软件商店」安装")
-                    }
-                    ForEach(software) { item in
+                    ForEach(visibleSoftware) { item in
                         softwareCard(item)
+                    }
+                    if software.isEmpty && !working && !softwareLoadFailed {
+                        VStack(alignment: .leading, spacing: 10) {
+                            EmptyHint(text: "这台服务器上还没有已安装的软件。")
+                            Button("去软件商店安装") { openStore() }
+                        }
+                    } else if visibleSoftware.isEmpty && !working {
+                        EmptyHint(text: "没有符合条件的软件")
                     }
                 }
             }
@@ -92,34 +172,23 @@ struct ServerServicesView: View {
             }
             Button("取消", role: .cancel) { pendingAction = nil }
         } message: {
-            if pendingAction?.isFirewall == true &&
-                (pendingAction?.action == "start" || pendingAction?.action == "enable") {
-                Text("请先确保防火墙允许 TCP 27520，否则可能中断 Seraphim 连接。")
-            } else if pendingAction?.action == "uninstall" {
+            if pendingAction?.action == "uninstall" {
                 Text("会先停止并禁用服务。备份选项将完整安装目录移到 /www/seraphim/backup/software，仍占用磁盘空间；彻底卸载会删除目录内的程序、配置和数据。系统依赖包、下载缓存及共享日志保留。")
             }
         }
-    }
-
-    private func firewallCard(_ service: RemoteService) -> some View {
-        Card(title: "防火墙") {
-            InfoRow(label: "服务单元", value: service.name)
-            InfoRow(label: "运行状态", value: service.runningText)
-            InfoRow(label: "开机启动", value: service.startupText)
-            HStack(spacing: 8) {
-                Button("启动") { select(service.name, name: "防火墙", action: "start", isFirewall: true) }
-                    .disabled(working || service.isActive)
-                Button("停止") { select(service.name, name: "防火墙", action: "stop", isFirewall: true) }
-                    .disabled(working || !service.isActive)
-                Button("重启") { select(service.name, name: "防火墙", action: "restart", isFirewall: true) }
-                    .disabled(working)
-                Divider().frame(height: 20)
-                Button("开机启用") { select(service.name, name: "防火墙", action: "enable", isFirewall: true) }
-                    .disabled(working || service.unitState != "disabled")
-                Button("取消开机启用") { select(service.name, name: "防火墙", action: "disable", isFirewall: true) }
-                    .disabled(working || !service.isEnabled)
+        .sheet(item: $logSheet) { sheet in
+            VStack(alignment: .leading, spacing: 12) {
+                Text(verbatim: sheet.title).font(.headline)
+                ScrollView {
+                    Text(verbatim: sheet.content.isEmpty ? "暂无操作日志" : sheet.content)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                Button("关闭") { logSheet = nil }
             }
-            .padding(.top, 6)
+            .padding(16)
+            .frame(minWidth: 650, minHeight: 400)
         }
     }
 
@@ -130,7 +199,7 @@ struct ServerServicesView: View {
                 InfoRow(label: "运行状态", value: item.runningText)
                 InfoRow(label: "开机启动", value: item.enabled ? "已启用" : "未启用")
             } else {
-                Text("运行环境，无常驻服务")
+                Text("没有常驻服务；运行环境的版本在「环境管理」中切换")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -139,27 +208,33 @@ struct ServerServicesView: View {
                     .font(.callout)
                     .foregroundStyle(item.message.hasPrefix("卸载失败") ? Color.orange : Color.secondary)
             }
-            if item.hasService {
-                HStack(spacing: 8) {
-                Button("启动") { select(item.id, name: item.name, action: "start") }
-                    .disabled(working || item.isRunning)
-                Button("停止") { select(item.id, name: item.name, action: "stop") }
-                    .disabled(working || !item.isRunning)
-                Button("重启") { select(item.id, name: item.name, action: "restart") }
+            HStack(spacing: 8) {
+                if item.hasService {
+                    Button("启动") { select(item.id, name: item.name, action: "start") }
+                        .disabled(working || item.isRunning)
+                    Button("停止") { select(item.id, name: item.name, action: "stop") }
+                        .disabled(working || !item.isRunning)
+                    Button("重启") { select(item.id, name: item.name, action: "restart") }
+                        .disabled(working)
+                    Divider().frame(height: 20)
+                    Button(item.enabled ? "取消开机启用" : "开机启用") {
+                        select(item.id, name: item.name, action: item.enabled ? "disable" : "enable")
+                    }
                     .disabled(working)
-                Divider().frame(height: 20)
-                Button(item.enabled ? "取消开机启用" : "开机启用") {
-                    select(item.id, name: item.name, action: item.enabled ? "disable" : "enable")
+                    if !item.credentialPath.isEmpty {
+                        Button("下载初始密码") { downloadInitialPassword(item) }
+                            .disabled(working)
+                    }
                 }
-                .disabled(working)
-                if !item.credentialPath.isEmpty {
-                    Button("下载初始密码") { downloadInitialPassword(item) }
+                Button(item.hasService ? "日志" : "安装日志") { Task { await showLog(item) } }
+                    .disabled(working)
+                if !item.hasService && item.isRuntime {
+                    Button("管理版本") { openEnvironments() }
                         .disabled(working)
                 }
                 Spacer(minLength: 0)
-                }
-                .padding(.top, 6)
             }
+            .padding(.top, 6)
             HStack {
                 Spacer()
                 Button("卸载…", role: .destructive) {
@@ -171,8 +246,8 @@ struct ServerServicesView: View {
         }
     }
 
-    private func select(_ id: String, name: String, action: String, isFirewall: Bool = false) {
-        pendingAction = SoftwareManagementAction(name: name, id: id, action: action, isFirewall: isFirewall)
+    private func select(_ id: String, name: String, action: String) {
+        pendingAction = SoftwareManagementAction(name: name, id: id, action: action)
     }
 
     private var confirmTitle: String {
@@ -193,6 +268,18 @@ struct ServerServicesView: View {
         }
     }
 
+    private func jobStateText(_ state: String) -> String {
+        switch state {
+        case "queued": return "排队中"
+        case "installing": return "安装中"
+        case "uninstalling": return "卸载中"
+        case "cancelling": return "停止中"
+        case "cancelled": return "已停止"
+        case "installed", "not_installed": return "已完成"
+        default: return "失败"
+        }
+    }
+
     @MainActor private func refresh() async {
         guard !working else { return }
         guard !token.isEmpty else {
@@ -202,13 +289,6 @@ struct ServerServicesView: View {
         }
         working = true
         defer { working = false }
-        var errors: [String] = []
-        do {
-            firewall = try await ServerServiceAPI.list(connection: connection, token: token).first
-        } catch {
-            firewall = nil
-            errors.append("防火墙：\(error.localizedDescription)")
-        }
         do {
             software = try await ServerSoftwareAPI.list(connection: connection, token: token)
                 .filter(\.isInstalled)
@@ -216,10 +296,38 @@ struct ServerServicesView: View {
         } catch {
             software = []
             softwareLoadFailed = true
-            errors.append("已安装软件：\(error.localizedDescription)")
+            message = error.localizedDescription
+            hasError = true
+            return
         }
-        hasError = !errors.isEmpty
-        message = errors.joined(separator: "；")
+        do {
+            jobs = try await ServerSoftwareAPI.jobs(connection: connection, token: token)
+        } catch {
+            // 任务列表拿不到不影响软件列表的使用，不再单独报错。
+            jobs = []
+        }
+        message = ""
+        hasError = false
+    }
+
+    @MainActor private func cancel(_ id: String) async {
+        do {
+            try await ServerSoftwareAPI.cancel(connection: connection, token: token, id: id)
+            await refresh()
+        } catch {
+            message = error.localizedDescription
+            hasError = true
+        }
+    }
+
+    @MainActor private func showLog(_ item: RemoteSoftware) async {
+        do {
+            let content = try await ServerSoftwareAPI.log(connection: connection, token: token, id: item.id)
+            logSheet = SoftwareManagementLogSheet(id: item.id, title: "\(item.name) 操作日志", content: content)
+        } catch {
+            message = error.localizedDescription
+            hasError = true
+        }
     }
 
     private func perform(_ selected: SoftwareManagementAction,
@@ -228,10 +336,7 @@ struct ServerServicesView: View {
         working = true
         Task {
             do {
-                if selected.isFirewall {
-                    try await ServerServiceAPI.perform(connection: connection, token: token,
-                                                       name: selected.id, action: selected.action)
-                } else if let uninstallMode {
+                if let uninstallMode {
                     try await ServerSoftwareAPI.uninstall(connection: connection, token: token,
                                                           id: selected.id, mode: uninstallMode)
                 } else {
@@ -241,7 +346,9 @@ struct ServerServicesView: View {
                 working = false
                 await refresh()
                 if !hasError {
-                    message = uninstallMode == nil ? "已执行\(actionLabel(selected.action))" : "卸载任务已开始，请到「软件商店」查看进度"
+                    message = uninstallMode == nil
+                        ? "已执行\(actionLabel(selected.action))"
+                        : "卸载任务已开始，进度显示在本页上方的「卸载任务」中"
                 }
             } catch {
                 working = false

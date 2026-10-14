@@ -38,6 +38,17 @@ func databaseTestAPI(t *testing.T) (*api, *[]string) {
 	dm.run = func(_ context.Context, engine, query, database, password string) (string, error) {
 		queries = append(queries, engine+":"+database+":"+query)
 		switch {
+		case strings.Contains(query, "SELECT 1 FROM mysql.user"):
+			// 只有 takenuser 视作已存在。
+			if strings.Contains(query, "'takenuser'") {
+				return "1\n", nil
+			}
+			return "", nil
+		case strings.Contains(query, "SELECT 1 FROM pg_roles"):
+			if strings.Contains(query, "'takenuser'") {
+				return "1\n", nil
+			}
+			return "", nil
 		case strings.Contains(query, "SHOW DATABASES"):
 			return "information_schema\nappdb\n", nil
 		case strings.Contains(query, "FROM mysql.user"):
@@ -94,6 +105,87 @@ func TestDatabasePasswordsPersistAndMatchAPI(t *testing.T) {
 	}
 	if got := databaseRequest(a, "GET", "/v1/databases/mysql/users/webuser:password", "", true); got.Code != 404 {
 		t.Fatalf("deleted secret revealed: %d", got.Code)
+	}
+}
+
+func TestCreateDatabaseWithUserGrantAndRollback(t *testing.T) {
+	a, queries := databaseTestAPI(t)
+	created := databaseRequest(a, "POST", "/v1/databases/mysql/databases", `{"name":"shopdb","user":"shopuser"}`, true)
+	if created.Code != 201 {
+		t.Fatalf("create with user: %d %s", created.Code, created.Body.String())
+	}
+	var result databaseCreateResponse
+	if err := json.Unmarshal(created.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Database != "shopdb" || result.User != "shopuser" || result.Level != "readwrite" || len(result.Password) != 48 {
+		t.Fatalf("unexpected response: %+v", result)
+	}
+	if got := databaseRequest(a, "GET", "/v1/databases/mysql/users/shopuser:password", "", true); !strings.Contains(got.Body.String(), result.Password) {
+		t.Fatalf("generated password not persisted: %s", got.Body.String())
+	}
+	joined := strings.Join(*queries, "\n")
+	for _, expected := range []string{"CREATE DATABASE `shopdb`", "CREATE USER 'shopuser'@'localhost' IDENTIFIED BY",
+		"GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP ON `shopdb`.* TO 'shopuser'@'localhost'"} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("missing %q in queries: %s", expected, joined)
+		}
+	}
+	// 只给库名时保持旧行为：不建用户、不返回密码。
+	plain := databaseRequest(a, "POST", "/v1/databases/mysql/databases", `{"name":"plaindb"}`, true)
+	if plain.Code != 201 || plain.Body.Len() != 0 {
+		t.Fatalf("plain create: %d %s", plain.Code, plain.Body.String())
+	}
+	// 用户名非法应在建库前挡下。
+	before := len(*queries)
+	if got := databaseRequest(a, "POST", "/v1/databases/mysql/databases", `{"name":"blockeddb","user":"bad user"}`, true).Code; got != 400 {
+		t.Fatalf("invalid user accepted: %d", got)
+	}
+	if len(*queries) != before {
+		t.Fatalf("invalid user still ran queries: %+v", (*queries)[before:])
+	}
+	// 系统用户同样挡在建库之前。
+	before = len(*queries)
+	if got := databaseRequest(a, "POST", "/v1/databases/mysql/databases", `{"name":"blockeddb","user":"root"}`, true).Code; got != 409 {
+		t.Fatalf("protected user accepted: %d", got)
+	}
+	if len(*queries) != before {
+		t.Fatalf("protected user still ran queries: %+v", (*queries)[before:])
+	}
+}
+
+func TestCreateDatabaseWithUserRollsBackOnUserFailure(t *testing.T) {
+	a, queries := databaseTestAPI(t)
+	base := a.databases.run
+	a.databases.run = func(ctx context.Context, engine, query, database, password string) (string, error) {
+		if strings.HasPrefix(query, "CREATE USER") {
+			return "", errors.New("create user failed")
+		}
+		return base(ctx, engine, query, database, password)
+	}
+	response := databaseRequest(a, "POST", "/v1/databases/mysql/databases", `{"name":"rollbackdb","user":"rolluser"}`, true)
+	if response.Code != 409 {
+		t.Fatalf("expected conflict, got %d %s", response.Code, response.Body.String())
+	}
+	joined := strings.Join(*queries, "\n")
+	if !strings.Contains(joined, "DROP DATABASE `rollbackdb`") {
+		t.Fatalf("database not rolled back: %s", joined)
+	}
+	// 账户没建成，就不该去 DROP 它（DROP USER 只会打到别人的账户上）。
+	if strings.Contains(joined, "DROP USER") {
+		t.Fatalf("rolled back a user that was never created: %s", joined)
+	}
+}
+
+func TestCreateDatabaseWithUserRejectsTakenAccount(t *testing.T) {
+	a, queries := databaseTestAPI(t)
+	response := databaseRequest(a, "POST", "/v1/databases/mysql/databases", `{"name":"taken_db","user":"takenuser"}`, true)
+	if response.Code != 409 {
+		t.Fatalf("taken account accepted: %d %s", response.Code, response.Body.String())
+	}
+	joined := strings.Join(*queries, "\n")
+	if strings.Contains(joined, "CREATE DATABASE") || strings.Contains(joined, "DROP USER") {
+		t.Fatalf("taken account path touched existing objects: %s", joined)
 	}
 }
 

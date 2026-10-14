@@ -36,12 +36,9 @@ echo 'SERA_STAGE:安装 PHP 编译依赖'
 sera_packages \
     gcc make pkgconf-pkg-config libxml2-devel sqlite-devel oniguruma-devel \
     openssl-devel libcurl-devel zlib-devel
-if ! getent group seraphim-web >/dev/null 2>&1; then
-    groupadd --system seraphim-web
-fi
-if ! id -u seraphim-web >/dev/null 2>&1; then
-    useradd --system --no-create-home --gid seraphim-web --shell /sbin/nologin seraphim-web
-fi
+# 面板只有两种身份：root 做需要特权的事，sera 跑一切业务进程（PHP-FPM、Web、项目）。
+# PHP 必须以 sera 运行，它才是站点目录的属主、才写得进自己的目录。
+sera_create_user sera
 
 echo 'SERA_STAGE:下载 PHP 官方源码'
 if [ ! -f "$archive" ]; then
@@ -70,7 +67,7 @@ make install
 find "$prefix" -type d -exec chmod 0755 {} +
 chmod 0755 "$prefix/bin/php" "$prefix/sbin/php-fpm"
 install -d -m 0755 "$prefix/etc" "$prefix/etc/conf.d"
-install -d -m 0700 -o seraphim-web -g seraphim-web "$prefix/run" "$root/logs/php"
+install -d -m 0750 -o sera -g sera "$prefix/run" "$root/logs/php"
 cp php.ini-production "$prefix/etc/php.ini"
 cat >> "$prefix/etc/php.ini" <<'CONFIG'
 
@@ -88,8 +85,8 @@ error_log = /www/seraphim/logs/php/php-fpm.log
 daemonize = no
 
 [www]
-user = seraphim-web
-group = seraphim-web
+user = sera
+group = sera
 listen = 127.0.0.1:9000
 pm = ondemand
 pm.max_children = 3
@@ -101,7 +98,7 @@ php_admin_flag[log_errors] = on
 CONFIG
 "$prefix/sbin/php-fpm" -t -y "$prefix/etc/php-fpm.conf" -c "$prefix/etc/php.ini"
 if [ -f "$root/logs/php/php-fpm.log" ]; then
-    chown seraphim-web:seraphim-web "$root/logs/php/php-fpm.log"
+    chown sera:sera "$root/logs/php/php-fpm.log"
     chmod 0600 "$root/logs/php/php-fpm.log"
 fi
 cat > "$unit" <<'UNIT'
@@ -112,8 +109,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=seraphim-web
-Group=seraphim-web
+User=sera
+Group=sera
 ExecStart=/www/seraphim/server/php/sbin/php-fpm --nodaemonize --fpm-config /www/seraphim/server/php/etc/php-fpm.conf --php-ini /www/seraphim/server/php/etc/php.ini
 Restart=on-failure
 RestartSec=3

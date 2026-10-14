@@ -14,19 +14,23 @@ func projectTestAPI(t *testing.T) (*api, *projectManager) {
 	t.Helper()
 	root := t.TempDir()
 	software := newSoftwareManager(root)
-	pm := newProjectManager(root, software)
+	variables := newGlobalVariableManager(root)
+	// 共用文件要交给 sera 组读，测试机上没有这个组，也不该在单测里 chown。
+	variables.own = func(string) error { return nil }
+	pm := newProjectManager(root, software, variables)
 	pm.unitDir = t.TempDir()
 	pm.ensureUser = func() (int, int, error) { return os.Getuid(), os.Getgid(), nil }
 	pm.systemctl = func(_ context.Context, args ...string) ([]byte, error) {
 		switch args[0] {
-		case "is-active":
-			return []byte("inactive\n"), nil
-		case "is-enabled":
-			return []byte("disabled\n"), nil
+		case "show":
+			return []byte("ActiveState=inactive\nSubState=dead\nUnitFileState=disabled\nResult=success\n" +
+				"MainPID=0\nExecMainStatus=0\nNRestarts=0\nMemoryCurrent=[not set]\n" +
+				"ActiveEnterTimestampMonotonic=0\n"), nil
 		default:
 			return nil, nil
 		}
 	}
+	pm.journalRun = func(context.Context, ...string) ([]byte, error) { return nil, nil }
 	for _, runtime := range projectRuntimes {
 		prefix := filepath.Join(root, "server", runtime.ID)
 		binary := filepath.Join(prefix, runtime.Binary)
@@ -40,7 +44,16 @@ func projectTestAPI(t *testing.T) (*api, *projectManager) {
 			t.Fatal(err)
 		}
 	}
-	return &api{token: "secret", software: software, projects: pm}, pm
+	// npm / bun / bundle / go 与主程序同目录，依赖安装测试会用到。
+	for _, tool := range []struct{ runtime, name string }{
+		{"node", "npm"}, {"bun", "bun"}, {"ruby", "bundle"}, {"go", "go"},
+	} {
+		path := filepath.Join(root, "server", tool.runtime, "bin", tool.name)
+		if err := os.WriteFile(path, []byte("#!/bin/sh\ntouch dependency-installed\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return &api{token: "secret", software: software, projects: pm, variables: variables}, pm
 }
 
 func projectRequest(a *api, method, path, body string, authorized bool) *httptest.ResponseRecorder {
@@ -76,17 +89,19 @@ func TestProjectsLifecycleAndIsolation(t *testing.T) {
 	if created.Code != 201 {
 		t.Fatalf("create: %d %s", created.Code, created.Body.String())
 	}
-	for _, path := range []string{filepath.Join(pm.root, "projects"), pm.projectDir("demo")} {
-		info, err := os.Stat(path)
-		if err != nil || info.Mode().Perm() != 0755 {
-			t.Fatalf("project path not traversable: %s %v %v", path, info, err)
-		}
+	// 上级目录必须可遍历（每个项目账户都要走到自己的工程目录），
+	// 而工程目录本身不对同机其他项目账户开放。
+	if info, err := os.Stat(filepath.Join(pm.root, "projects")); err != nil || info.Mode().Perm() != 0755 {
+		t.Fatalf("projects root not traversable: %v %v", info, err)
+	}
+	if info, err := os.Stat(pm.projectDir("demo")); err != nil || info.Mode().Perm() != 0750 {
+		t.Fatalf("project directory should be private: %v %v", info, err)
 	}
 	unit, err := os.ReadFile(pm.unitPath("demo"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{"User=sera-project", "ProtectSystem=strict", "ReadWritePaths=", "Environment=PORT=3000", "bin/python3", "StandardOutput=append:"} {
+	for _, expected := range []string{"User=sera\n", "Group=sera\n", "ProtectSystem=strict", "ReadWritePaths=", "Environment=PORT=3000", "bin/python3", "StandardOutput=append:"} {
 		if !strings.Contains(string(unit), expected) {
 			t.Fatalf("unit missing %q: %s", expected, unit)
 		}
@@ -348,5 +363,94 @@ func TestPythonWSGIServersValidateAndGenerateUnits(t *testing.T) {
 		if !strings.Contains(string(unit), expected) {
 			t.Fatalf("uWSGI unit missing %q: %s", expected, unit)
 		}
+	}
+}
+
+func TestSharedAccountNameIsUsableAsServiceAccount(t *testing.T) {
+	// 项目和网站都跑在这一个账户下，账户名必须能通过校验：单元里的 User= 直接用它。
+	if len(sharedAccount) > maxAccountName || !accountNamePattern.MatchString(sharedAccount) {
+		t.Fatalf("共享运行账户名不合法：%q", sharedAccount)
+	}
+}
+
+func TestProjectDirectoryRecordsItsAccount(t *testing.T) {
+	_, pm := projectTestAPI(t)
+	if err := pm.prepareDirectories("demo"); err != nil {
+		t.Fatal(err)
+	}
+	dir := pm.projectDir("demo")
+	info, err := os.Stat(dir)
+	if err != nil || info.Mode().Perm() != 0750 {
+		t.Fatalf("工程目录权限：%v %v", info, err)
+	}
+	marker := filepath.Join(dir, projectAccountMarker)
+	read := func() string {
+		data, err := os.ReadFile(marker)
+		if err != nil {
+			t.Fatalf("读取迁移标记：%v", err)
+		}
+		return strings.TrimSpace(string(data))
+	}
+	if got := read(); got != sharedAccount {
+		t.Fatalf("迁移标记：%q", got)
+	}
+	// 重复调用必须幂等。
+	if err := pm.prepareDirectories("demo"); err != nil {
+		t.Fatal(err)
+	}
+	// 标记丢失（从早期版本升级）时必须重新迁移并写回。
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	if err := pm.prepareDirectories("demo"); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(); got != sharedAccount {
+		t.Fatalf("标记未恢复：%q", got)
+	}
+}
+
+func TestReconcileUnitAccountUpgradesLegacyUnit(t *testing.T) {
+	a, pm := projectTestAPI(t)
+	if got := projectRequest(a, "POST", "/v1/projects", `{"id":"legacy","name":"Legacy","runtime":"python","entry":"main.py","port":3000}`, true).Code; got != 201 {
+		t.Fatalf("create: %d", got)
+	}
+	item, err := pm.read("legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 模拟上一版写下的单元：每个项目一个专属账户。现在统一回共享账户，
+	// 单元若不跟着改写，服务就会带着已经不存在的账户启动，读不到自己的数据目录。
+	legacy := strings.ReplaceAll(string(pm.unit(item)), "User="+sharedAccount+"\n", "User=sera-project-legacy\n")
+	legacy = strings.ReplaceAll(legacy, "Group="+sharedAccount+"\n", "Group=sera-project-legacy\n")
+	if err := os.WriteFile(pm.unitPath("legacy"), []byte(legacy), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := pm.reconcileUnitAccount(context.Background(), item); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := os.ReadFile(pm.unitPath("legacy"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"User=sera\n", "Group=sera\n"} {
+		if !strings.Contains(string(updated), expected) {
+			t.Fatalf("单元没有跟着账户迁移，缺少 %q：\n%s", expected, updated)
+		}
+	}
+	// 已经一致时保持稳定，不重复改写。
+	before, err := os.Stat(pm.unitPath("legacy"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pm.reconcileUnitAccount(context.Background(), item); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(pm.unitPath("legacy"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatal("账户未变化时不应重写单元")
 	}
 }

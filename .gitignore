@@ -1,3 +1,12 @@
 .DS_Store
 build/
 *.bak
+
+# 编译产物：服务端二进制在构建时生成，不入库
+server-status/sera
+
+# 本地测试服务器凭据，不入库
+test_server.txt
+
+# 本地工作记忆
+.workbuddy/

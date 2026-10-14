@@ -15,30 +15,62 @@ const tag = (text, good = false) => `<span class="tag ${good ? 'good' : ''}">${e
 const row = (left, right = '') => `<div class="row"><div class="grow">${left}</div><div class="actions">${right}</div></div>`;
 const card = (title, body, actions = '') => `<section class="card"><div class="card-header"><h2>${esc(title)}</h2><div class="actions">${actions}</div></div>${body}</section>`;
 const list = (data) => Array.isArray(data) ? data : (data?.items || []);
+// 剪贴板在部分环境下会被拒绝，失败了不要静默，至少把内容告诉用户。
+async function copyText(text, success) {
+  if (!text) return '没有可复制的内容';
+  try {
+    await navigator.clipboard.writeText(text);
+    return success;
+  } catch {
+    return `无法访问剪贴板，请手动复制：${text}`;
+  }
+}
+// 属主列显示成「所有者:用户组」，两者相同时只显示所有者。
+const ownerLabel = (file) => !file?.owner ? '—'
+  : (file.group && file.group !== file.owner ? `${file.owner}:${file.group}` : file.owner);
+// 证书里的域名是否覆盖某个主机名：精确匹配或单层通配（*.example.com）。
+const hostMatches = (host, rule) => {
+  const name = String(host || '').toLowerCase().replace(/^\.+|\.+$/g, '');
+  const pattern = String(rule || '').toLowerCase().replace(/^\.+|\.+$/g, '');
+  if (!name || !pattern) return false;
+  if (name === pattern) return true;
+  if (!pattern.startsWith('*.')) return false;
+  const suffix = pattern.slice(1);
+  if (!name.endsWith(suffix)) return false;
+  const label = name.slice(0, -suffix.length);
+  return label.length > 0 && !label.includes('.');
+};
 
 const groups = [
   ['概览', [['status', '服务器状态']]],
   ['站点与数据', [['files', '文件管理'], ['domains', '域名管理'], ['sites', '网站管理'], ['projects', '项目管理'], ['databases', '数据库管理']]],
-  ['运行与安全', [['services', '软件管理'], ['environments', '环境管理'], ['firewall', '防火墙'], ['tasks', '计划任务'], ['store', '软件商店']]],
+  ['运行与安全', [['services', '软件管理'], ['environments', '环境管理'], ['variables', '环境变量管理'], ['store', '软件商店'], ['firewall', '防火墙'], ['tasks', '计划任务'], ['api', 'API 设置']]],
   ['部署', [['installer', '安装服务端']]]
 ];
 const titles = Object.fromEntries(groups.flatMap(([group, items]) => items.map(([id, title]) => [id, [group, title]])));
 const subtitles = {
   status: '查看服务器实时状态。桌面客户端通过 HTTPS API 通信。',
-  files: '浏览服务器文件系统；默认位于 /www/seraphim。',
+  files: '浏览服务器文件系统；默认位于 /www/seraphim，可查看并修改权限与所有者。',
   domains: '管理域名解析与证书。',
-  sites: '管理 Nginx、Apache 和 OpenResty 网站。',
-  projects: '管理 Python、Node.js、Go 等常驻项目。',
+  sites: '管理 Nginx、Apache 和 OpenResty 网站；在本机申请的证书可就地部署到网站并启用 HTTPS。',
+  projects: '管理 Python、Node.js、Go 等常驻项目；启动失败时给出自检清单、依赖状态与日志。',
+  variables: '面板统一保管的一份公用变量；项目勾上才加载，代码也可以直接读服务器上导出的共用文件。',
+  api: '面板的接口列表和一把能直接用的 key；脚本与 AI 客户端都从这里接进来。',
   databases: '查看数据库实例并管理库、用户与权限。',
-  services: '查看服务状态，控制运行与开机启动。',
+  services: '只管理已安装软件：运行状态、开机启动、日志与卸载。',
   environments: '动态读取可安装版本，管理独立安装的运行环境。',
-  firewall: '查看与修改 TCP/UDP 入站端口规则。',
+  firewall: '管理防火墙服务的启停与入站端口规则。',
   tasks: '创建每小时、每天或每周执行的计划任务。',
-  store: '安装或卸载服务器软件；详细管理位于软件管理。',
+  store: '浏览软件目录并安装；装好后到软件管理操作。',
   installer: '通过 SSH 自动安装，或导出安装文件在服务器命令行部署。'
 };
 const S = { section: 'status', doc: { entries: [], selectedID: '' }, data: null, filePath: '/www/seraphim',
-  expanded: new Set(), versions: {}, selectedDatabase: '', catalog: null, acl: null, busy: false };
+  expanded: new Set(), versions: {}, selectedDatabase: '', catalog: null, acl: null, busy: false,
+  // globalVariables 只在项目管理页用到：编辑项目时要告诉用户会加载哪些值。
+  globalVariables: [], searchServices: '', filterServices: 'all' };
+
+// 这些运行时由「环境管理」按版本安装，软件商店只给入口，避免同一个运行时两处可装。
+const RUNTIME_IDS = new Set(['python', 'go', 'node', 'openjdk', 'dotnet', 'ruby', 'bun', 'deno', 'php']);
 let modalRevision = 0;
 
 function setNotice(message = '', error = false) {
@@ -70,11 +102,14 @@ function modal(title, fields, submit, label = '保存') {
     else if (field.type === 'checkbox') control = `<input id="${id}" name="${esc(field.name)}" type="checkbox" ${field.value ? 'checked' : ''}>`;
     else control = `<input id="${id}" name="${esc(field.name)}" type="${field.type || 'text'}" value="${esc(field.value)}" placeholder="${esc(field.placeholder)}" ${field.required ? 'required' : ''} ${field.disabled ? 'disabled' : ''}>`;
     if (field.browse) control = `<div class="inline">${control}<button type="button" class="secondary" data-browse="${esc(field.browse)}">选择…</button></div>`;
+    // 端口这类字段给一个「让服务器挑个没被占用的」按钮，省得自己去猜。
+    if (field.port) control = `<div class="inline">${control}<button type="button" class="secondary" data-free-port>选择空闲端口</button></div>`;
     return `<div class="field ${field.full ? 'full' : ''}"><label for="${id}">${esc(field.label)}</label>${control}</div>`;
   }).join('')}</div><p class="help" id="modal-error"></p></div>`;
   $('#modal-submit').textContent = label;
   $('#modal-submit').hidden = !submit;
   const dialog = $('#modal');
+  dialog.onclose = null;
   $('#modal-cancel').onclick = () => dialog.close();
   $('#modal-form').onsubmit = async (event) => {
     event.preventDefault();
@@ -95,6 +130,9 @@ function info(title, content) {
   if ($('#modal').open) $('#modal').close();
   $('#modal-content').innerHTML = `<div class="dialog-body"><h2>${esc(title)}</h2><div class="code">${esc(content)}</div></div>`;
   $('#modal-submit').hidden = true;
+  // 表单是 method="dialog"，残留的 onsubmit 会让回车键把窗口关掉。
+  $('#modal-form').onsubmit = (event) => event.preventDefault();
+  $('#modal').onclose = null;
   $('#modal-cancel').onclick = () => $('#modal').close();
   $('#modal').showModal();
 }
@@ -139,6 +177,8 @@ let refreshRevision = 0;
 async function refresh(clearNotice = true) {
   const revision = ++refreshRevision;
   const section = S.section;
+  // 离开变量页就不再显示上一次的保存结果。
+  if (section !== 'variables') S.variablesNotice = '';
   if (clearNotice) setNotice();
   renderChrome();
   if (!selectedConnection() && !['installer', 'domains'].includes(S.section)) {
@@ -163,11 +203,21 @@ const loaders = {
   status: async () => { S.data = await api('status'); },
   files: async () => { S.data = await api('files.list', { path: S.filePath }); S.filePath = S.data.path; },
   sites: async () => { S.data = await api('sites.list'); },
-  projects: async () => { S.data = await api('projects.list'); },
+  projects: async () => {
+    // 变量表读失败不该让整个项目管理打不开，单独兜住。
+    const [listing, variables] = await Promise.all([
+      api('projects.list'),
+      api('variables.get').catch(() => ({ variables: [] }))
+    ]);
+    S.data = listing;
+    S.globalVariables = variables.variables || [];
+  },
+  variables: async () => { S.data = await api('variables.get'); },
+  api: async () => { S.data = await api('api.doc'); },
   environments: async () => { S.data = await api('environments.list'); },
-  services: async () => { S.data = await Promise.all([api('software.list'), api('services.list')]); },
+  services: async () => { S.data = await Promise.all([api('software.list'), api('software.jobs')]); },
   store: async () => { S.data = await Promise.all([api('software.list'), api('software.jobs')]); },
-  firewall: async () => { S.data = await api('firewall.get'); },
+  firewall: async () => { S.data = await Promise.all([api('firewall.get'), api('services.list')]); },
   tasks: async () => { S.data = await api('tasks.list'); },
   databases: async () => {
     S.data = await api('databases.list');
@@ -209,7 +259,7 @@ renders.files = () => {
   const entries = S.data.entries || [];
   $('#content').innerHTML = `<div class="toolbar"><button class="secondary" data-action="files.up">上一级</button><input id="file-path" aria-label="服务器路径" value="${esc(S.filePath)}"><button class="secondary" data-action="files.go">前往</button><button data-action="files.mkdir">新建文件夹</button><button class="secondary" data-action="files.touch">新建文件</button><button class="secondary" data-action="files.upload-file">上传文件</button><button class="secondary" data-action="files.upload-folder">上传文件夹</button></div>
     <div class="file-drop-hint">也可以把文件或文件夹拖到这里上传，保留文件夹结构和空目录。</div>
-    <section class="card"><table class="table"><thead><tr><th>名称</th><th>权限</th><th>大小</th><th>修改时间</th><th></th></tr></thead><tbody>${entries.map((file, index) => `<tr><td>${file.kind === 'directory' ? '📁' : '📄'} <button class="linklike mono" data-action="files.open" data-index="${index}">${esc(file.name)}</button></td><td class="mono">${esc(file.permissions || '—')}</td><td>${file.kind === 'directory' ? '—' : fmtBytes(file.size_bytes)}</td><td>${esc((file.modified_at || '').replace('T', ' ').slice(0, 16))}</td><td class="actions-cell"><div class="actions">${file.kind === 'directory' ? button('进入', 'files.open', `data-index="${index}"`) : button('下载', 'files.download', `data-index="${index}"`)}${button('重命名', 'files.rename', `data-index="${index}"`)}${button('权限', 'files.chmod', `data-index="${index}"`)}${button('删除', 'files.delete', `data-index="${index}"`, 'danger')}</div></td></tr>`).join('')}</tbody></table>${entries.length ? '' : empty('此目录为空')}</section>`;
+    <section class="card"><table class="table"><thead><tr><th>名称</th><th>权限</th><th>所有者</th><th>大小</th><th>修改时间</th><th></th></tr></thead><tbody>${entries.map((file, index) => `<tr><td>${file.kind === 'directory' ? '📁' : '📄'} <button class="linklike mono" data-action="files.open" data-index="${index}">${esc(file.name)}</button></td><td class="mono">${esc(file.permissions || '—')}</td><td class="mono"><button class="linklike" data-action="files.owner" data-index="${index}">${esc(ownerLabel(file))}</button></td><td>${file.kind === 'directory' ? '—' : fmtBytes(file.size_bytes)}</td><td>${esc((file.modified_at || '').replace('T', ' ').slice(0, 16))}</td><td class="actions-cell"><div class="actions">${file.kind === 'directory' ? button('进入', 'files.open', `data-index="${index}"`) : button('下载', 'files.download', `data-index="${index}"`)}${button('重命名', 'files.rename', `data-index="${index}"`)}${button('权限', 'files.chmod', `data-index="${index}"`)}${button('属主', 'files.owner', `data-index="${index}"`)}${button('删除', 'files.delete', `data-index="${index}"`, 'danger')}</div></td></tr>`).join('')}</tbody></table>${entries.length ? '' : empty('此目录为空')}</section>`;
 };
 
 async function beginFileUpload(chosen) {
@@ -261,6 +311,18 @@ async function fileAction(action, index) {
       await api('files.command', { operation: 'chmod', path: file.path, permissions });
       await refresh(false);
     });
+  } else if (action === 'files.owner') {
+    const fields = [
+      { name: 'owner', label: '所有者（账户名或 UID）', value: file.owner || '', placeholder: '留空表示不变' },
+      { name: 'group', label: '用户组（组名或 GID）', value: file.group || '', placeholder: '留空表示不变' }
+    ];
+    if (file.kind === 'directory') fields.push({ name: 'recursive', label: '同时应用到目录内的全部内容', type: 'checkbox', value: true });
+    modal('修改所有者', fields, async (values) => {
+      const owner = (values.owner || '').trim(), group = (values.group || '').trim();
+      if (!owner && !group) throw new Error('请填写所有者或用户组；空着的那一项保持不变');
+      await api('files.command', { operation: 'chown', path: file.path, owner, group, recursive: !!values.recursive });
+      await refresh(false);
+    });
   } else if (action === 'files.delete') {
     if (confirm(`删除 ${file.path}${file.kind === 'directory' ? ' 及其中所有内容' : ''}？`))
       await mutate('files.delete', { path: file.path, recursive: file.kind === 'directory' }, '文件已删除');
@@ -271,7 +333,7 @@ renders.sites = () => {
   $('#page-actions').innerHTML = '<button data-action="sites.new">新建网站</button>';
   const sites = list(S.data), providers = S.data.providers || [];
   $('#content').innerHTML = `${card('Web 服务', providers.map((provider) => row(`<strong>${esc(provider.name)}</strong> ${tag(provider.installed ? (provider.running ? '运行中' : '已停止') : '未安装', provider.running)} <span class="small muted">端口 ${esc(provider.port)}</span>`)).join('') || empty('没有可用的 Web 服务'))}
-    ${sites.map((site, index) => card(site.domains?.[0] || site.id, `<div class="inline">${tag(site.provider)} ${tag(site.kind === 'proxy' ? '反向代理' : site.kind === 'php' ? `PHP ${site.php_version || ''}` : '静态网站')} ${tag(site.enabled ? '已启用' : '已停用', site.enabled)}</div><dl class="kv"><dt>域名</dt><dd>${esc((site.domains || []).join('、'))}</dd><dt>目录</dt><dd class="mono">${esc(site.root)}</dd>${site.kind === 'proxy' ? `<dt>上游</dt><dd class="mono">${esc(site.upstream)}</dd>` : ''}</dl>`, `${button('编辑', 'sites.edit', `data-index="${index}"`)}${button(site.enabled ? '停用' : '启用', 'sites.toggle', `data-index="${index}"`)}${site.kind !== 'proxy' ? button('文件', 'sites.files', `data-index="${index}"`) : ''}${button('删除', 'sites.delete', `data-index="${index}"`, 'danger')}`)).join('') || empty('尚无网站')}`;
+    ${sites.map((site, index) => card(site.domains?.[0] || site.id, `<div class="inline">${tag(site.provider)} ${tag(site.kind === 'proxy' ? '反向代理' : site.kind === 'php' ? `PHP ${site.php_version || ''}` : '静态网站')} ${tag(site.enabled ? '已启用' : '已停用', site.enabled)} ${site.tls ? tag(site.tls_expires_at ? `HTTPS 至 ${esc(String(site.tls_expires_at).slice(0, 10))}` : 'HTTPS 443', true) : tag('未部署证书')}</div><dl class="kv"><dt>域名</dt><dd>${esc((site.domains || []).join('、'))}</dd><dt>目录</dt><dd class="mono">${esc(site.root)}</dd>${site.kind === 'proxy' ? `<dt>上游</dt><dd class="mono">${esc(site.upstream)}</dd>` : ''}</dl>`, `${button(site.tls ? '更换证书' : '部署证书', 'sites.cert', `data-index="${index}"`)}${button('编辑', 'sites.edit', `data-index="${index}"`)}${button(site.enabled ? '停用' : '启用', 'sites.toggle', `data-index="${index}"`)}${site.kind !== 'proxy' ? button('文件', 'sites.files', `data-index="${index}"`) : ''}${button('删除', 'sites.delete', `data-index="${index}"`, 'danger')}`)).join('') || empty('尚无网站')}`;
 };
 function siteForm(site) {
   const installed = (S.data.providers || []).filter((provider) => provider.installed);
@@ -310,21 +372,270 @@ async function siteAction(action, index) {
       php_version: site.php_version || '',
       enabled: !site.enabled } }, site.enabled ? '网站已停用' : '网站已启用');
   else if (action === 'sites.files') { S.filePath = site.root; S.section = 'files'; await refresh(); }
+  else if (action === 'sites.cert') {
+    if (!site.enabled) throw new Error('网站已停用，请先启用再部署证书');
+    const certificates = await window.sera.certificates();
+    S.certificates = certificates;
+    if (!certificates.length) throw new Error('本机还没有已签发的证书；请先到「域名管理」申请');
+    const covering = certificates.filter((cert) =>
+      (site.domains || []).every((domain) => (cert.domains || []).some((rule) => hostMatches(domain, rule))));
+    const ordered = [...covering, ...certificates.filter((cert) => !covering.includes(cert))];
+    modal(`部署证书到 ${site.domains?.[0] || site.id}`, [{ name: 'certificate', label: '本机已签发的证书', type: 'select',
+      options: ordered.map((cert) => [cert.id, `${cert.domains.join('、')} · 续期 ${String(cert.notAfter || '').slice(0, 10)}`
+        + (covering.includes(cert) ? '' : '（未覆盖本站域名）')]) }],
+    async ({ certificate }) => {
+      await window.sera.deployCertificate(certificate, site.provider, site.id);
+      await refresh(false);
+      setNotice('证书已部署，网站 HTTPS 已启用');
+    }, '部署');
+  }
   else if (action === 'sites.delete' && confirm(`删除 ${site.domains?.[0] || site.id} 的网站配置？网站文件会保留。`))
     await mutate('sites.delete', { provider: site.provider, id: site.id }, '网站配置已删除');
 }
 
 const defaultEntries = { python: 'main.py', node: 'index.js', go: '.', openjdk: 'app.jar', dotnet: 'app.dll',
   ruby: 'app.rb', bun: 'index.ts', deno: 'main.ts' };
+
+// systemd 在「起了又崩」时 ActiveState 仍是 activating/active，只看它就等于把崩溃
+// 显示成「运行中」。子状态与 Result 才是真相。
+const projectStateLabel = (project) => project.sub_state === 'auto-restart' ? '反复重启'
+  : ({ active: '运行中', inactive: '已停止', failed: '启动失败', activating: '启动中',
+       deactivating: '停止中' }[project.active_state] || '状态未知');
+const projectFailureText = (project) => {
+  if (project.sub_state === 'auto-restart') return '进程反复退出，systemd 正在自动重启';
+  const reason = { 'exit-code': '启动后立即退出', signal: '被信号终止', timeout: '启动超时',
+    'start-limit-hit': '连续失败次数过多，已放弃重启' }[project.result];
+  if (reason) return project.exit_status > 0 ? `${reason}（退出码 ${project.exit_status}）` : reason;
+  return project.active_state === 'failed' ? '启动未成功' : '';
+};
+// Python 项目的启动方式：服务端用 python_server 区分 uvicorn / uwsgi / gunicorn / 直接跑。
+// 取值要和 macOS 客户端的 serverLabel 保持一致。
+const projectServerLabel = (project) => ({
+  gunicorn: 'Gunicorn', uwsgi: 'uWSGI', uvicorn: 'Uvicorn'
+}[project.python_server] || '直接运行');
+const projectStartupText = (project) => {
+  if (project.runtime !== 'python') return project.entry;
+  const server = projectServerLabel(project);
+  if (server === '直接运行') return `直接运行 ${project.entry}`;
+  const worker = project.python_server === 'gunicorn'
+    ? ` · ${project.python_worker || (project.python_threads > 1 ? 'gthread' : 'sync')} worker` : '';
+  return `${server} · ${project.python_callable || 'app'} · ${project.python_workers || 2} 进程${worker}`;
+};
+const fmtUptime = (value) => {
+  let seconds = Math.max(0, Math.floor(Number(value) || 0));
+  if (!seconds) return '';
+  const units = [[86400, '天'], [3600, '小时'], [60, '分钟'], [1, '秒']];
+  const parts = [];
+  for (const [size, label] of units) {
+    if (parts.length === 2) break;
+    if (seconds >= size) { parts.push(`${Math.floor(seconds / size)}${label}`); seconds %= size; }
+  }
+  return parts.join(' ');
+};
+// 卡片上的动作太多会糊成一片，主操作留在外面，其余收进「更多」浮层。
+const actionMenu = (label, items) => `<details class="menu"><summary>${esc(label)} ▾</summary><div class="menu-body">${items.filter(Boolean).join('')}</div></details>`;
 renders.projects = () => {
   $('#page-actions').innerHTML = '<button data-action="projects.new">新建项目</button>';
   const projects = list(S.data), runtimes = S.data.runtimes || [];
   $('#content').innerHTML = projects.map((project, index) => {
     const runtime = runtimes.find((item) => item.id === project.runtime);
-    return card(project.name, `<div class="inline">${tag(project.active_state === 'active' ? '运行中' : project.active_state === 'failed' ? '启动失败' : '已停止', project.active_state === 'active')} ${tag(project.enabled ? '开机启动' : '不自启')} ${tag(`${runtime?.name || project.runtime} ${project.runtime_version || ''}`)} ${!project.runtime_ready ? tag('运行环境缺失') : ''} ${project.use_venv && !project.venv_ready ? tag('虚拟环境未就绪') : ''} ${project.server_ready === false ? tag('启动器未安装') : ''}</div><dl class="kv"><dt>工程目录</dt><dd class="mono">${esc(project.directory)}</dd><dt>入口</dt><dd class="mono">${esc(project.entry)}</dd>${project.runtime === 'python' ? `<dt>启动方式</dt><dd>${esc(project.python_server === 'uwsgi' ? 'uWSGI' : project.python_server === 'uvicorn' ? 'Uvicorn' : project.python_server === 'gunicorn' ? 'Gunicorn' : '直接运行')}${project.python_server && project.python_server !== 'direct' ? ` · ${esc(project.python_callable || 'app')} · ${esc(project.python_workers || 2)} 进程${project.python_server === 'gunicorn' ? ` · ${esc(project.python_worker || (project.python_threads > 1 ? 'gthread' : 'sync'))} worker` : ''}` : ''}</dd>` : ''}<dt>端口</dt><dd>${esc(project.port || '未指定')}</dd></dl>`,
-      `${button('编辑', 'projects.edit', `data-index="${index}"`)}${button('文件', 'projects.files', `data-index="${index}"`)}${button('日志', 'projects.log', `data-index="${index}"`)}${project.use_venv ? button(project.venv_ready ? '安装依赖' : '创建虚拟环境', 'projects.venv', `data-index="${index}"`) : ''}${project.runtime === 'python' && project.python_server && project.python_server !== 'direct' && project.venv_ready && project.server_ready === false ? button(`安装 ${project.python_server === 'uwsgi' ? 'uWSGI' : project.python_server === 'uvicorn' ? 'Uvicorn' : 'Gunicorn'}`, 'projects.server', `data-index="${index}"`) : ''}${button(project.active_state === 'active' ? '停止' : '启动', 'projects.toggle', `data-index="${index}"`)}${project.active_state === 'active' ? button('重启', 'projects.restart', `data-index="${index}"`) : ''}${button(project.enabled ? '取消自启' : '开机自启', 'projects.enable', `data-index="${index}"`)}${button('删除', 'projects.delete', `data-index="${index}"`, 'danger')}`);
+    const failure = projectFailureText(project);
+    const running = project.active_state === 'active';
+    const startable = project.runtime_ready && (!project.use_venv || project.venv_ready) && project.server_ready !== false;
+    const runtimeInfo = [
+      project.main_pid > 0 ? `PID ${project.main_pid}` : '',
+      project.memory_bytes > 0 ? `内存 ${fmtBytes(project.memory_bytes)}` : '',
+      running && project.uptime_seconds > 0 ? `已运行 ${fmtUptime(project.uptime_seconds)}` : '',
+      project.restarts > 0 ? `已重启 ${project.restarts} 次` : ''
+    ].filter(Boolean).join(' · ');
+    const envRows = Object.entries(project.env || {})
+      .map(([key, value]) => `<dt>${esc(key)}</dt><dd class="mono">${esc(value)}</dd>`).join('')
+      + (project.env_file ? '<dt>环境文件</dt><dd class="mono">工程目录下的 .env</dd>' : '');
+    // 面板那份公用变量：默认不加载，勾上的项目才会读到；不加载就不占地方。
+    const inheritedRow = project.use_global_env === true
+      ? `<dt>面板环境变量</dt><dd class="muted">已加载「环境变量管理」里的值（同名以项目自己的为准） · <a href="#" data-action="variables.goto">打开环境变量管理</a></dd>`
+      : '';
+    const pythonDetail = project.runtime === 'python'
+      ? `<dt>启动方式</dt><dd>${esc(projectStartupText(project))}</dd>` : '';
+    const dependencyLine = dependencyCardText(project.dependency);
+    const dependencyRow = dependencyLine
+      ? `<dt>依赖清单</dt><dd>${esc(dependencyLine)}</dd>` : '';
+    const actions = `${button('详情', 'projects.detail', `data-index="${index}"`)}${button(running ? '停止' : '启动', 'projects.toggle', `data-index="${index}"`)}${running ? button('重启', 'projects.restart', `data-index="${index}"`) : ''}${actionMenu('更多', [
+      button('编辑配置', 'projects.edit', `data-index="${index}"`),
+      button('打开工程目录', 'projects.files', `data-index="${index}"`),
+      button('查看日志', 'projects.log', `data-index="${index}"`),
+      button('安装依赖', 'projects.deps', `data-index="${index}"`),
+      project.use_venv && !project.venv_ready ? button('创建虚拟环境', 'projects.venv', `data-index="${index}"`) : '',
+      project.runtime === 'python' && project.python_server && project.python_server !== 'direct' && project.venv_ready && project.server_ready === false
+        ? button(`安装 ${projectServerLabel(project)}`, 'projects.server', `data-index="${index}"`) : '',
+      button(project.enabled ? '取消开机自启' : '开机自启', 'projects.enable', `data-index="${index}"`),
+      project.port > 0 ? button('复制反向代理地址', 'projects.proxy', `data-index="${index}"`) : '',
+      button('清空日志…', 'projects.clearlog', `data-index="${index}"`),
+      button('删除', 'projects.delete', `data-index="${index}"`, 'danger')
+    ])}`;
+    return card(project.name, `<div class="inline">${tag(projectStateLabel(project), running && project.sub_state !== 'auto-restart')} ${tag(project.enabled ? '开机启动' : '不自启')} ${tag(`${runtime?.name || project.runtime} ${project.runtime_version || ''}`)} ${!project.runtime_ready ? tag('运行环境缺失') : ''} ${project.use_venv && !project.venv_ready ? tag('虚拟环境未就绪') : ''} ${project.server_ready === false ? tag('启动器未安装') : ''} ${project.port_busy ? tag('端口被占用') : ''} ${!running && !startable ? tag('环境未就绪，直接启动会失败') : ''}</div>${failure ? `<p class="help">${esc(failure)} · 点「详情」看启动自检和系统日志</p>` : ''}<dl class="kv"><dt>工程目录</dt><dd class="mono">${esc(project.directory)}</dd><dt>入口</dt><dd class="mono">${esc(project.entry)}</dd>${dependencyRow}${pythonDetail}<dt>端口</dt><dd>${esc(project.port || '未指定')}${project.port_busy ? '（已被其他进程占用）' : ''}</dd>${runtimeInfo ? `<dt>运行信息</dt><dd>${esc(runtimeInfo)}</dd>` : ''}${inheritedRow}${envRows}</dl>`, actions);
   }).join('') || empty('尚无服务器项目；可先上传项目文件，再创建项目配置');
 };
+// 环境变量管理：面板统一保管的一份公用变量。它不是某个项目的设置——面板只负责
+// 存，谁读、读哪几个由使用方决定：项目可以勾上加载，也可以让代码直接读导出的文件。
+renders.variables = () => {
+  const variables = S.data?.variables || [];
+  const file = S.data?.file || '';
+  const text = variables.map((item) => `${item.name}=${item.value}`).join('\n');
+  const updated = S.data?.updated_at ? S.data.updated_at.replace('T', ' ').slice(0, 16) : '';
+  $('#page-actions').innerHTML = '';
+  $('#content').innerHTML = `<section class="card">
+    <div class="card-header"><h2>怎么取用</h2></div>
+    <dl class="kv">
+      <dt>项目读取</dt><dd>在项目里勾上「加载面板环境变量」，值会写进它的 systemd 单元；同名时以项目自己填的为准。不勾就完全不碰这个项目。</dd>
+      <dt>代码读取</dt><dd class="mono">${file ? esc(file) : '（暂未获取到路径）'}</dd>
+      ${file ? `<dt>用法</dt><dd class="mono">shell：. ${esc(file)}<br>代码：每行一个 KEY=VALUE，# 开头是注释</dd>` : ''}
+      <dt>权限</dt><dd>文件属组 sera、权限 0640：项目进程与 Web 服务能读，其他本地用户读不到。</dd>
+      <dt>计划任务</dt><dd>执行命令时会带上同一份值，脚本和常驻服务看到的东西一致。</dd>
+    </dl>
+    <p class="help">端口、PATH、虚拟环境这类由面板按项目分配，不能定义在这里。</p>
+  </section>
+  <section class="card" style="margin-top:12px">
+    <div class="card-header"><h2>变量</h2><div class="actions">${button('保存', 'variables.save')}</div></div>
+    ${S.variablesNotice ? `<p class="help">${esc(S.variablesNotice)}</p>` : ''}
+    <div class="field full"><label for="variables-text">每行一个 KEY=VALUE，# 开头为注释</label>
+    <textarea id="variables-text" class="mono" rows="14" spellcheck="false" placeholder="PROJECT_RUNTIME=dev&#10;API_BASE=https://example.test">${esc(text)}</textarea></div>
+    <p class="help">共 ${variables.length} 项${updated ? ` · 最后更新 ${esc(updated)}` : ''}。保存会同时更新共用文件；勾了加载的项目会被同步并重启一次，没勾的项目不会被动到。</p>
+  </section>`;
+};
+// API 设置：接口列表 + 一把给脚本与 AI 用的 key。
+//
+// 这把 key 是服务端单独存的一把（config/api-key），和面板连服务器用的凭据
+// 不是同一个，所以这里能重置：脚本泄露就换掉它，已连上的面板不受影响。
+// key 只由服务端生成，页面上没有填写框。
+renders.api = () => {
+  const doc = S.data || {};
+  const sections = Array.isArray(doc.sections) ? doc.sections : [];
+  const mcp = doc.mcp || {};
+  const tools = Array.isArray(mcp.tools) ? mcp.tools : [];
+  const total = sections.reduce((sum, section) => sum + (section.endpoints || []).length, 0);
+  const endpoints = sections.map((section) => `
+    <h3>${esc(section.name)}</h3>
+    <dl class="kv">${(section.endpoints || []).map((endpoint) => `
+      <dt class="mono">${esc(endpoint.method)} ${esc(endpoint.path)}</dt>
+      <dd>${esc(endpoint.summary)}${endpoint.example
+        ? `<pre class="code">${esc(endpoint.example)}</pre>` : ''}</dd>`).join('')}
+    </dl>`).join('');
+  const curl = `export SERAPHIM="${doc.endpoint || ''}"
+export API_KEY="${doc.key || ''}"
+curl -k -H "Authorization: Bearer $API_KEY" "$SERAPHIM/v1/projects"`;
+  const httpConfig = JSON.stringify({ mcpServers: { seraphim: {
+    type: 'http', url: mcp.url || '', headers: { Authorization: `Bearer ${doc.key || ''}` } } } }, null, 2);
+  const stdioConfig = JSON.stringify({ mcpServers: { seraphim: {
+    command: 'python3', args: ['<seraphim-mcp.py 的完整路径>'],
+    env: { SERAPHIM_ENDPOINT: doc.endpoint || '', SERAPHIM_TOKEN: doc.key || '' } } } }, null, 2);
+  $('#page-actions').innerHTML = '';
+  $('#content').innerHTML = `
+  <section class="card">
+    <div class="card-header"><h2>连接信息</h2>
+      <div class="actions">${button('复制 key', 'api.copy', 'data-copy="#api-key"')}
+        ${button('重置 key', 'api.reset')}</div></div>
+    <dl class="kv">
+      <dt>服务地址</dt><dd class="mono">${esc(doc.endpoint || '—')}</dd>
+      <dt>API key</dt><dd class="mono" id="api-key">${esc(doc.key || '—')}</dd>
+      <dt>请求头</dt><dd class="mono">${esc(doc.header || '—')}</dd>
+    </dl>
+    <p class="help">这把 key 由服务端生成，与面板连服务器用的凭据是两把。脚本或 AI 客户端泄露时直接重置：旧 key 立刻失效，已经连上的面板不受影响。页面上只能重置，不能自己填。</p>
+  </section>
+  <section class="card" style="margin-top:12px">
+    <div class="card-header"><h2>快速开始</h2>
+      <div class="actions">${button('复制', 'api.copy', 'data-copy="#api-curl"')}</div></div>
+    <p class="help">贴进终端就能列出服务器上的项目。常见的自动化：打包上传（POST /v1/projects/import）、启动（POST /v1/projects/{id}/action）、改公用变量（PUT /v1/variables）。重置 key 之后，这些脚本里的 key 也要换成新的。</p>
+    <pre class="code" id="api-curl">${esc(curl)}</pre>
+  </section>
+  <section class="card" style="margin-top:12px">
+    <div class="card-header"><h2>接口列表</h2></div>
+    <p class="help">共 ${total} 个接口。带 {id} 的参数按实际项目标识替换。</p>
+    ${endpoints || empty('暂未获取到接口列表')}
+  </section>
+  <section class="card" style="margin-top:12px">
+    <div class="card-header"><h2>MCP（让 AI 直接管理）</h2>
+      <div class="actions">${button('下载桥脚本', 'api.download')}</div></div>
+    <p class="help">面板自带 MCP 端点，AI 客户端接上之后就能看项目、上传代码、启动服务、读自检。支持 HTTP 传输的用第一段配置；只支持 stdio 的（多数桌面客户端）先下载桥脚本，用它的完整路径替换第二段里的占位符。两段里填的都是上面这把 key，重置后要一起换。</p>
+    <h3>HTTP 传输</h3>
+    <div class="actions">${button('复制', 'api.copy', 'data-copy="#api-mcp-http"')}</div>
+    <pre class="code" id="api-mcp-http">${esc(httpConfig)}</pre>
+    <h3>stdio 传输</h3>
+    <div class="actions">${button('复制', 'api.copy', 'data-copy="#api-mcp-stdio"')}</div>
+    <pre class="code" id="api-mcp-stdio">${esc(stdioConfig)}</pre>
+    <h3>AI 能用的 ${tools.length} 个工具</h3>
+    <dl class="kv">${tools.map((tool) => `
+      <dt class="mono">${esc(tool.name)}</dt><dd>${esc(tool.description)}</dd>`).join('')}</dl>
+  </section>`;
+};
+async function apiAction(action, target) {
+  if (action === 'api.copy') {
+    const node = document.querySelector(target.dataset.copy || '');
+    setNotice(await copyText(node ? node.textContent : '', '已复制'));
+    return;
+  }
+  if (action === 'api.reset') {
+    if (!confirm('重置 API key？\n服务端会生成新的一把，旧的立刻失效：正在用它的脚本和 AI 客户端都要换成新的。\n面板连服务器用的是另一份凭据，不会掉线。')) return;
+    try {
+      // 服务端把新的整份接入信息发回来，页面上的示例与 MCP 配置一起换掉。
+      S.data = await api('api.reset');
+      renders.api();
+      setNotice('已重置：旧 key 立刻失效，脚本和 AI 客户端里的都要换成新的');
+    } catch (error) { setNotice(error.message || String(error), true); }
+    return;
+  }
+  if (action === 'api.download') {
+    try {
+      const text = await api('api.script');
+      const url = URL.createObjectURL(new Blob([String(text)], { type: 'text/x-python' }));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'seraphim-mcp.py';
+      link.click();
+      URL.revokeObjectURL(url);
+      setNotice('桥脚本已下载；把它放到任意位置，用完整路径替换配置里的占位符');
+    } catch (error) { setNotice(error.message || String(error), true); }
+  }
+}
+async function variablesAction(action) {
+  if (action === 'variables.goto') { S.section = 'variables'; await refresh(); return; }
+  if (action !== 'variables.save' || S.busy) return;
+  let items;
+  try {
+    items = Object.entries(parseEnvText($('#variables-text').value)).map(([name, value]) => ({ name, value }));
+  } catch (error) { setNotice(error.message, true); return; }
+  S.busy = true;
+  try {
+    const result = await api('variables.save', { variables: items });
+    const applied = result.applied || [];
+    const saved = (result.variables || []).length;
+    S.variablesNotice = applied.length
+      ? `已保存 ${saved} 项，并同步到 ${applied.length} 个项目：${applied.join('、')}`
+      : (items.length
+        ? `已保存 ${saved} 项，并写入共用文件；没有项目勾选加载，所以没有项目被同步`
+        : '已清空，共用文件也同步清空了');
+    setNotice(S.variablesNotice);
+  } catch (error) { setNotice(error.message || String(error), true); }
+  S.busy = false;
+  await refresh(false);
+}
+// 环境变量在表单里按「每行一个 KEY=VALUE」编辑，空行与 # 注释忽略。
+function parseEnvText(text) {
+  const env = {};
+  for (const line of String(text || '').split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const index = trimmed.indexOf('=');
+    if (index < 1) throw new Error(`环境变量要写成 KEY=VALUE：${trimmed}`);
+    const name = trimmed.slice(0, index).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name)) throw new Error(`环境变量名不合法：${name}`);
+    env[name] = trimmed.slice(index + 1);
+  }
+  return env;
+}
+function formatEnvText(env) {
+  return Object.entries(env || {}).map(([key, value]) => `${key}=${value}`).join('\n');
+}
 function projectForm(project) {
   const runtimes = S.data.runtimes || [];
   const first = project?.runtime || runtimes.find((item) => item.installed)?.id || runtimes[0]?.id || 'python';
@@ -333,6 +644,10 @@ function projectForm(project) {
   const versions = [...(selected?.legacy_installed ? [['', '原有版本']] : []),
     ...((selected?.versions || []).map((version) => [version, version]))];
   if (!versions.length) versions.push(['', '尚未安装']);
+  const globalNames = (S.globalVariables || []).map((item) => item.name);
+  const globalLabel = globalNames.length
+    ? `加载面板的公用环境变量（当前 ${globalNames.length} 项：${globalNames.slice(0, 6).join('、')}${globalNames.length > 6 ? ' 等' : ''}）`
+    : '加载面板的公用环境变量（「环境变量管理」里还没有定义变量）';
   modal(project ? '编辑服务器项目' : '新建服务器项目', [
     { name: 'id', label: '项目标识', value: project?.id || '', disabled: Boolean(project), required: true },
     { name: 'name', label: '名称', value: project?.name || '', required: true },
@@ -340,7 +655,12 @@ function projectForm(project) {
     { name: 'runtime_version', label: '环境版本', type: 'select', options: versions, value: project?.runtime_version || versions[0][0] },
     { name: 'directory', label: '工程目录（服务器绝对路径，留空使用默认目录）', value: project?.directory || '', full: true, browse: 'directory' },
     { name: 'entry', label: '入口（相对于工程目录）', value: project?.entry || defaultEntries[first], required: true, full: true, browse: 'entry' },
-    { name: 'port', label: 'PORT 环境变量', type: 'number', value: project?.port ?? 3000 },
+    { name: 'port', label: 'PORT 环境变量', type: 'number', value: project?.port ?? 3000, port: true },
+    { name: 'use_global_env', label: globalLabel, type: 'checkbox',
+      value: project?.use_global_env === true, full: true },
+    { name: 'env', label: '项目自己的环境变量（每行一个 KEY=VALUE，# 开头为注释；同名会盖住面板那份）', type: 'textarea', rows: 4,
+      value: formatEnvText(project?.env), full: true },
+    { name: 'env_file', label: '同时加载工程目录下的 .env 文件（最后加载，同名以它为准）', type: 'checkbox', value: project?.env_file === true, full: true },
     { name: 'use_venv', label: '使用 Python 虚拟环境', type: 'checkbox', value: project?.use_venv ?? first === 'python' },
     { name: 'python_server', label: 'Python 启动方式', type: 'select', options: [['gunicorn', 'Gunicorn'], ['uvicorn', 'Uvicorn（ASGI）'], ['uwsgi', 'uWSGI（WSGI）'], ['direct', '直接运行脚本']], value: project?.python_server || 'gunicorn' },
     { name: 'python_worker', label: 'Gunicorn worker class', type: 'select', options: [['sync', 'sync（WSGI）'], ['gthread', 'gthread（WSGI）'], ['uvicorn', 'uvicorn_worker.UvicornWorker（ASGI）']], value: project?.python_worker || (project?.python_threads > 1 ? 'gthread' : 'sync') },
@@ -353,9 +673,12 @@ function projectForm(project) {
     if (hasServer && (!Number.isInteger(Number(values.python_workers)) || Number(values.python_workers) < 1 || Number(values.python_workers) > 32 ||
       !Number.isInteger(Number(values.python_threads)) || Number(values.python_threads) < 1 || Number(values.python_threads) > 64))
       throw new Error('进程数须为 1–32，线程数须为 1–64');
+    const env = parseEnvText(values.env);
     const payload = { id: project?.id || values.id.trim(), name: values.name.trim(), runtime: values.runtime,
       runtime_version: values.runtime_version, directory: values.directory.trim(), entry: values.entry.trim(),
-      port: Number(values.port || 0), use_venv: values.runtime === 'python' && values.use_venv,
+      port: Number(values.port || 0), env, env_file: values.env_file === true,
+      use_global_env: values.use_global_env === true,
+      use_venv: values.runtime === 'python' && values.use_venv,
       python_server: values.runtime === 'python' ? values.python_server : '',
       python_worker: values.runtime === 'python' && values.python_server === 'gunicorn' ? values.python_worker : '',
       python_callable: hasServer ? values.python_callable.trim() : '',
@@ -390,12 +713,197 @@ function projectForm(project) {
   }
   updatePythonFields();
 }
+// ── 项目详情 ────────────────────────────────────────────────────────────────
+// 服务端把启动自检、运行信息、依赖状态和日志一起算好，这里只负责铺开。
+// 详情窗口 3 秒自刷一次：依赖安装、启动、重启都在这个窗口里做，状态要跟着动。
+const D = { project: null, detail: null, timer: null, message: '', busy: false };
+
+const checkMark = (level) => (level === 'ok' ? '✓' : level === 'error' ? '✕' : '!');
+const checkClass = (level) => (level === 'ok' ? 'good' : level === 'error' ? 'bad' : 'warn');
+const CHECK_ACTIONS = { deps: '安装依赖', venv: '创建虚拟环境', server: '安装启动器', edit: '编辑项目',
+  files: '打开目录', runtime: '环境管理', variables: '环境变量管理' };
+
+function dependencyText(dependency) {
+  if (!dependency) return '正在读取…';
+  return [dependency.manifest, dependency.detail].filter(Boolean).join(' · ') || '无需安装';
+}
+// 项目卡片上的一行：面板认的是哪份依赖清单、装了没有。识别结果以前只在详情窗口里，
+// 扫一眼列表根本看不出面板支持 pyproject.toml / setup.py。
+// 服务端说不出清单名、也没话要说时（Java 的 jar、.NET 的 dll）返回空串，不占这一行。
+function dependencyCardText(dependency) {
+  if (!dependency) return '';
+  if (dependency.manifest) {
+    if (dependency.installed) return `${dependency.manifest} · 已安装`;
+    // 面板不打算装（例如 Python 没开虚拟环境）时，别挂一个点不动的「尚未安装」。
+    if (dependency.action === 'deps' && dependency.command) {
+      return `${dependency.manifest} · 尚未安装（${dependency.command}）`;
+    }
+    return `${dependency.manifest} · 面板不会替它装，原因见详情`;
+  }
+  return dependency.level === 'ok' ? '' : (dependency.detail || '');
+}
+function checkActionLabel(check, project) {
+  if (!check.action || check.action === 'log') return '';
+  // 「安装启动器」要说清楚装的是哪个：用户照着点才不会装错。
+  if (check.action === 'server')
+    return project?.python_server && project.python_server !== 'direct'
+      ? `安装 ${projectServerLabel(project)}` : '安装启动器';
+  return CHECK_ACTIONS[check.action] || '';
+}
+function projectDetail(project) {
+  D.project = project;
+  D.detail = null;
+  D.message = '';
+  D.busy = false;
+  modalRevision++;
+  if ($('#modal').open) $('#modal').close();
+  $('#modal-content').innerHTML = `<div class="dialog-body" id="project-detail"><h2>${esc(project.name)} · 详情</h2><p class="muted">正在检查…</p></div>`;
+  $('#modal-submit').hidden = true;
+  // 详情窗口只读，回车不该提交；表单是 method="dialog"，不拦住就会直接关窗。
+  $('#modal-form').onsubmit = (event) => event.preventDefault();
+  $('#modal-cancel').onclick = () => closeProjectDetail();
+  $('#modal').onclose = () => closeProjectDetail();
+  $('#modal').showModal();
+  loadProjectDetail();
+  D.timer = setInterval(() => {
+    if (!$('#modal').open) { closeProjectDetail(); return; }
+    if (!D.busy) loadProjectDetail(true);
+  }, 3000);
+}
+function closeProjectDetail() {
+  if (D.timer) { clearInterval(D.timer); D.timer = null; }
+  D.project = null;
+  D.detail = null;
+  D.busy = false;
+  if ($('#modal').open) $('#modal').close();
+}
+async function loadProjectDetail(silent = false) {
+  const id = D.project?.id;
+  if (!id) return;
+  try {
+    D.detail = await api('projects.status', { id });
+    if (!silent) D.message = '';
+  } catch (error) {
+    if (!silent) D.message = error.message || String(error);
+    renderProjectDetail();
+    return;
+  }
+  renderProjectDetail();
+}
+function renderProjectDetail() {
+  const host = $('#project-detail');
+  if (!host) return;
+  const detail = D.detail;
+  const current = detail?.project || D.project;
+  if (!current) return;
+  const status = detail?.status || {};
+  const stateTag = tag(projectStateLabel(current), current.active_state === 'active' && current.sub_state !== 'auto-restart');
+  const failure = projectFailureText(current);
+  const checks = detail?.checks || [];
+  const checkRows = checks.map((check) => {
+    const label = checkActionLabel(check, current);
+    return `<div class="row ${checkClass(check.level)}"><div class="grow"><strong>${checkMark(check.level)} ${esc(check.label)}</strong>${check.detail ? `<div class="small">${esc(check.detail)}</div>` : ''}${check.hint ? `<div class="small muted">${esc(check.hint)}</div>` : ''}</div><div class="actions">${label ? button(label, 'noop', `data-detail-action="${esc(check.action)}"`) : ''}</div></div>`;
+  }).join('');
+  const runtimeFields = [
+    ['systemd 状态', `${status.active_state || current.active_state || ''}${status.sub_state && status.sub_state !== 'dead' ? ` · ${status.sub_state === 'auto-restart' ? '正在自动重启' : status.sub_state}` : ''}`],
+    ['PID', status.main_pid > 0 ? String(status.main_pid) : ''],
+    ['内存占用', status.memory_bytes > 0 ? fmtBytes(status.memory_bytes) : ''],
+    ['已运行', current.active_state === 'active' && status.uptime_seconds > 0 ? fmtUptime(status.uptime_seconds) : ''],
+    // 重启次数哪怕为 0 也要显示：用户就是想知道它到底重启过几次。
+    ['重启次数', `重启 ${status.restarts ?? current.restarts ?? 0} 次`],
+    ['上次结果', [status.result, status.exit_status > 0 ? `退出码 ${status.exit_status}` : ''].filter(Boolean).join(' · ')],
+    ['监听端口', current.port > 0 ? `127.0.0.1:${current.port}${current.port_busy ? '（已被其他进程占用）' : ''}` : ''],
+    ['工程目录', current.directory],
+    ['启动命令', projectStartupText(current)]
+  ];
+  const runtimeRows = runtimeFields.filter(([, value]) => value)
+    .map(([label, value]) => `<dt>${esc(label)}</dt><dd class="mono">${esc(value)}</dd>`).join('');
+  const dependency = detail?.dependency;
+  // 环境变量：把加载来的和项目自己填的分开列，同名的标出被覆盖，
+  // 免得用户以为变量没生效而反复保存。
+  const ownEnv = Object.entries(current.env || {}).sort(([a], [b]) => (a < b ? -1 : 1));
+  const inherited = detail?.global_variables || [];
+  const overridden = new Set(ownEnv.map(([name]) => name));
+  const variableRows = [
+    ...inherited.map((item) => [`面板 · ${item.name}`,
+      `${item.value}${overridden.has(item.name) ? '　（被项目变量覆盖）' : ''}`]),
+    ...ownEnv.map(([name, value]) => [`项目 · ${name}`, value])
+  ];
+  const envNote = current.env_file ? '工程目录下的 .env 会最后加载，同名以它为准。' : '';
+  const variableSection = `<section class="card"><div class="card-header"><h2>环境变量</h2><div class="actions">${button('环境变量管理…', 'noop', 'data-detail-action="variables"')}</div></div>
+    ${current.use_global_env === true ? '' : '<p class="help">这个项目没有加载面板那份公用变量（默认不加载），只用下面项目自己的值。代码也可以直接读服务器上的共用文件，不必改项目配置。</p>'}
+    ${variableRows.length ? `<dl class="kv">${variableRows.map(([key, value]) => `<dt>${esc(key)}</dt><dd class="mono">${esc(value)}</dd>`).join('')}</dl>` : '<p class="muted">没有自定义环境变量。</p>'}
+    ${current.port > 0 || envNote ? `<p class="help">${current.port > 0 ? `PORT=${esc(current.port)} 由面板按项目写入。` : ''}${esc(envNote)}</p>` : ''}
+  </section>`;
+  const log = detail?.log || '';
+  const journal = detail?.journal || '';
+  host.innerHTML = `<h2>${esc(current.name)} · 详情</h2>
+    <div class="inline">${stateTag} ${current.enabled ? tag('开机启动') : tag('不自启')} ${tag(`${current.runtime} ${current.runtime_version || ''}`)}</div>
+    ${failure ? `<p class="help">${esc(failure)}</p>` : ''}
+    ${D.message ? `<p class="help">${esc(D.message)}</p>` : ''}
+    <section class="card"><div class="card-header"><h2>启动自检</h2><div class="actions">${button('重新检查', 'noop', 'data-detail-action="refresh"')}${current.active_state === 'active' ? button('重启', 'noop', 'data-detail-action="restart"') : button('启动', 'noop', 'data-detail-action="start"')}${current.active_state === 'active' ? button('停止', 'noop', 'data-detail-action="stop"') : ''}</div></div>${checkRows || '<p class="muted">正在检查…</p>'}</section>
+    <section class="card"><div class="card-header"><h2>运行信息</h2></div><dl class="kv">${runtimeRows}</dl></section>
+    ${variableSection}
+    <section class="card"><div class="card-header"><h2>项目依赖</h2><div class="actions">${dependency?.present && !dependency?.installed && dependency?.command ? button(`安装依赖（${dependency.command}）`, 'noop', 'data-detail-action="deps"') : ''}</div></div><p class="mono small">${esc(dependencyText(dependency))}</p>${dependency?.present && !dependency?.installed ? '<p class="small muted">安装依赖需要先停止项目。</p>' : ''}</section>
+    <section class="card"><div class="card-header"><h2>项目日志</h2><div class="actions">${button('复制', 'noop', 'data-detail-action="copy-log"')}${button('清空…', 'noop', 'data-detail-action="clear-log"', 'danger')}</div></div><div class="code">${esc(log || '暂无日志')}</div>${journal ? `<p class="small muted">进程还没起来就退出时项目日志是空的，原因只在系统日志里。</p><div class="code">${esc(journal)}</div>` : ''}</section>`;
+}
+// 详情窗口里的按钮统一走 data-detail-action，避免和列表页的 data-index 混在一起。
+async function projectDetailAction(action, element) {
+  void element;
+  const project = D.detail?.project || D.project;
+  if (!project) return;
+  if (action === 'refresh') { D.busy = true; await loadProjectDetail(); D.busy = false; return; }
+  if (action === 'copy-log') {
+    D.message = await copyText(D.detail?.log || '', '日志已复制');
+    renderProjectDetail();
+    return;
+  }
+  if (action === 'edit' || action === 'files' || action === 'runtime' || action === 'variables') {
+    closeProjectDetail();
+    if (action === 'files') { S.filePath = project.directory; S.section = 'files'; await refresh(); }
+    else if (action === 'runtime') { S.section = 'environments'; await refresh(); }
+    else if (action === 'variables') { S.section = 'variables'; await refresh(); }
+    else projectForm(project);
+    return;
+  }
+  // 安装依赖要跑几分钟，窗口不能自己刷新把按钮状态顶掉，所以先占住 busy。
+  const perform = async (task, message) => {
+    D.busy = true;
+    try {
+      await task();
+      D.message = message;
+    } catch (error) { D.message = error.message || String(error); }
+    D.busy = false;
+    await loadProjectDetail(true);
+    await refresh(false);
+  };
+  if (action === 'deps') await perform(() => api('projects.deps', { id: project.id }), '依赖安装完成');
+  else if (action === 'venv') await perform(() => api('projects.venv', { id: project.id, action: 'create' }), '虚拟环境已创建');
+  else if (action === 'server') await perform(() => api('projects.venv', { id: project.id, action: 'install_server' }), '启动器已安装');
+  else if (action === 'start' || action === 'stop' || action === 'restart')
+    await perform(() => api('projects.action', { id: project.id, action }), '操作已下发');
+  else if (action === 'clear-log') {
+    if (!confirm(`清空 ${project.name} 的项目日志？`)) return;
+    await perform(() => api('projects.log.clear', { id: project.id }), '日志已清空');
+  }
+}
 async function projectAction(action, index) {
   const project = list(S.data)[index];
+  if (!project) return;
   if (action === 'projects.new') projectForm();
   else if (action === 'projects.edit') projectForm(project);
+  else if (action === 'projects.detail' || action === 'projects.log') projectDetail(project);
   else if (action === 'projects.files') { S.filePath = project.directory; S.section = 'files'; await refresh(); }
-  else if (action === 'projects.log') info(`${project.name} · 日志`, await api('projects.log', { id: project.id }));
+  else if (action === 'projects.proxy') {
+    const address = `http://127.0.0.1:${project.port}`;
+    setNotice(await copyText(address, `已复制反向代理地址 ${address}，可在网站管理中创建代理站点`));
+  }
+  else if (action === 'projects.clearlog') {
+    if (confirm(`清空 ${project.name} 的项目日志？（systemd 的系统日志会保留）`))
+      await mutate('projects.log.clear', { id: project.id }, '日志已清空');
+  }
+  else if (action === 'projects.deps' && confirm(`按依赖清单为 ${project.name} 安装依赖？安装期间项目必须处于停止状态。`))
+    await mutate('projects.deps', { id: project.id }, '依赖安装完成');
   else if (action === 'projects.toggle') await mutate('projects.action', { id: project.id,
     action: project.active_state === 'active' ? 'stop' : 'start' });
   else if (action === 'projects.restart') await mutate('projects.action', { id: project.id, action: 'restart' });
@@ -519,31 +1027,68 @@ async function environmentAction(action, index, partIndex) {
 
 renders.store = () => {
   $('#page-actions').innerHTML = '';
-  const items = list(S.data[0]), jobs = list(S.data[1]), search = (S.searchStore || '').toLowerCase();
-  $('#content').innerHTML = `<div class="toolbar"><input id="store-search" placeholder="搜索软件" value="${esc(S.searchStore || '')}"><span class="small muted">共 ${items.length} 款 · 已安装 ${items.filter((item) => item.state === 'installed' || item.state === 'multiple_versions').length} 款</span></div><section class="card"><table class="table"><thead><tr><th>软件</th><th>类别</th><th>版本</th><th>状态</th><th></th></tr></thead><tbody>${items.map((item, index) => ({ item, index })).filter(({ item }) => !search || `${item.name} ${item.category} ${item.description}`.toLowerCase().includes(search)).map(({ item, index }) => `<tr><td><strong>${esc(item.name)}</strong><div class="small muted">${esc(item.description)}</div></td><td>${esc(item.category || '其他')}</td><td>${esc(item.version)}</td><td>${tag(item.state === 'installed' ? '已安装' : item.state === 'installing' ? '安装中' : item.state === 'uninstalling' ? '卸载中' : item.state === 'queued' ? '排队中' : item.state === 'cancelling' ? '停止中' : item.state === 'cancelled' ? '已停止' : item.state === 'multiple_versions' ? '多版本' : '未安装', item.state === 'installed')}</td><td class="actions-cell"><div class="actions">${item.state === 'installed' ? button('卸载', 'software.uninstall', `data-index="${index}"`, 'danger') : item.install_available !== false && item.supported && !['queued', 'installing', 'uninstalling', 'cancelling', 'multiple_versions'].includes(item.state) ? button('安装', 'software.install', `data-index="${index}"`) : ''}${button('日志', 'software.log', `data-index="${index}"`)}</div></td></tr>`).join('')}</tbody></table></section>`;
-  $('#content').insertAdjacentHTML('afterbegin', `<section class="card"><h3>任务列表</h3>${jobs.length ? jobs.map((job) => `<div class="inline"><strong>${esc(items.find((item) => item.id === job.id)?.name || job.id)}</strong> ${esc(job.operation === 'install' ? '安装' : '卸载')} · ${esc(({ queued: '排队中', installing: '安装中', uninstalling: '卸载中', cancelling: '停止中', cancelled: '已停止', installed: '已完成', not_installed: '已完成', failed: '失败', needs_attention: '需处理' })[job.state] || job.state)} · ${esc(job.message)} ${['queued', 'installing', 'uninstalling'].includes(job.state) ? button('停止任务', 'software.cancel', `data-id="${esc(job.id)}"`) : ''}</div>`).join('') : '<p class="muted">暂无任务</p>'}</section>`);
+  const items = list(S.data[0]), search = (S.searchStore || '').toLowerCase();
+  const installJobs = list(S.data[1]).filter((job) => job.operation === 'install');
+  const installedCount = items.filter((item) => ['installed', 'multiple_versions'].includes(item.state)).length;
+  const visible = items.map((item, index) => ({ item, index }))
+    .filter(({ item }) => !search || `${item.name} ${item.category} ${item.description}`.toLowerCase().includes(search));
+  const rows = visible.map(({ item, index }) => {
+    const isInstalled = ['installed', 'multiple_versions'].includes(item.state);
+    const canInstall = item.install_available !== false && item.supported &&
+      !['queued', 'installing', 'uninstalling', 'cancelling', 'multiple_versions', 'installed'].includes(item.state);
+    const isRuntime = RUNTIME_IDS.has(item.id);
+    const primary = isRuntime
+      ? (isInstalled ? button('去管理', 'software.gotoManagement') : button('选择版本…', 'software.gotoEnvironments'))
+      : (canInstall ? button('安装', 'software.install', `data-index="${index}"`)
+        : (isInstalled ? button('去管理', 'software.gotoManagement') : ''));
+    const stateText = { installed: '已安装', multiple_versions: '多版本已安装', installing: '安装中', uninstalling: '卸载中',
+      queued: '排队中', cancelling: '停止中', cancelled: '已停止', failed: '安装失败', needs_attention: '需要处理' }[item.state] || '未安装';
+    return `<tr><td><strong>${esc(item.name)}</strong><div class="small muted">${esc(item.description)}</div></td><td>${esc(item.category || '其他')}</td><td>${esc(item.version)}</td><td>${tag(stateText, item.state === 'installed')}</td><td class="actions-cell"><div class="actions">${primary}${button('日志', 'software.log', `data-index="${index}"`)}</div></td></tr>`;
+  }).join('');
+  $('#content').innerHTML = `<section class="card"><h3>安装任务</h3>${installJobs.length ? installJobs.map((job) => `<div class="inline"><strong>${esc(items.find((item) => item.id === job.id)?.name || job.id)}</strong> · ${esc(jobStateText(job.state))} · ${esc(job.message)} ${['queued', 'installing'].includes(job.state) ? button('停止任务', 'software.cancel', `data-id="${esc(job.id)}"`) : ''}</div>`).join('') : '<p class="muted">暂无安装任务</p>'}</section><div class="toolbar"><input id="store-search" placeholder="搜索软件" value="${esc(S.searchStore || '')}"><span class="small muted">共 ${items.length} 款 · 已安装 ${installedCount} 款</span></div><section class="card"><table class="table"><thead><tr><th>软件</th><th>类别</th><th>版本</th><th>状态</th><th></th></tr></thead><tbody>${rows}</tbody></table></section>`;
 };
+const jobStateText = (state) => ({ queued: '排队中', installing: '安装中', uninstalling: '卸载中', cancelling: '停止中',
+  cancelled: '已停止', installed: '已完成', not_installed: '已完成', failed: '失败', needs_attention: '需处理' })[state] || state;
+
 renders.services = () => {
-  $('#page-actions').innerHTML = '';
-  const [software, services] = S.data;
-  const installed = list(software).filter((item) => item.state === 'installed' && item.service_available !== false);
-  $('#content').innerHTML = `${card('防火墙服务', (services.services || []).map((service, index) => row(`<strong>${esc(service.description || service.name)}</strong> ${tag(service.active_state === 'active' ? '运行中' : '已停止', service.active_state === 'active')} ${tag(service.unit_state === 'enabled' ? '开机启动' : '不自启')}`, `${button(service.active_state === 'active' ? '停止' : '启动', 'services.firewall', `data-index="${index}" data-command="${service.active_state === 'active' ? 'stop' : 'start'}"`)}${button(service.unit_state === 'enabled' ? '取消自启' : '开机自启', 'services.firewall', `data-index="${index}" data-command="${service.unit_state === 'enabled' ? 'disable' : 'enable'}"`)}`)).join('') || empty('未检测到防火墙服务'))}
-    ${installed.map((item, index) => card(item.name, `<div class="inline">${tag(item.service_state === 'active' ? '运行中' : '已停止', item.service_state === 'active')} ${tag(item.enabled ? '开机启动' : '不自启')} <span class="small muted mono">${esc(item.install_path)}</span></div>`, `${button(item.service_state === 'active' ? '停止' : '启动', 'services.software', `data-index="${index}" data-command="${item.service_state === 'active' ? 'stop' : 'start'}"`)}${button('重启', 'services.software', `data-index="${index}" data-command="restart"`)}${button(item.enabled ? '取消自启' : '开机自启', 'services.software', `data-index="${index}" data-command="${item.enabled ? 'disable' : 'enable'}"`)}${button('日志', 'services.log', `data-index="${index}"`)}`)).join('') || empty('尚无已安装的常驻服务')}`;
-  S.installedServices = installed;
+  $('#page-actions').innerHTML = button('去软件商店安装', 'software.gotoStore');
+  const [software, jobs] = S.data;
+  const installed = list(software).filter((item) => item.state === 'installed' || item.state === 'multiple_versions');
+  const uninstallJobs = list(jobs).filter((job) => job.operation === 'uninstall');
+  const search = (S.searchServices || '').toLowerCase();
+  const filter = S.filterServices || 'all';
+  const visible = installed.filter((item) => {
+    if (search && !`${item.name} ${item.version} ${item.install_path || ''}`.toLowerCase().includes(search)) return false;
+    if (filter === 'running') return item.service_available !== false && item.service_state === 'active';
+    if (filter === 'stopped') return item.service_available !== false && item.service_state !== 'active';
+    if (filter === 'runtime') return RUNTIME_IDS.has(item.id);
+    return true;
+  });
+  S.installedServices = visible;
+  const filters = [['all', '全部'], ['running', '运行中'], ['stopped', '已停止'], ['runtime', '运行环境']];
+  $('#content').innerHTML = `${uninstallJobs.length ? card('卸载任务', uninstallJobs.map((job) => row(
+    `<strong>${esc(installed.find((item) => item.id === job.id)?.name || job.id)}</strong> ${esc(jobStateText(job.state))} <span class="small muted">${esc(job.message)}</span>`,
+    ['queued', 'uninstalling'].includes(job.state) ? button('停止任务', 'software.cancel', `data-id="${esc(job.id)}"`) : '')).join('')) : ''}<div class="toolbar"><input id="services-search" placeholder="搜索已安装软件" value="${esc(S.searchServices || '')}"><select id="services-filter">${filters.map(([value, text]) => `<option value="${value}" ${filter === value ? 'selected' : ''}>${text}</option>`).join('')}</select><span class="small muted">已安装 ${installed.length} 款</span></div>${visible.map((item, index) => {
+      const hasService = item.service_available !== false && item.state !== 'multiple_versions';
+      const actions = `${hasService ? `${button(item.service_state === 'active' ? '停止' : '启动', 'services.software', `data-index="${index}" data-command="${item.service_state === 'active' ? 'stop' : 'start'}"`)}${button('重启', 'services.software', `data-index="${index}" data-command="restart"`)}${button(item.enabled ? '取消自启' : '开机自启', 'services.software', `data-index="${index}" data-command="${item.enabled ? 'disable' : 'enable'}"`)}` : ''}${button('日志', 'services.log', `data-index="${index}"`)}${RUNTIME_IDS.has(item.id) ? button('管理版本', 'software.gotoEnvironments') : ''}${button('卸载', 'software.uninstall', `data-index="${index}"`, 'danger')}`;
+      const state = hasService
+        ? `${tag(item.service_state === 'active' ? '运行中' : '已停止', item.service_state === 'active')} ${tag(item.enabled ? '开机启动' : '不自启')}`
+        : '<span class="small muted">无常驻服务</span>';
+      return card(`${item.name} · ${item.version}`, `<div class="inline">${state} <span class="small muted mono">${esc(item.install_path)}</span></div>`, actions);
+    }).join('') || empty('这台服务器上还没有已安装的软件')}`;
 };
 async function softwareAction(action, index, command) {
-  if (action === 'services.firewall') {
-    const service = S.data[1].services[index];
-    if (confirm(`${command} ${service.name}？`)) await mutate('services.action', { name: service.name, action: command });
-    return;
-  }
+  if (action === 'software.gotoStore') { S.section = 'store'; await refresh(); return; }
+  if (action === 'software.gotoManagement') { S.section = 'services'; await refresh(); return; }
+  if (action === 'software.gotoEnvironments') { S.section = 'environments'; await refresh(); return; }
   if (action === 'software.cancel') { await mutate('software.cancel', { id: command }, '已请求停止任务'); return; }
   const item = action.startsWith('services.') ? S.installedServices[index] : list(S.data[0])[index];
-  if (action === 'software.install' && confirm(`安装 ${item.name}？`)) await mutate('software.install', { id: item.id }, '安装任务已开始');
+  if (!item) return;
+  if (action === 'software.install' && confirm(`安装 ${item.name}？`)) await mutate('software.install', { id: item.id }, '安装任务已开始，进度见下方任务列表');
   else if (action === 'software.uninstall') {
     const mode = confirm(`卸载 ${item.name} 并备份目录？\n确定：备份；取消：继续选择彻底删除。`) ? 'backup'
       : (confirm(`彻底删除 ${item.name}？`) ? 'purge' : null);
-    if (mode) await mutate('software.uninstall', { id: item.id, mode }, '卸载任务已开始');
+    if (mode) await mutate('software.uninstall', { id: item.id, mode }, '卸载任务已开始，进度见本页上方「卸载任务」');
   } else if (action === 'software.log' || action === 'services.log') info(`${item.name} · 日志`, await api('software.log', { id: item.id }));
   else if (action === 'services.software' && confirm(`${command} ${item.name}？`))
     await mutate('software.service', { id: item.id, action: command });
@@ -551,10 +1096,23 @@ async function softwareAction(action, index, command) {
 
 renders.firewall = () => {
   $('#page-actions').innerHTML = '<button data-action="firewall.add">添加规则</button>';
-  const firewall = S.data;
-  $('#content').innerHTML = `${card('当前防火墙', `<div class="inline">${tag(firewall.backend || '未启用', Boolean(firewall.backend))}<span class="muted">区域 ${esc(firewall.zone || '—')}</span></div>`)}${card('入站端口', (firewall.rules || []).map((rule, index) => row(`<strong>${esc(rule.port)}/${esc(rule.protocol)}</strong> <span class="muted small">${esc(rule.source || '全部来源')}</span>`, button('删除', 'firewall.remove', `data-index="${index}"`, 'danger'))).join('') || empty('没有简单端口规则'))}`;
+  const [firewall, services] = S.data;
+  const service = (services.services || [])[0];
+  const serviceCard = service
+    ? card('防火墙服务', `<div class="inline">${tag(service.active_state === 'active' ? '运行中' : '已停止', service.active_state === 'active')} ${tag(service.unit_state === 'enabled' ? '开机启动' : '不自启')} <span class="small muted mono">${esc(service.name)}</span></div>`,
+      `${button(service.active_state === 'active' ? '停止' : '启动', 'services.firewall', `data-index="0" data-command="${service.active_state === 'active' ? 'stop' : 'start'}"`)}${button('重启', 'services.firewall', 'data-index="0" data-command="restart"')}${button(service.unit_state === 'enabled' ? '取消自启' : '开机自启', 'services.firewall', `data-index="0" data-command="${service.unit_state === 'enabled' ? 'disable' : 'enable'}"`)}`)
+    : card('防火墙服务', empty('未检测到防火墙服务'));
+  $('#content').innerHTML = `${serviceCard}${card('当前防火墙', `<div class="inline">${tag(firewall.backend || '未启用', Boolean(firewall.backend))}<span class="muted">区域 ${esc(firewall.zone || '—')}</span></div>`)}${card('入站端口', (firewall.rules || []).map((rule, index) => row(`<strong>${esc(rule.port)}/${esc(rule.protocol)}</strong> <span class="muted small">${esc(rule.source || '全部来源')}</span>`, button('删除', 'firewall.remove', `data-index="${index}"`, 'danger'))).join('') || empty('没有简单端口规则'))}`;
 };
-async function firewallAction(action, index) {
+async function firewallAction(action, index, command) {
+  if (action === 'services.firewall') {
+    const service = (S.data[1].services || [])[index];
+    if (!service) return;
+    const warning = ['start', 'enable'].includes(command) ? '（注意：请先确保防火墙允许 TCP 27520，否则可能中断 Seraphim 连接）' : '';
+    if (confirm(`${command} ${service.name}？${warning}`))
+      await mutate('services.action', { name: service.name, action: command });
+    return;
+  }
   if (action === 'firewall.add') modal('添加入站端口', [
     { name: 'port', label: '端口', type: 'number', required: true },
     { name: 'protocol', label: '协议', type: 'select', options: [['tcp', 'TCP'], ['udp', 'UDP']] }
@@ -564,7 +1122,7 @@ async function firewallAction(action, index) {
     await refresh(false);
   }, '添加');
   else if (action === 'firewall.remove') {
-    const rule = S.data.rules[index];
+    const rule = S.data[0].rules[index];
     if (confirm(`删除 ${rule.port}/${rule.protocol} 入站规则？`))
       await mutate('firewall.change', { action: 'remove', port: rule.port, protocol: rule.protocol });
   }
@@ -637,13 +1195,24 @@ async function databaseAction(action, index, id) {
   const dbs = S.catalog?.databases || [], users = S.catalog?.users || [], aclUsers = S.acl?.users || [];
   if (action === 'databases.db.create' || action === 'databases.user.create' || action === 'databases.acl.create') {
     const acl = action === 'databases.acl.create';
-    modal(acl ? '创建 ACL 用户' : action === 'databases.db.create' ? '创建数据库' : '创建账户', [
-      { name: 'name', label: acl ? '账户名称' : action === 'databases.db.create' ? '数据库名' : '账户名', required: true },
+    const db = action === 'databases.db.create';
+    modal(acl ? '创建 ACL 用户' : db ? '创建数据库' : '创建账户', [
+      { name: 'name', label: acl ? '账户名称' : db ? '数据库名' : '账户名', required: true },
+      ...(db ? [{ name: 'createUser', label: '同时创建账户并授权（密码自动生成）', type: 'checkbox', value: true },
+        { name: 'user', label: '账户名（留空则与数据库同名）' },
+        { name: 'level', label: '账户权限', type: 'select', options: [['readwrite', '读写'], ['read', '只读']] }] : []),
       ...(acl ? [{ name: 'level', label: '权限', type: 'select', options: [['readwrite', '读写'], ['read', '只读']] }] : [])
-    ], async ({ name, level }) => {
-      const result = await api(action === 'databases.db.create' ? 'databases.create' : acl ? 'databases.acl.create' : 'databases.user.create',
-        { engine, name, level });
-      if (result?.password) info('请保存新账户密码', `${result.user}\n${result.password}`);
+    ], async ({ name, level, user, createUser }) => {
+      if (db) {
+        const account = createUser ? String(user || '').trim() || name : '';
+        if (account && !/^[A-Za-z][A-Za-z0-9_]{0,31}$/.test(account))
+          throw new Error('账户名须以字母开头，只能包含字母、数字和下划线，最长 32 位');
+        const result = await api('databases.create', { engine, name, user: account, level: level || 'readwrite' });
+        if (result?.password) info('请保存新账户密码', `${result.user}\n${result.password}`);
+      } else {
+        const result = await api(acl ? 'databases.acl.create' : 'databases.user.create', { engine, name, level });
+        if (result?.password) info('请保存新账户密码', `${result.user}\n${result.password}`);
+      }
       await refresh(false);
     }, '创建');
   } else if (action === 'databases.db.delete' && confirm(`删除数据库 ${dbs[index]} 及其中数据？`))
@@ -822,7 +1391,36 @@ async function domainAction(action, index, certId) {
   }
 }
 
+// 「更多」用的是 <details> 浮层：点了里面的按钮、或点了别处，都该收起来。
+// 放在捕获阶段，先收起再让业务动作跑，元素本身还在 DOM 里，动作不受影响。
+document.addEventListener('click', (event) => {
+  const inside = event.target.closest('.menu');
+  const clickedItem = event.target.closest('.menu-body button');
+  for (const node of document.querySelectorAll('.menu[open]')) {
+    if (clickedItem || node !== inside) node.removeAttribute('open');
+  }
+}, true);
+
 document.addEventListener('click', async (event) => {
+  const detailAction = event.target.closest('[data-detail-action]');
+  if (detailAction) {
+    await projectDetailAction(detailAction.dataset.detailAction, detailAction);
+    return;
+  }
+  const freePort = event.target.closest('[data-free-port]');
+  if (freePort) {
+    freePort.disabled = true;
+    try {
+      const input = $('#field-port');
+      const after = Math.max(0, Number(input?.value) - 1) || 3000;
+      const result = await api('projects.ports', { after });
+      const port = list(result)[0] ?? result?.ports?.[0];
+      if (port && input) input.value = port;
+      else setNotice('服务器没有返回可用的空闲端口', true);
+    } catch (error) { setNotice(error.message || String(error), true); }
+    finally { freePort.disabled = false; }
+    return;
+  }
   const browse = event.target.closest('[data-browse]');
   if (browse) {
     if (browse.dataset.browse === 'ssh-key') {
@@ -852,7 +1450,10 @@ document.addEventListener('click', async (event) => {
     else if (action.startsWith('files.')) await fileAction(action, index);
     else if (action.startsWith('sites.')) await siteAction(action, index);
     else if (action.startsWith('projects.')) await projectAction(action, index);
+    else if (action.startsWith('variables.')) await variablesAction(action);
+    else if (action.startsWith('api.')) await apiAction(action, target);
     else if (action.startsWith('environments.')) await environmentAction(action, index, part);
+    else if (action === 'services.firewall') await firewallAction(action, index, target.dataset.command);
     else if (action.startsWith('software.') || action.startsWith('services.'))
       await softwareAction(action, index, target.dataset.command || target.dataset.id);
     else if (action.startsWith('firewall.')) await firewallAction(action, index);
@@ -878,6 +1479,18 @@ document.addEventListener('input', (event) => {
     renders.store();
     $('#store-search').focus();
     $('#store-search').setSelectionRange(position, position);
+  } else if (event.target.id === 'services-search') {
+    S.searchServices = event.target.value;
+    const position = event.target.selectionStart;
+    renders.services();
+    $('#services-search').focus();
+    $('#services-search').setSelectionRange(position, position);
+  }
+});
+document.addEventListener('change', (event) => {
+  if (event.target.id === 'services-filter') {
+    S.filterServices = event.target.value;
+    renders.services();
   }
 });
 let fileDragDepth = 0;
@@ -926,6 +1539,25 @@ $('#connection-edit').addEventListener('click', () => {
 });
 $('#connection-add').addEventListener('click', () => editConnection());
 $('#refresh').addEventListener('click', () => refresh());
+let servicesPolling = false;
+setInterval(async () => {
+  if (servicesPolling || S.section !== 'services' || !selectedConnection() || S.busy || $('#modal').open || document.hidden) return;
+  if (['services-search', 'services-filter'].includes(document.activeElement?.id)) return;
+  // 只有确实有卸载任务在跑才轮询，避免空转重绘打断操作。
+  const pending = list(S.data?.[1]).some((job) => ['queued', 'uninstalling'].includes(job.state));
+  if (!pending) return;
+  servicesPolling = true;
+  const connectionID = S.doc.selectedID;
+  try {
+    const snapshot = await Promise.all([api('software.list'), api('software.jobs')]);
+    if (S.section === 'services' && S.doc.selectedID === connectionID) {
+      S.data = snapshot;
+      renders.services();
+    }
+  } catch (error) { setNotice(error.message || String(error), true); }
+  finally { servicesPolling = false; }
+}, 5000);
+
 let statusPolling = false;
 setInterval(async () => {
   if (statusPolling || S.section !== 'status' || !selectedConnection() || S.busy || $('#modal').open || document.hidden) return;

@@ -27,6 +27,14 @@ struct RemoteDatabasePassword: Decodable {
     let password: String
 }
 
+/// 建库时一并创建的账户信息（服务端只在同时建账户时返回密码）。
+struct RemoteDatabaseCreation: Decodable {
+    let database: String
+    let user: String
+    let password: String
+    let level: String
+}
+
 struct RemoteKeyValueUser: Decodable, Identifiable {
     let name: String
     let enabled: Bool
@@ -110,10 +118,14 @@ enum ServerDatabaseAPI {
         return try decoder().decode(RemoteDatabaseCatalog.self, from: data)
     }
 
-    static func createDatabase(connection: ServerConnection, token: String, engine: String, name: String) async throws {
-        struct Payload: Encodable { let name: String }
-        _ = try await call(connection: connection, token: token, path: "/v1/databases/\(engine)/databases", method: "POST",
-                           body: JSONEncoder().encode(Payload(name: name)), expected: 201)
+    /// 建库；user 非空时服务端会同时创建账户、生成密码并授权，返回值即包含一次密码。
+    static func createDatabase(connection: ServerConnection, token: String, engine: String, name: String,
+                               user: String = "", level: String = "readwrite") async throws -> RemoteDatabaseCreation? {
+        struct Payload: Encodable { let name: String; let user: String; let level: String }
+        let data = try await call(connection: connection, token: token, path: "/v1/databases/\(engine)/databases", method: "POST",
+                                  body: JSONEncoder().encode(Payload(name: name, user: user, level: level)), expected: 201)
+        guard !user.isEmpty else { return nil }
+        return try decoder().decode(RemoteDatabaseCreation.self, from: data)
     }
 
     static func deleteDatabase(connection: ServerConnection, token: String, engine: String, name: String) async throws {

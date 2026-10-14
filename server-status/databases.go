@@ -45,6 +45,14 @@ type databasePasswordResponse struct {
 	Password string `json:"password"`
 }
 
+// databaseCreateResponse 在建库同时创建账户时返回一次生成的密码。
+type databaseCreateResponse struct {
+	Database string `json:"database"`
+	User     string `json:"user"`
+	Password string `json:"password"`
+	Level    string `json:"level"`
+}
+
 type databaseManager struct {
 	root     string
 	software *softwareManager
@@ -392,6 +400,59 @@ func (dm *databaseManager) deleteDatabase(ctx context.Context, engine, name stri
 	}
 	_, err := dm.query(ctx, engine, "DROP DATABASE "+quoteDatabaseIdentifier(engine, name), "")
 	return err
+}
+
+// userExists 判断账户是否已存在。用户名已由 databaseUserPattern 限制为字母数字下划线，
+// 因此这里可以安全地内联到查询里。
+func (dm *databaseManager) userExists(ctx context.Context, engine, name string) (bool, error) {
+	sql := "SELECT 1 FROM mysql.user WHERE User = '" + name + "' LIMIT 1"
+	if engine == "postgresql" {
+		sql = "SELECT 1 FROM pg_roles WHERE rolname = '" + name + "' LIMIT 1"
+	}
+	output, err := dm.query(ctx, engine, sql, "")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(output) != "", nil
+}
+
+// createDatabaseWithUser 建库；当给出用户名时，同时创建一个生成密码的登录账户并授权到该库。
+// 建库之后的任一步失败都会回滚，且只删除确实由本次操作创建的对象，不会碰同名既有账户。
+func (dm *databaseManager) createDatabaseWithUser(ctx context.Context, engine, name, username, level string) (string, error) {
+	if username == "" {
+		return "", dm.createDatabase(ctx, engine, name)
+	}
+	if level != "read" && level != "readwrite" {
+		return "", errors.New("权限须为只读或读写")
+	}
+	if protectedDatabaseUser(username) {
+		return "", errors.New("用户名无效或属于系统账户")
+	}
+	taken, err := dm.userExists(ctx, engine, username)
+	if err != nil {
+		return "", err
+	}
+	if taken {
+		return "", errors.New("账户名已被占用，请换一个，或先删除该账户")
+	}
+	if err := dm.createDatabase(ctx, engine, name); err != nil {
+		return "", err
+	}
+	// 注意：createUser 只在账户确实建立之后才返回非空密码。
+	password, err := dm.createUser(ctx, engine, username)
+	if err != nil {
+		if password != "" {
+			_ = dm.deleteUser(context.Background(), engine, username)
+		}
+		_ = dm.deleteDatabase(context.Background(), engine, name)
+		return "", err
+	}
+	if err := dm.grant(ctx, engine, name, username, level, false); err != nil {
+		_ = dm.deleteUser(context.Background(), engine, username)
+		_ = dm.deleteDatabase(context.Background(), engine, name)
+		return "", err
+	}
+	return password, nil
 }
 
 func (dm *databaseManager) createUser(ctx context.Context, engine, name string) (string, error) {
@@ -799,16 +860,45 @@ func (a *api) databasesHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(catalog)
 	case len(parts) == 2 && parts[1] == "databases" && r.Method == http.MethodPost:
-		name, err := decodeName()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		// name 必填；user 可选，给出时同时创建账户、生成密码并授权到该库。
+		var input struct {
+			Name  string `json:"name"`
+			User  string `json:"user"`
+			Level string `json:"level"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&input); err != nil ||
+			!databaseNamePattern.MatchString(input.Name) {
+			http.Error(w, "名称无效", http.StatusBadRequest)
 			return
 		}
-		if err := a.databases.createDatabase(r.Context(), engine, name); err != nil {
+		level := input.Level
+		if level == "" {
+			level = "readwrite"
+		}
+		if input.User != "" {
+			if !databaseUserPattern.MatchString(input.User) {
+				http.Error(w, "用户名无效", http.StatusBadRequest)
+				return
+			}
+			if level != "read" && level != "readwrite" {
+				http.Error(w, "权限须为只读或读写", http.StatusBadRequest)
+				return
+			}
+		}
+		password, err := a.databases.createDatabaseWithUser(r.Context(), engine, input.Name, input.User, level)
+		if err != nil {
 			fail(err)
 			return
 		}
+		if input.User == "" {
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(databaseCreateResponse{
+			Database: input.Name, User: input.User, Password: password, Level: level,
+		})
 	case len(parts) == 3 && parts[1] == "databases" && r.Method == http.MethodDelete:
 		if err := a.databases.deleteDatabase(r.Context(), engine, parts[2]); err != nil {
 			fail(err)

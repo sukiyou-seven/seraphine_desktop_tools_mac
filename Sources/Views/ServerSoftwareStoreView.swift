@@ -12,13 +12,17 @@ private enum SoftwareStoreFilter: String, CaseIterable {
     case installed = "已安装"
 }
 
+/// 软件商店只做一件事：安装。
+/// 已安装软件的启停、开机启动、日志和卸载都在「软件管理」，运行环境的版本在「环境管理」。
 struct ServerSoftwareStoreView: View {
     let connection: ServerConnection
     let token: String
+    let openManagement: () -> Void
+    let openEnvironments: () -> Void
 
     @State private var items: [RemoteSoftware] = []
     @State private var jobs: [RemoteSoftwareJob] = []
-    @State private var pendingAction: (id: String, action: String)?
+    @State private var pendingInstallID: String?
     @State private var logSheet: SoftwareLogSheet?
     @State private var working = false
     @State private var message = ""
@@ -57,6 +61,15 @@ struct ServerSoftwareStoreView: View {
         }
     }
 
+    /// 本页只关心安装进度；卸载进度属于「软件管理」，不在这里重复展示。
+    private var installJobs: [RemoteSoftwareJob] {
+        jobs.filter { $0.operation == "install" }
+    }
+
+    private var activeInstallJobCount: Int {
+        installJobs.filter { ["queued", "installing", "cancelling"].contains($0.state) }.count
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -66,7 +79,7 @@ struct ServerSoftwareStoreView: View {
                 Button("刷新") { Task { await refresh() } }.disabled(working)
                 if working { ProgressView().controlSize(.small) }
             }
-            Text("浏览、安装和卸载软件；常用运行操作可直接使用，开机启动等设置在「软件管理」。")
+            Text("浏览软件目录并安装。安装完成后请到「软件管理」控制运行状态、开机启动和卸载；运行环境请到「环境管理」按版本安装。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -77,21 +90,24 @@ struct ServerSoftwareStoreView: View {
                     .lineLimit(3)
             }
 
-            if !jobs.isEmpty {
-                DisclosureGroup("任务列表 · \(jobs.filter { ["queued", "installing", "uninstalling", "cancelling"].contains($0.state) }.count) 进行中") {
-                    ForEach(jobs) { job in
-                        HStack {
-                            Text(items.first(where: { $0.id == job.id })?.name ?? job.id).fontWeight(.medium)
-                            Text(job.operation == "install" ? "安装" : "卸载")
-                            Text(job.state == "queued" ? "排队中" : job.state == "installing" ? "安装中" : job.state == "uninstalling" ? "卸载中" : job.state == "cancelling" ? "停止中" : job.state == "cancelled" ? "已停止" : job.state == "installed" || job.state == "not_installed" ? "已完成" : "失败")
-                                .foregroundStyle(.secondary)
-                            Text(verbatim: job.message).font(.caption).lineLimit(1)
-                            Spacer()
-                            if ["queued", "installing", "uninstalling"].contains(job.state) {
-                                Button("停止任务") { Task { await cancel(job.id) } }.disabled(working)
+            if !installJobs.isEmpty {
+                DisclosureGroup("安装任务 · \(activeInstallJobCount) 进行中") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(installJobs) { job in
+                            HStack(spacing: 8) {
+                                Text(items.first(where: { $0.id == job.id })?.name ?? job.id)
+                                    .fontWeight(.medium)
+                                Text(jobStateText(job.state))
+                                    .foregroundStyle(.secondary)
+                                Text(verbatim: job.message).font(.caption).lineLimit(1)
+                                Spacer(minLength: 0)
+                                if ["queued", "installing"].contains(job.state) {
+                                    Button("停止任务") { Task { await cancel(job.id) } }.disabled(working)
+                                }
                             }
                         }
                     }
+                    .padding(.top, 6)
                 }
             }
 
@@ -150,35 +166,18 @@ struct ServerSoftwareStoreView: View {
             Task { await refresh() }
         }
         .confirmationDialog(confirmTitle, isPresented: Binding(
-            get: { pendingAction != nil },
-            set: { if !$0 { pendingAction = nil } }
+            get: { pendingInstallID != nil },
+            set: { if !$0 { pendingInstallID = nil } }
         )) {
-            if let pendingAction {
-                if pendingAction.action == "uninstall" {
-                    Button("卸载并备份原目录", role: .destructive) {
-                        let selected = pendingAction
-                        self.pendingAction = nil
-                        perform((selected.id, "uninstall_backup"))
-                    }
-                    Button("彻底卸载", role: .destructive) {
-                        let selected = pendingAction
-                        self.pendingAction = nil
-                        perform((selected.id, "uninstall_purge"))
-                    }
-                } else {
-                    Button(actionLabel(pendingAction.action), role: pendingAction.action == "stop" ? .destructive : nil) {
-                        let selected = pendingAction
-                        self.pendingAction = nil
-                        perform(selected)
-                    }
-                }
+            Button("安装") {
+                let selected = pendingInstallID
+                pendingInstallID = nil
+                if let selected { performInstall(selected) }
             }
-            Button("取消", role: .cancel) { pendingAction = nil }
+            Button("取消", role: .cancel) { pendingInstallID = nil }
         } message: {
-            if pendingAction?.action == "install" {
-                Text(installNote(for: pendingAction?.id ?? ""))
-            } else if pendingAction?.action == "uninstall" {
-                Text("会先停止并禁用服务。备份选项将完整安装目录移到 /www/seraphim/backup/software，仍占用磁盘空间；彻底卸载会删除目录内的程序、配置和数据。系统依赖包、下载缓存及共享日志保留。")
+            if let pendingInstallID {
+                Text(installNote(for: pendingInstallID))
             }
         }
         .sheet(item: $logSheet) { sheet in
@@ -198,20 +197,20 @@ struct ServerSoftwareStoreView: View {
     }
 
     private var confirmTitle: String {
-        guard let pendingAction else { return "确认操作" }
-        let name = items.first(where: { $0.id == pendingAction.id })?.name ?? pendingAction.id
-        if pendingAction.action == "uninstall" { return "卸载 \(name)？" }
-        return "确定对 \(name) 执行\(actionLabel(pendingAction.action))？"
+        guard let pendingInstallID else { return "确认操作" }
+        let name = items.first(where: { $0.id == pendingInstallID })?.name ?? pendingInstallID
+        return "安装 \(name)？"
     }
 
-    private func actionLabel(_ action: String) -> String {
-        switch action {
-        case "install": return "安装"
-        case "uninstall": return "卸载"
-        case "start": return "启动"
-        case "stop": return "停止"
-        case "restart": return "重启"
-        default: return "操作"
+    private func jobStateText(_ state: String) -> String {
+        switch state {
+        case "queued": return "排队中"
+        case "installing": return "安装中"
+        case "uninstalling": return "卸载中"
+        case "cancelling": return "停止中"
+        case "cancelled": return "已停止"
+        case "installed", "not_installed": return "已完成"
+        default: return "失败"
         }
     }
 
@@ -268,26 +267,20 @@ struct ServerSoftwareStoreView: View {
             }
             .frame(width: 85, alignment: .trailing)
 
-            if item.canInstall && (item.state == "not_installed" || item.state == "failed" || item.state == "cancelled") {
-                Button("安装") { pendingAction = (item.id, "install") }
+            if !item.isRuntime && item.canInstall &&
+                (item.state == "not_installed" || item.state == "failed" || item.state == "cancelled") {
+                Button("安装") { pendingInstallID = item.id }
                     .disabled(working || !item.supported)
             }
-            if ["queued", "installing", "uninstalling"].contains(item.state) {
+            if ["queued", "installing"].contains(item.state) {
                 Button("停止") { Task { await cancel(item.id) } }.disabled(working)
             }
-            if item.isInstalled && item.hasService {
-                Menu("运行操作") {
-                    Button("启动") { pendingAction = (item.id, "start") }
-                        .disabled(item.isRunning)
-                    Button("停止") { pendingAction = (item.id, "stop") }
-                        .disabled(!item.isRunning)
-                    Button("重启") { pendingAction = (item.id, "restart") }
-                }
-                .disabled(working)
-            }
-            if item.canUninstall {
-                Button("卸载") { pendingAction = (item.id, "uninstall") }
-                    .disabled(working)
+            if item.isInstalled {
+                // 装好之后的一切操作都在「软件管理」，这里不再重复。
+                Button("去管理") { openManagement() }.disabled(working)
+            } else if item.isRuntime {
+                // 运行环境没有"默认版本"这回事，必须去「环境管理」挑具体版本。
+                Button("选择版本…") { openEnvironments() }.disabled(working)
             }
             if item.canInstall {
                 Button("日志") { Task { await showLog(item) } }
@@ -328,31 +321,16 @@ struct ServerSoftwareStoreView: View {
         }
     }
 
-    private func perform(_ selected: (id: String, action: String)) {
+    private func performInstall(_ id: String) {
         guard !working else { return }
         working = true
         Task {
             do {
-                if selected.action == "install" {
-                    try await ServerSoftwareAPI.install(connection: connection, token: token, id: selected.id)
-                } else if selected.action == "uninstall_backup" || selected.action == "uninstall_purge" {
-                    try await ServerSoftwareAPI.uninstall(connection: connection, token: token,
-                                                          id: selected.id,
-                                                          mode: selected.action == "uninstall_backup" ? .backup : .purge)
-                } else {
-                    try await ServerSoftwareAPI.service(connection: connection, token: token,
-                                                        id: selected.id, action: selected.action)
-                }
+                try await ServerSoftwareAPI.install(connection: connection, token: token, id: id)
                 working = false
                 await refresh()
                 if !hasError {
-                    if selected.action == "install" {
-                        message = "安装任务已开始"
-                    } else if selected.action.hasPrefix("uninstall_") {
-                        message = "卸载任务已开始，完成后请查看操作日志"
-                    } else {
-                        message = "操作完成"
-                    }
+                    message = "安装任务已开始，可在上方「安装任务」查看进度"
                 }
             } catch {
                 working = false

@@ -5,6 +5,8 @@ struct ServerFirewallView: View {
     let token: String
 
     @State private var snapshot: RemoteFirewallSnapshot?
+    @State private var service: RemoteService?
+    @State private var pendingServiceAction: String?
     @State private var newPort = ""
     @State private var newProtocol = "tcp"
     @State private var pendingRemove: RemoteFirewallPort?
@@ -20,10 +22,33 @@ struct ServerFirewallView: View {
                 Button("刷新") { Task { await refresh() } }.disabled(working)
                 if working { ProgressView().controlSize(.small) }
             }
-            Text("管理当前防火墙区域的 TCP/UDP 入站端口。服务启停在「软件管理」中操作；云服务器还需要配置云平台安全组。")
+            Text("管理防火墙服务的启停与开机启动，以及当前区域的 TCP/UDP 入站端口。云服务器还需要配置云平台安全组。")
                 .font(.caption).foregroundStyle(.secondary)
             if !message.isEmpty {
                 Text(verbatim: message).font(.callout).foregroundStyle(hasError ? Color.orange : Color.secondary)
+            }
+            if let service {
+                Card(title: "防火墙服务") {
+                    InfoRow(label: "服务单元", value: service.name)
+                    InfoRow(label: "运行状态", value: service.runningText)
+                    InfoRow(label: "开机启动", value: service.startupText)
+                    HStack(spacing: 8) {
+                        Button("启动") { pendingServiceAction = "start" }
+                            .disabled(working || service.isActive)
+                        Button("停止") { pendingServiceAction = "stop" }
+                            .disabled(working || !service.isActive)
+                        Button("重启") { pendingServiceAction = "restart" }
+                            .disabled(working)
+                        Divider().frame(height: 20)
+                        Button("开机启用") { pendingServiceAction = "enable" }
+                            .disabled(working || service.unitState != "disabled")
+                        Button("取消开机启用") { pendingServiceAction = "disable" }
+                            .disabled(working || !service.isEnabled)
+                    }
+                    .padding(.top, 6)
+                }
+            } else if !working && !hasError {
+                EmptyHint(text: "此服务器没有找到受支持的防火墙服务")
             }
             if let snapshot {
                 Card(title: "当前后端") {
@@ -79,6 +104,57 @@ struct ServerFirewallView: View {
         } message: {
             Text("应用可能无法再从该端口连接。请确认服务器还有其他管理入口。")
         }
+        .confirmationDialog(serviceConfirmTitle, isPresented: Binding(
+            get: { pendingServiceAction != nil },
+            set: { if !$0 { pendingServiceAction = nil } }
+        )) {
+            if let pendingServiceAction {
+                Button(serviceActionLabel(pendingServiceAction),
+                       role: pendingServiceAction == "stop" ? .destructive : nil) {
+                    let action = pendingServiceAction
+                    self.pendingServiceAction = nil
+                    Task { await performService(action) }
+                }
+            }
+            Button("取消", role: .cancel) { pendingServiceAction = nil }
+        } message: {
+            if let pendingServiceAction,
+               pendingServiceAction == "start" || pendingServiceAction == "enable" {
+                Text("请先确保防火墙允许 TCP 27520，否则可能中断 Seraphim 连接。")
+            }
+        }
+    }
+
+    private var serviceConfirmTitle: String {
+        guard let pendingServiceAction else { return "确认操作" }
+        return "确定对防火墙服务执行\(serviceActionLabel(pendingServiceAction))？"
+    }
+
+    private func serviceActionLabel(_ action: String) -> String {
+        switch action {
+        case "start": return "启动"
+        case "stop": return "停止"
+        case "restart": return "重启"
+        case "enable": return "开机启用"
+        case "disable": return "取消开机启用"
+        default: return "操作"
+        }
+    }
+
+    @MainActor private func performService(_ action: String) async {
+        guard let service else { return }
+        working = true
+        do {
+            try await ServerServiceAPI.perform(connection: connection, token: token,
+                                               name: service.name, action: action)
+            working = false
+            await refresh()
+            if !hasError { message = "已执行\(serviceActionLabel(action))" }
+        } catch {
+            working = false
+            hasError = true
+            message = error.localizedDescription
+        }
     }
 
     private func add() {
@@ -108,14 +184,20 @@ struct ServerFirewallView: View {
         guard !working else { return }
         working = true
         defer { working = false }
+        var errors: [String] = []
         do {
             snapshot = try await ServerFirewallAPI.snapshot(connection: connection, token: token)
-            hasError = false
-            message = ""
         } catch {
             snapshot = nil
-            hasError = true
-            message = error.localizedDescription
+            errors.append(error.localizedDescription)
         }
+        do {
+            service = try await ServerServiceAPI.list(connection: connection, token: token).first
+        } catch {
+            service = nil
+            errors.append("防火墙服务：\(error.localizedDescription)")
+        }
+        hasError = !errors.isEmpty
+        message = errors.joined(separator: "；")
     }
 }

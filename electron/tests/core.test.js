@@ -79,6 +79,60 @@ test('server actions use fixed routes and encoded path segments', () => {
   assert.throws(() => route('custom.endpoint', {}), /不支持/);
 });
 
+test('project diagnostics routes carry the long timeout and safe defaults', () => {
+  assert.deepEqual(route('projects.status', { id: 'wechats' }), ['GET', '/v1/projects/wechats/status']);
+  assert.deepEqual(route('projects.log', { id: 'wechats' }), ['GET', '/v1/projects/wechats/log']);
+  assert.deepEqual(route('projects.log.clear', { id: 'wechats' }), ['DELETE', '/v1/projects/wechats/log']);
+  // 装依赖可能要跑十几分钟，默认 120 秒会提前断开连接。
+  assert.deepEqual(route('projects.deps', { id: 'wechats' })[3], { timeout: 960000 });
+  assert.deepEqual(route('projects.venv', { id: 'wechats', action: 'create' })[3], { timeout: 660000 });
+  assert.throws(() => route('projects.venv', { id: 'wechats', action: 'rm -rf /' }), /操作/);
+  // 空闲端口要能兜住空参数与非数字，别把 undefined 拼进查询串。
+  assert.deepEqual(route('projects.ports', {}), ['GET', '/v1/projects/ports?after=3000']);
+  assert.deepEqual(route('projects.ports', { after: 53100 }), ['GET', '/v1/projects/ports?after=53100']);
+  assert.deepEqual(route('projects.ports', { after: 'abc' }), ['GET', '/v1/projects/ports?after=3000']);
+  assert.throws(() => route('projects.status', { id: 'a/b' }), /标识/);
+});
+
+test('global variable routes send the whole table and allow a long sync timeout', () => {
+  assert.deepEqual(route('variables.get', {}), ['GET', '/v1/variables']);
+  const [method, endpoint, body, options] = route('variables.save',
+    { variables: [{ name: 'PROJECT_RUNTIME', value: 'dev' }] });
+  assert.equal(method, 'PUT');
+  assert.equal(endpoint, '/v1/variables');
+  assert.deepEqual(body, { variables: [{ name: 'PROJECT_RUNTIME', value: 'dev' }] });
+  // 保存会顺带重建各项目单元并重启运行中的项目，120 秒可能不够。
+  assert.deepEqual(options, { timeout: 300000 });
+  // 清空整张表也必须是合法的：用户就是把变量全删了。
+  assert.deepEqual(route('variables.save', {})[2], { variables: [] });
+  assert.deepEqual(route('variables.save', { variables: 'nope' })[2], { variables: [] });
+});
+
+test('API 设置只读接口：接口列表、key 重置与桥脚本', () => {
+  // 这几个接口是「API 设置」页面的全部数据来源，路径写错页面就是空的。
+  assert.deepEqual(route('api.doc', {}), ['GET', '/v1/api']);
+  assert.deepEqual(route('api.script', {}), ['GET', '/v1/mcp/script']);
+  // 重置是一把纯动作：服务端自己生成新 key，请求体一律不看。传了参数也不能
+  // 把它发上去，否则等于给了「自己指定 key」的口子。
+  assert.deepEqual(route('api.reset', { key: '123456' }), ['POST', '/v1/api/key']);
+  assert.equal(route('api.reset', {}).length, 2);
+  // 桥脚本是纯文本响应，不需要任何参数，也不能顺手带上请求体。
+  assert.equal(route('api.script', {}).length, 2);
+});
+
+test('request options survive the IPC merge without dropping the body', () => {
+  // main.js 的写法是 { body, ...options }：route() 第 4 项里的 timeout 不能把 body 挤掉。
+  const [method, endpoint, body, options] = route('projects.venv', { id: 'wechats', action: 'create' });
+  assert.deepEqual({ body, ...options }, { body: { action: 'create' }, timeout: 660000 });
+  assert.equal(method, 'POST');
+  assert.equal(endpoint, '/v1/projects/wechats/venv');
+  // deps 是纯动作接口，没有请求体，合并后也不能变成 undefined 之外的东西。
+  const [depMethod, depEndpoint, depBody, depOptions] = route('projects.deps', { id: 'wechats' });
+  assert.deepEqual({ body: depBody, ...depOptions }, { body: undefined, timeout: 960000 });
+  assert.equal(depMethod, 'POST');
+  assert.equal(depEndpoint, '/v1/projects/wechats/deps');
+});
+
 test('AliDNS signature matches independent documented vector', () => {
   const params = { Format: 'XML', AccessKeyId: 'testid', Action: 'DescribeDomainRecords',
     SignatureMethod: 'HMAC-SHA1', DomainName: 'example.com',
@@ -117,10 +171,16 @@ test('pinned self-signed TLS accepts matching certificate before sending bearer 
   const cert = fs.readFileSync(certFile);
   const fingerprint = crypto.createHash('sha256').update(new crypto.X509Certificate(cert).raw).digest('hex');
   const seen = [];
+  const bodies = [];
   const server = https.createServer({ key: fs.readFileSync(keyFile), cert }, (req, res) => {
     seen.push(req.headers.authorization);
-    res.setHeader('Content-Type', 'application/json');
-    res.end('{"ok":true}');
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      bodies.push({ url: req.url, text: Buffer.concat(chunks).toString('utf8') });
+      res.setHeader('Content-Type', 'application/json');
+      res.end('{"ok":true}');
+    });
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const endpoint = `https://127.0.0.1:${server.address().port}`;
@@ -128,10 +188,17 @@ test('pinned self-signed TLS accepts matching certificate before sending bearer 
     const success = await request({ endpoint, fingerprint }, 'BearerSecret', 'GET', '/v1/status');
     assert.deepEqual(success.data, { ok: true });
     assert.deepEqual(seen, ['Bearer BearerSecret']);
+    // 走一遍 main.js 的合并路径：route() 给的 timeout 不能把请求体吃掉。
+    const [method, path, body, options] = route('projects.venv', { id: 'wechats', action: 'create' });
+    await request({ endpoint, fingerprint }, 'BearerSecret', method, path, { body, ...options });
+    assert.deepEqual(bodies, [
+      { url: '/v1/status', text: '' },
+      { url: '/v1/projects/wechats/venv', text: '{"action":"create"}' }
+    ]);
     await assert.rejects(request({ endpoint, fingerprint: '0'.repeat(64) }, 'wrong', 'GET', '/v1/status'), /指纹不匹配/);
-    assert.deepEqual(seen, ['Bearer BearerSecret']);
+    assert.deepEqual(seen, ['Bearer BearerSecret', 'Bearer BearerSecret']);
     await assert.rejects(request({ endpoint, fingerprint: '' }, 'wrong', 'GET', '/v1/status'), /certificate|self-signed/i);
-    assert.deepEqual(seen, ['Bearer BearerSecret']);
+    assert.deepEqual(seen, ['Bearer BearerSecret', 'Bearer BearerSecret']);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     fs.rmSync(dir, { recursive: true, force: true });

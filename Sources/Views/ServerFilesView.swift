@@ -19,9 +19,13 @@ struct ServerFilesView: View {
     @State private var selectedPath: String?
     @State private var action: String?
     @State private var nameInput = ""
-    @State private var permissionTarget: RemoteFile?
+    @State private var dialog: FileDialog?
     @State private var permissionsInput = ""
     @State private var permissionsError = ""
+    @State private var ownerInput = ""
+    @State private var groupInput = ""
+    @State private var ownerRecursive = false
+    @State private var ownerError = ""
     @State private var pendingUpload: [URL] = []
     @State private var dropTargeted = false
     @State private var pendingRename: (from: String, to: String)?
@@ -32,6 +36,31 @@ struct ServerFilesView: View {
     @State private var working = false
     @State private var message = ""
     @State private var hasError = false
+
+    /// 行上点开的编辑面板。SwiftUI 在同一个视图上挂多个 sheet 会互相顶掉，所以权限与
+    /// 属主共用一个 sheet，靠枚举区分。
+    private enum FileDialog: Identifiable {
+        case permissions(RemoteFile)
+        case owner(RemoteFile)
+
+        var item: RemoteFile {
+            switch self {
+            case .permissions(let item), .owner(let item): return item
+            }
+        }
+
+        var id: String {
+            switch self {
+            case .permissions(let item): return "permissions:" + item.path
+            case .owner(let item): return "owner:" + item.path
+            }
+        }
+    }
+
+    private var permissionTarget: RemoteFile? {
+        if case .permissions(let item) = dialog { return item }
+        return nil
+    }
 
     private var selected: RemoteFile? {
         listing?.entries.first(where: { $0.path == selectedPath })
@@ -63,6 +92,8 @@ struct ServerFilesView: View {
                     .disabled(working || selected == nil)
                 Button("修改权限") { if let selected { beginPermissions(for: selected) } }
                     .disabled(working || selected?.permissions == nil || selected?.isProtectedPath == true)
+                Button("修改所有者") { if let selected { beginOwner(for: selected) } }
+                    .disabled(working || selected?.owner == nil || selected?.isProtectedPath == true)
                 Button("删除") { if let selected { askDelete(selected) } }
                     .disabled(working || selected == nil || selected?.isProtectedPath == true)
                 Spacer(minLength: 0)
@@ -92,8 +123,9 @@ struct ServerFilesView: View {
             HStack(spacing: 8) {
                 Text("名称").frame(maxWidth: .infinity, alignment: .leading)
                 Text("权限").frame(width: 60, alignment: .trailing)
-                Text("大小").frame(width: 110, alignment: .trailing)
-                Text("修改时间").frame(width: 145, alignment: .trailing)
+                Text("所有者").frame(width: 130, alignment: .leading)
+                Text("大小").frame(width: 100, alignment: .trailing)
+                Text("修改时间").frame(width: 140, alignment: .trailing)
                 Text("操作").frame(width: 76, alignment: .trailing)
             }
             .font(.caption)
@@ -120,7 +152,7 @@ struct ServerFilesView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            Text("点击权限数字可修改权限；点击每行的删除按钮可删除文件或目录。新上传的普通文件默认 0644，新建目录默认 0755。")
+            Text("点击权限数字可修改权限；点击所有者可改属主与用户组；点击每行的删除按钮可删除文件或目录。新上传的普通文件默认 0644，新建目录默认 0755。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -148,34 +180,84 @@ struct ServerFilesView: View {
         } message: {
             Text(pendingDelete?.isDirectory == true ? "将递归删除 \(pendingDelete?.path ?? "") 及其全部内容。" : (pendingDelete?.path ?? ""))
         }
-        .sheet(item: $permissionTarget) { item in
-            VStack(alignment: .leading, spacing: 12) {
-                Text("修改权限").font(.headline)
-                Text(verbatim: item.path)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                TextField("例如 0644 或 0755", text: $permissionsInput)
-                    .font(.system(.body, design: .monospaced))
-                    .onSubmit { submitPermissions() }
-                if !permissionsError.isEmpty {
-                    Text(verbatim: permissionsError)
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                }
-                Text("普通文件通常用 0644，目录和可执行文件通常用 0755。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                HStack {
-                    Spacer()
-                    Button("取消") { permissionTarget = nil }
-                    Button("保存") { submitPermissions() }
-                        .keyboardShortcut(.defaultAction)
-                }
+        .sheet(item: $dialog) { entry in
+            switch entry {
+            case .permissions(let item): permissionsSheet(item)
+            case .owner(let item): ownerSheet(item)
             }
-            .padding(20)
-            .frame(width: 420)
         }
+    }
+
+    private func permissionsSheet(_ item: RemoteFile) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("修改权限").font(.headline)
+            Text(verbatim: item.path)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            TextField("例如 0644 或 0755", text: $permissionsInput)
+                .font(.system(.body, design: .monospaced))
+                .onSubmit { submitPermissions() }
+            if !permissionsError.isEmpty {
+                Text(verbatim: permissionsError)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            Text("普通文件通常用 0644，目录和可执行文件通常用 0755。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("取消") { dialog = nil }
+                Button("保存") { submitPermissions() }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
+    }
+
+    private func ownerSheet(_ item: RemoteFile) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("修改所有者").font(.headline)
+            Text(verbatim: item.path)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            HStack(spacing: 8) {
+                Text("所有者").frame(width: 64, alignment: .leading)
+                TextField("账户名或 UID", text: $ownerInput)
+                    .font(.system(.body, design: .monospaced))
+                    .onSubmit { submitOwner() }
+                Button("sera") { ownerInput = "sera"; groupInput = "sera" }
+                    .help("面板的业务运行账户：网站与项目都归它")
+            }
+            HStack(spacing: 8) {
+                Text("用户组").frame(width: 64, alignment: .leading)
+                TextField("组名或 GID，留空则不变", text: $groupInput)
+                    .font(.system(.body, design: .monospaced))
+                    .onSubmit { submitOwner() }
+            }
+            if item.isDirectory {
+                Toggle("同时应用到目录内的全部内容", isOn: $ownerRecursive)
+            }
+            if !ownerError.isEmpty {
+                Text(verbatim: ownerError)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            Text("留空的项目保持原值；也可以直接填数字 ID。修改所有权不影响读写权限。面板自己的 .sera-project.json、.sera-account 不会被改动，项目进程就无法改写自身配置。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("取消") { dialog = nil }
+                Button("保存") { submitOwner() }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
     }
 
     private func row(_ item: RemoteFile) -> some View {
@@ -207,10 +289,23 @@ struct ServerFilesView: View {
             } else {
                 Text("—").frame(width: 60, alignment: .trailing)
             }
+            if let ownerLabel = item.ownerLabel {
+                Button(ownerLabel) { beginOwner(for: item) }
+                    .buttonStyle(.plain)
+                    .font(.system(.callout, design: .monospaced))
+                    .foregroundStyle(Color.accentColor)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(width: 130, alignment: .leading)
+                    .help("点击修改所有者")
+                    .disabled(working || item.isProtectedPath)
+            } else {
+                Text("—").frame(width: 130, alignment: .leading)
+            }
             Text(item.isDirectory ? "—" : ByteCountFormatter.string(fromByteCount: item.sizeBytes, countStyle: .file))
-                .frame(width: 110, alignment: .trailing)
+                .frame(width: 100, alignment: .trailing)
             Text(String(item.modifiedAt.prefix(16)).replacingOccurrences(of: "T", with: " "))
-                .frame(width: 145, alignment: .trailing)
+                .frame(width: 140, alignment: .trailing)
             HStack(spacing: 4) {
                 if item.isDirectory {
                     Button("进入") { navigate(to: item.path) }
@@ -247,6 +342,9 @@ struct ServerFilesView: View {
         .contextMenu {
             if item.permissions != nil && !item.isProtectedPath {
                 Button("修改权限…") { beginPermissions(for: item) }
+            }
+            if item.owner != nil && !item.isProtectedPath {
+                Button("修改所有者…") { beginOwner(for: item) }
             }
             Button("删除", role: .destructive) { askDelete(item) }
                 .disabled(item.isProtectedPath)
@@ -318,7 +416,7 @@ struct ServerFilesView: View {
         action = nil
         permissionsInput = permissions
         permissionsError = ""
-        permissionTarget = item
+        dialog = .permissions(item)
     }
 
     private func submitPermissions() {
@@ -329,10 +427,43 @@ struct ServerFilesView: View {
             permissionsError = "请输入 000 到 0777 的八进制权限，例如 0644 或 0755"
             return
         }
-        permissionTarget = nil
+        dialog = nil
         execute {
             try await ServerFileAPI.chmod(connection: connection, token: token,
                                           path: item.path, permissions: value)
+        }
+    }
+
+    private func beginOwner(for item: RemoteFile) {
+        guard item.owner != nil, !item.isProtectedPath, !working else { return }
+        selectedPath = item.path
+        action = nil
+        ownerInput = item.owner ?? ""
+        groupInput = item.group ?? ""
+        ownerRecursive = item.isDirectory
+        ownerError = ""
+        dialog = .owner(item)
+    }
+
+    private func submitOwner() {
+        guard case .owner(let item) = dialog, !working else { return }
+        let owner = ownerInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let group = groupInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !owner.isEmpty || !group.isEmpty else {
+            ownerError = "请填写所有者或用户组；空着的那一项保持不变"
+            return
+        }
+        for value in [owner, group] where !value.isEmpty {
+            guard value.range(of: #"^[A-Za-z0-9_.@-]+$"#, options: .regularExpression) != nil else {
+                ownerError = "只允许字母、数字、下划线、点、横线与 @，或直接填数字 ID"
+                return
+            }
+        }
+        let recursive = ownerRecursive && item.isDirectory
+        dialog = nil
+        execute {
+            try await ServerFileAPI.chown(connection: connection, token: token, path: item.path,
+                                          owner: owner, group: group, recursive: recursive)
         }
     }
 

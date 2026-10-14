@@ -31,6 +31,9 @@ CORE=(
   "$ROOT/Sources/AIDevService.swift"
   "$ROOT/Sources/AIReviewService.swift"
   "$ROOT/Sources/AICloudService.swift"
+  # 服务端接口的模型层：纯 Foundation，没有任何 UI 依赖，但解错字段就是「面板显示
+  # 运行中、实际进程早就没了」这类问题的来源，值得一起测。
+  "$ROOT"/Sources/ServerManagement/*.swift
   "$ROOT/tests/FakeRedis.swift"
   "$ROOT/tests/main.swift"
 )

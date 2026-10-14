@@ -17,7 +17,7 @@ func TestVersionedRuntimePathsAndProjects(t *testing.T) {
 	root := t.TempDir()
 	sm := newSoftwareManager(root)
 	em := newEnvironmentManager(sm)
-	pm := newProjectManager(root, sm)
+	pm := newProjectManager(root, sm, newGlobalVariableManager(root))
 	base := em.versionPrefix("python", "3.13.16")
 	if err := os.MkdirAll(filepath.Join(base, "bin"), 0755); err != nil {
 		t.Fatal(err)

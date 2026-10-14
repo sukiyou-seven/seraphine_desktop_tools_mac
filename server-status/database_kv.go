@@ -14,6 +14,10 @@ import (
 	"time"
 )
 
+// errKeyValueAuth 表示 Redis/Valkey 拒绝了认证（NOAUTH / WRONGPASS）。
+// 调用方据此区分"实例有密码但面板没存"与"用户填错了密码"。
+var errKeyValueAuth = errors.New("key-value authentication required")
+
 type keyValueUser struct {
 	Name    string `json:"name"`
 	Enabled bool   `json:"enabled"`
@@ -99,7 +103,16 @@ func (dm *databaseManager) runKeyValueCLI(ctx context.Context, engine string, ar
 	command.Stdout, command.Stderr = output, output
 	err := command.Run()
 	result := strings.TrimSpace(string(output.data))
-	if err != nil || strings.HasPrefix(result, "ERR ") || strings.HasPrefix(result, "NOAUTH ") || strings.HasPrefix(result, "NOPERM ") || strings.HasPrefix(result, "WRONGPASS ") {
+	// 注意：redis-cli 对服务端错误回复（NOAUTH/WRONGPASS/NOPERM/ERR）**退出码是 0**，
+	// 且认证失败时 stderr 会先输出 "AUTH failed: WRONGPASS …" 再打 "NOAUTH …"，
+	// 两者被合并后既不以 "NOAUTH " 也不以 "WRONGPASS " 开头。
+	// 所以这里必须用包含判断：用前缀判断会让"保存了错误密码"静默成功。
+	if strings.Contains(result, "NOAUTH") || strings.Contains(result, "WRONGPASS") || strings.Contains(result, "AUTH failed") {
+		// 认证失败单独标记：调用方要给的提示与"密码填错了"完全不同。
+		return "", errKeyValueAuth
+	}
+	if err != nil || strings.Contains(result, "NOPERM") ||
+		strings.HasPrefix(result, "ERR ") || strings.HasPrefix(result, "-ERR") || strings.HasPrefix(result, "-NOAUTH") {
 		if len(result) > 1200 {
 			result = result[:1200]
 		}
@@ -118,7 +131,12 @@ func (dm *databaseManager) keyValueQuery(ctx context.Context, engine string, arg
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
-	return dm.kvRun(ctx, engine, args, input, password)
+	output, err := dm.kvRun(ctx, engine, args, input, password)
+	if errors.Is(err, errKeyValueAuth) {
+		// 直接把 "NOAUTH Authentication required." 抛给界面，用户无从下手。
+		return "", errors.New("该实例已设置密码，但面板还没保存正确的管理员密码。请先在「设置已有管理员密码」中填入当前密码并保存，再重试。")
+	}
+	return output, err
 }
 
 func (dm *databaseManager) keyValueSaveACL(ctx context.Context, engine string) error {
@@ -204,6 +222,9 @@ func (dm *databaseManager) keyValueSetAdminCredential(ctx context.Context, engin
 		return errors.New("管理员密码须为 8 至 512 字符")
 	}
 	if _, err := dm.kvRun(ctx, engine, []string{"ACL", "LIST"}, "", password); err != nil {
+		if errors.Is(err, errKeyValueAuth) {
+			return errors.New("密码验证失败，请填写该实例当前的管理员密码")
+		}
 		return err
 	}
 	return atomicSiteWrite(dm.keyValueAdminPath(engine), []byte(password+"\n"), 0600)

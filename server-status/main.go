@@ -162,7 +162,10 @@ func createCertificate(host string) ([]byte, []byte, string, error) {
 }
 
 type api struct {
-	token        string
+	// token 是面板客户端连服务器用的凭据（安装时生成，存在于客户端那边）。
+	token string
+	// apiKeys 是给脚本和 AI 客户端用的另一把，可以在面板上重置。
+	apiKeys      *apiKeyStore
 	collect      func(time.Duration) (snapshot, error)
 	limit        chan struct{}
 	files        *fileManager
@@ -171,15 +174,26 @@ type api struct {
 	sites        *siteManager
 	environments *environmentManager
 	projects     *projectManager
+	variables    *globalVariableManager
 	databases    *databaseManager
 	tasks        *taskManager
 	firewall     *firewallManager
 }
 
+// authorized 认两把钥匙：面板客户端用的 token，和给脚本 / AI 用的 API key。
+//
+// 权限相同，区别只在「能不能单独作废」——重置 API key 不会把已经连上的面板
+// 踢下线，重装面板也不会打断正在跑的自动化。
 func (a *api) authorized(r *http.Request) bool {
 	provided, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-	return ok && len(provided) == len(a.token) &&
-		subtle.ConstantTimeCompare([]byte(provided), []byte(a.token)) == 1
+	if !ok {
+		return false
+	}
+	if len(provided) == len(a.token) &&
+		subtle.ConstantTimeCompare([]byte(provided), []byte(a.token)) == 1 {
+		return true
+	}
+	return a.apiKeys.matches(provided)
 }
 
 func (a *api) status(w http.ResponseWriter, r *http.Request) {
@@ -261,8 +275,22 @@ func serveCommand(args []string) error {
 	defer root.Close()
 	handler := http.NewServeMux()
 	software := newSoftwareManager("/www/seraphim")
-	a := &api{token: token, collect: collect, limit: make(chan struct{}, 2), files: &fileManager{root: root}, services: &serviceManager{run: runSystemctl}, software: software, sites: newSiteManager("/www/seraphim", software), environments: newEnvironmentManager(software), projects: newProjectManager("/www/seraphim", software), databases: newDatabaseManager("/www/seraphim", software), tasks: newTaskManager("/www/seraphim"), firewall: newFirewallManager()}
+	// 变量表由项目与计划任务共用，所以在这里建一份实例再分发下去。
+	variables := newGlobalVariableManager("/www/seraphim")
+	// 共用文件被手工删掉时，不必等到下一次保存才恢复。失败不影响启动。
+	_ = variables.syncSharedFile()
+	a := &api{token: token, collect: collect, limit: make(chan struct{}, 2), files: &fileManager{root: root}, services: &serviceManager{run: runSystemctl}, software: software, sites: newSiteManager("/www/seraphim", software), environments: newEnvironmentManager(software), projects: newProjectManager("/www/seraphim", software, variables), variables: variables, databases: newDatabaseManager("/www/seraphim", software), tasks: newTaskManager("/www/seraphim"), firewall: newFirewallManager()}
+	// 给脚本 / AI 用的那把 key 单独放一个文件，和上面这把互不影响。
+	// 启动时就准备好，配置目录里能直接看见；失败也不拦启动，面板照样能用。
+	a.apiKeys = newAPIKeyStore(*dir)
+	if _, err := a.apiKeys.current(); err != nil {
+		log.Printf("API key unavailable: %v", err)
+	}
 	handler.HandleFunc("/v1/status", a.status)
+	handler.HandleFunc("/v1/api", a.apiHandler)
+	handler.HandleFunc("/v1/api/key", a.apiKeyHandler)
+	handler.HandleFunc("/v1/mcp", a.mcpHandler)
+	handler.HandleFunc("/v1/mcp/script", a.mcpScriptHandler)
 	handler.HandleFunc("/v1/files", a.filesHandler)
 	handler.HandleFunc("/v1/files/content", a.fileContentHandler)
 	handler.HandleFunc("/v1/services", a.servicesHandler)
@@ -274,6 +302,7 @@ func serveCommand(args []string) error {
 	handler.HandleFunc("/v1/environments/", a.environmentsHandler)
 	handler.HandleFunc("/v1/projects", a.projectsHandler)
 	handler.HandleFunc("/v1/projects/", a.projectsHandler)
+	handler.HandleFunc("/v1/variables", a.variablesHandler)
 	handler.HandleFunc("/v1/databases", a.databasesHandler)
 	handler.HandleFunc("/v1/databases/", a.databasesHandler)
 	handler.HandleFunc("/v1/tasks", a.tasksHandler)

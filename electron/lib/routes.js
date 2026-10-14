@@ -19,8 +19,9 @@ function route(action, p = {}) {
   case 'files.list': return ['GET', `/v1/files?${pathQuery(p.path)}`];
   case 'files.command':
     return ['POST', '/v1/files', {
-      operation: choice(p.operation, ['mkdir', 'touch', 'rename', 'chmod']),
-      path: p.path, destination: p.destination, overwrite: Boolean(p.overwrite), permissions: p.permissions
+      operation: choice(p.operation, ['mkdir', 'touch', 'rename', 'chmod', 'chown']),
+      path: p.path, destination: p.destination, overwrite: Boolean(p.overwrite), permissions: p.permissions,
+      owner: p.owner, group: p.group, recursive: Boolean(p.recursive)
     }];
   case 'files.delete': return ['DELETE', `/v1/files?${pathQuery(p.path)}&recursive=${p.recursive === true}`];
   case 'services.list': return ['GET', '/v1/services'];
@@ -58,11 +59,24 @@ function route(action, p = {}) {
   case 'projects.action': return ['POST', `/v1/projects/${segment(p.id)}/action`,
     { action: choice(p.action, ['start', 'stop', 'restart', 'enable', 'disable']) }];
   case 'projects.venv': return ['POST', `/v1/projects/${segment(p.id)}/venv`,
-    { action: choice(p.action, ['create', 'install_requirements', 'install_server']) }];
+    { action: choice(p.action, ['create', 'install_requirements', 'install_server']) },
+    { timeout: 660000 }];
+  // 装依赖可能要跑好几分钟（npm / pip 都很慢），默认 120 秒会提前断开。
+  case 'projects.deps': return ['POST', `/v1/projects/${segment(p.id)}/deps`, undefined, { timeout: 960000 }];
+  case 'projects.status': return ['GET', `/v1/projects/${segment(p.id)}/status`];
+  case 'projects.ports': return ['GET', `/v1/projects/ports?after=${Number(p.after) > 0 ? Number(p.after) : 3000}`];
   case 'projects.log': return ['GET', `/v1/projects/${segment(p.id)}/log`];
+  case 'projects.log.clear': return ['DELETE', `/v1/projects/${segment(p.id)}/log`];
+  // 面板级全局变量：整表读写，保存后服务端会同步进各项目单元。
+  case 'variables.get': return ['GET', '/v1/variables'];
+  case 'variables.save': return ['PUT', '/v1/variables',
+    { variables: Array.isArray(p.variables) ? p.variables : [] }, { timeout: 300000 }];
   case 'databases.list': return ['GET', '/v1/databases'];
   case 'databases.catalog': return ['GET', `/v1/databases/${segment(p.engine)}/catalog`];
-  case 'databases.create': return ['POST', `/v1/databases/${segment(p.engine)}/databases`, { name: p.name }];
+  case 'databases.create':
+    // 给出 user 时服务端同时创建账户、生成密码并授权到该库，响应里带回一次密码。
+    return ['POST', `/v1/databases/${segment(p.engine)}/databases`,
+      p.user ? { name: p.name, user: p.user, level: choice(p.level, ['read', 'readwrite']) } : { name: p.name }];
   case 'databases.delete': return ['DELETE', `/v1/databases/${segment(p.engine)}/databases/${segment(p.name)}`];
   case 'databases.user.create': return ['POST', `/v1/databases/${segment(p.engine)}/users`, { name: p.name }];
   case 'databases.user.delete': return ['DELETE', `/v1/databases/${segment(p.engine)}/users/${segment(p.name)}`];
@@ -95,6 +109,10 @@ function route(action, p = {}) {
   case 'tasks.update': return ['PUT', `/v1/tasks/${segment(p.id)}`, p.task];
   case 'tasks.delete': return ['DELETE', `/v1/tasks/${segment(p.id)}`];
   case 'tasks.log': return ['GET', `/v1/tasks/${segment(p.id)}?view=log`];
+  // 供脚本与 AI 客户端接入：接口列表 + 当前这把 key（能重置，不能自填）。
+  case 'api.doc': return ['GET', '/v1/api'];
+  case 'api.reset': return ['POST', '/v1/api/key'];
+  case 'api.script': return ['GET', '/v1/mcp/script'];
   default: throw new Error('不支持的接口操作');
   }
 }

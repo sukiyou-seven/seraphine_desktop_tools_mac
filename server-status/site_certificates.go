@@ -14,6 +14,46 @@ import (
 	"time"
 )
 
+// siteCertificateExists 判断网站已部署的证书文件是否还在。
+func siteCertificateExists(item site) bool {
+	certificate, key := siteCertificatePaths(item)
+	for _, path := range []string{certificate, key} {
+		if info, err := os.Stat(path); err != nil || !info.Mode().IsRegular() {
+			return false
+		}
+	}
+	return true
+}
+
+// describeCertificate 给列表里的网站补上已部署证书的信息。
+//
+// 证书本身没有单独的元数据文件：网站是否启用 HTTPS 记在 site.TLS 上，证书内容就在
+// sites/certificates 下。列表要显示「到期时间/覆盖域名」时现读一次证书文件即可，
+// 读不到或解析失败就保持原样——列表不能因为一张坏证书而失败。
+func (sm *siteManager) describeCertificate(item site) site {
+	if !item.TLS {
+		return item
+	}
+	certificatePath, _ := siteCertificatePaths(item)
+	data, err := os.ReadFile(certificatePath)
+	if err != nil {
+		return item
+	}
+	// fullchain 的第一个块是站点自己的证书，中间证书跟在后面。
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return item
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return item
+	}
+	item.TLSDomains = leaf.DNSNames
+	item.TLSExpiresAt = leaf.NotAfter.UTC().Format(time.RFC3339)
+	item.TLSIssuer = leaf.Issuer.CommonName
+	return item
+}
+
 func (sm *siteManager) deployCertificate(provider, id, certificate, privateKey string) error {
 	if len(certificate) == 0 || len(privateKey) == 0 || len(certificate) > 192<<10 || len(privateKey) > 64<<10 {
 		return errors.New("证书或私钥大小无效")
@@ -99,6 +139,25 @@ func (sm *siteManager) deployCertificate(provider, id, certificate, privateKey s
 	if err := atomicSiteWrite(keyPath, []byte(privateKey), 0600); err != nil {
 		return err
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	// 部署证书时会重写 vhost，顺手确保站点目录归共享账户、对应版本的 FPM 就绪，
+	// 并拿到 vhost 要转发到的地址。老站点可能还停在旧账户上，这里一并纠正。
+	phpTarget := ""
+	var certErr error
+	if item.Kind == "static" || item.Kind == "php" {
+		if err := sm.prepareSiteRoot(item); err != nil {
+			return err
+		}
+	}
+	if item.Kind == "php" {
+		if certErr = sm.ensurePHP(ctx, item.PHPVersion); certErr != nil {
+			return certErr
+		}
+		if phpTarget, certErr = sm.phpTarget(item.PHPVersion); certErr != nil {
+			return certErr
+		}
+	}
 	item.TLS = true
 	metadata, _ := json.MarshalIndent(item, "", "  ")
 	if err := atomicSiteWrite(paths[2], append(metadata, '\n'), 0644); err != nil {
@@ -110,21 +169,12 @@ func (sm *siteManager) deployCertificate(provider, id, certificate, privateKey s
 			port = candidate.Port
 		}
 	}
-	phpTarget := ""
-	if item.Kind == "php" {
-		phpTarget, err = sm.phpTarget(item.PHPVersion)
-		if err != nil {
-			return err
-		}
-	}
 	if err := atomicSiteWrite(paths[3], siteConfig(item, port, phpTarget), 0644); err != nil {
 		return err
 	}
 	if err := atomicSiteWrite(paths[4], []byte(siteTLSBase(string(snapshots[4].data), provider, true)), snapshots[4].mode); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-	defer cancel()
 	if err := sm.test(ctx, provider); err != nil {
 		return err
 	}

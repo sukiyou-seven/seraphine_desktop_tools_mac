@@ -36,9 +36,14 @@ struct ServerManagementView: View {
         ("运行与安全", [
             Module(id: 2, title: "软件管理", symbol: "gearshape.2"),
             Module(id: 3, title: "环境管理", symbol: "terminal"),
+            // 环境管理管的是运行时版本，环境变量管理管的是那份公用变量表，两者是邻居但不相干。
+            Module(id: 11, title: "环境变量管理", symbol: "key"),
+            Module(id: 10, title: "软件商店", symbol: "shippingbox"),
             Module(id: 8, title: "防火墙", symbol: "shield"),
             Module(id: 9, title: "计划任务", symbol: "calendar.badge.clock"),
-            Module(id: 10, title: "软件商店", symbol: "shippingbox")
+            // API 设置与「连接设置」不是一回事：那里填客户端怎么连，这里给的是
+            // 让脚本和 AI 客户端接进来的地址、key 与接口清单。
+            Module(id: 12, title: "API 设置", symbol: "curlybraces")
         ])
     ]
 
@@ -181,7 +186,10 @@ struct ServerManagementView: View {
             }
         case 2:
             connectedContent { connection, savedToken in
-                ServerServicesView(connection: connection, token: savedToken).id(selectedID)
+                ServerServicesView(connection: connection, token: savedToken,
+                                   openStore: { section = 10 },
+                                   openEnvironments: { section = 3 })
+                    .id(selectedID)
             }
         case 3:
             connectedContent { connection, savedToken in
@@ -195,14 +203,16 @@ struct ServerManagementView: View {
             connectedContent { connection, savedToken in
                 ServerSitesView(connection: connection, token: savedToken,
                                 openFiles: { path in fileStartPath = path; section = 1 },
-                                openStore: { section = 10 })
+                                openStore: { section = 10 },
+                                openDomains: { section = 4 })
                     .id(selectedID)
             }
         case 6:
             connectedContent { connection, savedToken in
                 ServerProjectsView(connection: connection, token: savedToken,
                                    openFiles: { path in fileStartPath = path; section = 1 },
-                                   openEnvironments: { section = 3 })
+                                   openEnvironments: { section = 3 },
+                                   openVariables: { section = 11 })
                     .id(selectedID)
             }
         case 7:
@@ -221,7 +231,18 @@ struct ServerManagementView: View {
             }
         case 10:
             connectedContent { connection, savedToken in
-                ServerSoftwareStoreView(connection: connection, token: savedToken).id(selectedID)
+                ServerSoftwareStoreView(connection: connection, token: savedToken,
+                                        openManagement: { section = 2 },
+                                        openEnvironments: { section = 3 })
+                    .id(selectedID)
+            }
+        case 11:
+            connectedContent { connection, savedToken in
+                ServerVariablesView(connection: connection, token: savedToken).id(selectedID)
+            }
+        case 12:
+            connectedContent { connection, savedToken in
+                ServerAPIAccessView(connection: connection, token: savedToken).id(selectedID)
             }
         default:
             statusAndPlaceholders

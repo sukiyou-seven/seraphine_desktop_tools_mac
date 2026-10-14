@@ -9,7 +9,10 @@ sera_stage '编译 OpenResty'
 make -j1
 sera_create_prefix
 make install
+# worker 以 sera 运行（面板唯一的业务账户），才读得到归 sera 所有的站点目录。
+sera_create_user sera
 cat > "$sera_prefix/nginx/conf/nginx.conf" <<'EOF'
+user sera;
 worker_processes 1;
 pid /www/seraphim/server/openresty/nginx/logs/nginx.pid;
 events { worker_connections 512; }

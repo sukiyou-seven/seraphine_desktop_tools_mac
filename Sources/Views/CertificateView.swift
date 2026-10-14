@@ -373,7 +373,7 @@ private struct ACMECertificatesCard: View {
                 VStack(spacing: 0) {
                     HStack {
                         Text("域名").font(.caption).frame(width: 200, alignment: .leading)
-                        Text("类型").font(.caption).frame(width: 80, alignment: .leading)
+                        Text("类型").font(.caption).frame(width: 96, alignment: .leading)
                         Text("下次续期").font(.caption).frame(width: 200, alignment: .leading)
                         Text("证书路径").font(.caption).frame(maxWidth: .infinity, alignment: .leading)
                         Spacer().frame(width: 150)
@@ -393,17 +393,19 @@ private struct ACMECertificatesCard: View {
                             }
                             .frame(width: 200, alignment: .leading)
 
-                            Text(verbatim: certificate.keyLength)
+                            Text(verbatim: certificate.keyLabel)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                                .frame(width: 80, alignment: .leading)
+                                .frame(width: 96, alignment: .leading)
                             Text(verbatim: certificate.renewAt.isEmpty ? "—" : String(certificate.renewAt.prefix(16)))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .frame(width: 200, alignment: .leading)
                             CopyableText(text: certificate.fullchainPath, monospaced: false)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                            Button("续期") { model.renewCertificate(certificate.domain) }
+                            Button("续期") {
+                                model.renewCertificate(certificate.domain, ecc: certificate.isECC)
+                            }
                                 .buttonStyle(.borderless)
                                 .font(.caption)
                             Button("部署到网站") { deployingCertificate = certificate }
@@ -478,11 +480,11 @@ private struct CertificateDeploymentSheet: View {
         working = true
         defer { working = false }
         do {
-            let fullchain = try String(contentsOfFile: certificate.fullchainPath, encoding: .utf8)
-            let key = try String(contentsOfFile: certificate.keyPath, encoding: .utf8)
+            let files = try certificate.readDeploymentFiles()
             try await ServerSiteAPI.deployCertificate(connection: connection,
                                                       token: ServerConnectionStore.token(for: connectionID),
-                                                      site: site, certificate: fullchain, privateKey: key)
+                                                      site: site, certificate: files.certificate,
+                                                      privateKey: files.privateKey)
             dismiss()
         } catch { message = error.localizedDescription }
     }

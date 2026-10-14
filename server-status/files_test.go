@@ -243,8 +243,12 @@ func TestManagedProjectFileUploadPermissions(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer root.Close()
+	ownerCalls := 0
 	a := &api{token: "secret", files: &fileManager{root: root,
-		projectOwner: func() (int, int, error) { return os.Getuid(), os.Getgid(), nil }}}
+		projectOwner: func() (int, int, error) {
+			ownerCalls++
+			return os.Getuid(), os.Getgid(), nil
+		}}}
 	request := func(method, target string, body []byte) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, target, bytes.NewReader(body))
 		r.Header.Set("Authorization", "Bearer secret")
@@ -274,5 +278,9 @@ func TestManagedProjectFileUploadPermissions(t *testing.T) {
 	}
 	if content, err := os.ReadFile(filepath.Join(projectDir, "src/main.py")); err != nil || !bytes.Equal(content, data) {
 		t.Fatalf("content: %q %v", content, err)
+	}
+	// 工程目录里的新内容要改属到运行账户，而不是留在 root 名下。
+	if ownerCalls == 0 {
+		t.Fatal("工程目录内的写入没有解析运行账户")
 	}
 }

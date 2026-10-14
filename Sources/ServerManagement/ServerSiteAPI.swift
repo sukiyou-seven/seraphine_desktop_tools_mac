@@ -10,8 +10,26 @@ struct RemoteSite: Codable, Identifiable {
     let root: String
     let enabled: Bool
     let tls: Bool?
+    /// 下面三项由服务端在列表时从已部署的证书里读出来，用于在网站管理里显示 HTTPS 状态。
+    let tlsDomains: [String]?
+    let tlsExpiresAt: String?
+    let tlsIssuer: String?
     var uniqueID: String { "\(provider)/\(id)" }
     var primaryDomain: String { domains.first ?? id }
+    var tlsEnabled: Bool { tls == true }
+    /// 证书到期日期（yyyy-MM-dd）；服务端读不到证书时为 nil。
+    var tlsExpiryDate: String? {
+        guard let raw = tlsExpiresAt, raw.count >= 10 else { return nil }
+        return String(raw.prefix(10))
+    }
+    var providerLabel: String {
+        switch provider {
+        case "nginx": return "Nginx"
+        case "apache": return "Apache"
+        case "openresty": return "OpenResty"
+        default: return provider
+        }
+    }
 }
 
 struct RemoteSiteProvider: Decodable, Identifiable {
@@ -94,15 +112,19 @@ enum ServerSiteAPI {
         }
     }
 
+    private static func decoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return decoder
+    }
+
     static func list(connection: ServerConnection, token: String) async throws -> RemoteSiteListing {
         let session = try session(connection: connection)
         defer { session.invalidateAndCancel() }
         let (data, response) = try await session.data(for: request(connection: connection, token: token,
                                                                      path: "/v1/sites", method: "GET"))
         try check(response, data: data, expected: 200)
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        return try decoder.decode(RemoteSiteListing.self, from: data)
+        return try decoder().decode(RemoteSiteListing.self, from: data)
     }
 
     static func create(connection: ServerConnection, token: String,
@@ -115,7 +137,7 @@ enum ServerSiteAPI {
         let (data, response) = try await session.data(for: request(connection: connection, token: token,
                                                                      path: "/v1/sites", method: "POST", body: body))
         try check(response, data: data, expected: 201)
-        return try JSONDecoder().decode(RemoteSite.self, from: data)
+        return try decoder().decode(RemoteSite.self, from: data)
     }
 
     static func update(connection: ServerConnection, token: String, site: RemoteSite,

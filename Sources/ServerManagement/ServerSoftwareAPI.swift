@@ -49,6 +49,14 @@ struct RemoteSoftware: Decodable, Identifiable {
         default: return "已停止"
         }
     }
+
+    /// 这些运行时由「环境管理」按版本安装，软件商店只显示入口、不重复提供安装按钮，
+    /// 否则同一个运行时会有两条能力不同的安装路径。
+    static let runtimeIDs: Set<String> = [
+        "python", "go", "node", "openjdk", "dotnet", "ruby", "bun", "deno", "php",
+    ]
+
+    var isRuntime: Bool { RemoteSoftware.runtimeIDs.contains(id) }
 }
 
 enum RemoteSoftwareUninstallMode: String {

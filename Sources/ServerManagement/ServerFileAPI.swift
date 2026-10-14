@@ -5,11 +5,21 @@ struct RemoteFile: Decodable, Identifiable {
     let path: String
     let kind: String
     let permissions: String?
+    let owner: String?
+    let group: String?
+    let uid: Int?
+    let gid: Int?
     let sizeBytes: Int64
     let modifiedAt: String
     var id: String { path }
     var isDirectory: Bool { kind == "directory" }
     var isRegularFile: Bool { kind == "file" }
+    /// 列表里显示成「所有者:用户组」，两者相同时只显示所有者。
+    var ownerLabel: String? {
+        guard let owner else { return nil }
+        guard let group, group != owner else { return owner }
+        return "\(owner):\(group)"
+    }
     var isProtectedPath: Bool {
         ["/", "/www", "/www/seraphim", "/www/seraphim/server", "/www/seraphim/web",
          "/www/seraphim/projects", "/www/seraphim/download", "/www/seraphim/backup",
@@ -38,6 +48,7 @@ enum ServerFileError: LocalizedError {
         case .response(404): return "文件或目录不存在，请刷新"
         case .response(409): return "目标已存在，或目录不为空"
         case .response(413): return "文件超过 2 GiB 上传限制"
+        case .response(422): return "指定的用户或用户组不存在"
         case .response(let code): return "文件接口返回 HTTP \(code)"
         }
     }
@@ -103,18 +114,23 @@ enum ServerFileAPI {
 
     private static func command(connection: ServerConnection, token: String, operation: String,
                                 path: String, destination: String? = nil, overwrite: Bool = false,
-                                permissions: String? = nil) async throws {
+                                permissions: String? = nil, owner: String? = nil,
+                                group: String? = nil, recursive: Bool = false) async throws {
         struct Payload: Encodable {
             let operation: String
             let path: String
             let destination: String?
             let overwrite: Bool
             let permissions: String?
+            let owner: String?
+            let group: String?
+            let recursive: Bool
         }
         let url = try url(endpoint: connection.endpoint, path: "/v1/files", remotePath: path)
         let body = try JSONEncoder().encode(Payload(operation: operation, path: path,
                                                      destination: destination, overwrite: overwrite,
-                                                     permissions: permissions))
+                                                     permissions: permissions, owner: owner,
+                                                     group: group, recursive: recursive))
         let session = try makeSession(connection: connection)
         defer { session.invalidateAndCancel() }
         let (_, response) = try await session.data(for: request(url, method: "POST", token: token, json: body))
@@ -133,6 +149,13 @@ enum ServerFileAPI {
                       permissions: String) async throws {
         try await command(connection: connection, token: token, operation: "chmod",
                           path: path, permissions: permissions)
+    }
+
+    /// 修改所有者与用户组。空字符串表示保持原值；目录可递归作用于子项。
+    static func chown(connection: ServerConnection, token: String, path: String,
+                      owner: String, group: String, recursive: Bool) async throws {
+        try await command(connection: connection, token: token, operation: "chown",
+                          path: path, owner: owner, group: group, recursive: recursive)
     }
 
     static func rename(connection: ServerConnection, token: String, from: String,

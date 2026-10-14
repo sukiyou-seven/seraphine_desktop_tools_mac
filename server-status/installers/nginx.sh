@@ -48,10 +48,14 @@ cd "$work"
     --with-http_ssl_module --with-http_v2_module --with-stream
 make -j1
 echo 'SERA_STAGE:安装 Nginx 到 /www/seraphim/server/nginx'
+# 面板只有两种身份：root 做需要特权的事，sera 跑一切业务进程（Web worker、PHP、项目）。
+# worker 以 sera 运行，因此读得到归 sera 所有的站点目录。
+sera_create_user sera
 created=1
 make install
 install -d -m 0755 "$prefix/run" "$root/web"
 cat > "$prefix/conf/nginx.conf" <<'CONFIG'
+user sera;
 worker_processes  1;
 pid /www/seraphim/server/nginx/run/nginx.pid;
 error_log /www/seraphim/logs/nginx-error.log warn;

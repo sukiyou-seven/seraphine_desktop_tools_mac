@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -30,6 +29,10 @@ type site struct {
 	Root       string   `json:"root"`
 	Enabled    bool     `json:"enabled"`
 	TLS        bool     `json:"tls,omitempty"`
+	// 下面三项只在列表接口里按已部署的证书文件填充，不写进网站元数据。
+	TLSDomains   []string `json:"tls_domains,omitempty"`
+	TLSExpiresAt string   `json:"tls_expires_at,omitempty"`
+	TLSIssuer    string   `json:"tls_issuer,omitempty"`
 }
 
 type siteProvider struct {
@@ -47,14 +50,16 @@ type siteListing struct {
 }
 
 type siteManager struct {
-	root      string
-	software  *softwareManager
-	mu        sync.Mutex
-	test      func(context.Context, string) error
-	reload    func(context.Context, string) error
-	start     func(context.Context, string) error
-	phpReady  func(string) bool
-	isRunning func(context.Context, string) bool
+	root       string
+	unitDir    string
+	software   *softwareManager
+	mu         sync.Mutex
+	test       func(context.Context, string) error
+	reload     func(context.Context, string) error
+	start      func(context.Context, string) error
+	phpReady   func(string) bool
+	isRunning  func(context.Context, string) bool
+	ensureUser func() (int, int, error)
 }
 
 var siteProviders = []siteProvider{
@@ -65,7 +70,8 @@ var siteProviders = []siteProvider{
 var siteLabel = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 
 func newSiteManager(root string, software *softwareManager) *siteManager {
-	sm := &siteManager{root: root, software: software}
+	sm := &siteManager{root: root, unitDir: "/etc/systemd/system", software: software,
+		ensureUser: ensureSharedAccount}
 	sm.test = func(ctx context.Context, provider string) error {
 		var binary, config string
 		switch provider {
@@ -193,7 +199,7 @@ func (sm *siteManager) normalize(input site) (site, error) {
 		input.PHPVersion = ""
 	} else if input.Kind == "php" {
 		input.Upstream = ""
-		if _, err := sm.phpTarget(input.PHPVersion); err != nil {
+		if _, err := sm.phpPrefix(input.PHPVersion); err != nil {
 			return site{}, err
 		}
 	} else {
@@ -201,92 +207,6 @@ func (sm *siteManager) normalize(input site) (site, error) {
 		input.PHPVersion = ""
 	}
 	return input, nil
-}
-
-func (sm *siteManager) phpTarget(version string) (string, error) {
-	if !versionPattern.MatchString(version) {
-		return "", errors.New("请选择已安装的 PHP 版本")
-	}
-	legacy := filepath.Join(sm.root, "server/php")
-	versioned := filepath.Join(legacy, "versions", version)
-	for _, entry := range []struct{ prefix, target string }{
-		{versioned, "unix:" + filepath.Join(versioned, "run/php-fpm.sock")},
-		{legacy, "127.0.0.1:9000"},
-	} {
-		if directory, err := os.Lstat(entry.prefix); err != nil || !directory.IsDir() {
-			continue
-		}
-		info, err := os.Lstat(filepath.Join(entry.prefix, ".sera-installed"))
-		if err != nil || !info.Mode().IsRegular() {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(entry.prefix, ".sera-installed"))
-		if err == nil && strings.TrimSpace(string(data)) == version {
-			return entry.target, nil
-		}
-	}
-	return "", fmt.Errorf("PHP %s 尚未安装，请先在环境管理安装", version)
-}
-
-func (sm *siteManager) ensurePHP(ctx context.Context, version string) error {
-	target, err := sm.phpTarget(version)
-	if err != nil {
-		return err
-	}
-	unit := "sera-php.service"
-	if strings.HasPrefix(target, "unix:") {
-		unit = "sera-php-" + version + ".service"
-		runDir := filepath.Dir(strings.TrimPrefix(target, "unix:"))
-		if info, err := os.Lstat(runDir); err != nil || !info.IsDir() {
-			return fmt.Errorf("PHP socket 目录无效：%s", runDir)
-		}
-		if err := os.Chmod(runDir, 0750); err != nil {
-			return fmt.Errorf("PHP socket 目录权限设置失败：%w", err)
-		}
-	}
-	logDir := "php"
-	if strings.HasPrefix(target, "unix:") {
-		logDir = "php-" + version
-	}
-	logFile := filepath.Join(sm.root, "logs", logDir, "php-fpm.log")
-	if info, err := os.Lstat(logFile); err == nil {
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("PHP 日志文件无效：%s", logFile)
-		}
-		account, err := user.Lookup("seraphim-web")
-		if err != nil {
-			return fmt.Errorf("PHP 运行用户不存在：%w", err)
-		}
-		uid, err := strconv.Atoi(account.Uid)
-		if err != nil {
-			return err
-		}
-		gid, err := strconv.Atoi(account.Gid)
-		if err != nil {
-			return err
-		}
-		if err := os.Chown(logFile, uid, gid); err != nil {
-			return fmt.Errorf("PHP 日志权限修复失败：%w", err)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	output, err := sm.software.systemctl(ctx, "is-active", unit)
-	if err != nil || strings.TrimSpace(string(output)) != "active" {
-		output, err = sm.software.systemctl(ctx, "start", unit)
-		if err != nil {
-			return fmt.Errorf("PHP %s 启动失败：%s", version, strings.TrimSpace(string(output)))
-		}
-	}
-	deadline := time.Now().Add(8 * time.Second)
-	for time.Now().Before(deadline) && ctx.Err() == nil {
-		output, err = sm.software.systemctl(ctx, "is-active", unit)
-		if err == nil && strings.TrimSpace(string(output)) == "active" && sm.phpReady(target) {
-			return nil
-		}
-		time.Sleep(150 * time.Millisecond)
-	}
-	return fmt.Errorf("PHP %s 服务未就绪，请检查 PHP-FPM 日志", version)
 }
 
 func (sm *siteManager) phpVersions() []string {
@@ -371,7 +291,7 @@ func (sm *siteManager) list() (siteListing, error) {
 			if err := json.Unmarshal(data, &item); err != nil {
 				return siteListing{}, err
 			}
-			result.Items = append(result.Items, item)
+			result.Items = append(result.Items, sm.describeCertificate(item))
 		}
 	}
 	sort.Slice(result.Items, func(i, j int) bool {
@@ -432,6 +352,10 @@ func siteConfig(item site, port int, phpTarget string) []byte {
 	access := filepath.Join("/www/seraphim/logs", item.Provider+"-"+item.ID+"-access.log")
 	problem := filepath.Join("/www/seraphim/logs", item.Provider+"-"+item.ID+"-error.log")
 	if item.Provider == "apache" {
+		// 正则必须原样写成 "\\.php$"（Go 源码里的 `"\.php$"`）。用 %q 会输出
+		// "\\\\.php$"，Apache 把它读成「一个反斜杠 + 任意字符」，永远匹配不到
+		// .php 请求：PHP 站点会被当纯文本吐出源码，静态站点的源码保护也会失效。
+		const phpFiles = `"\.php$"`
 		var body strings.Builder
 		fmt.Fprintf(&body, "<VirtualHost *:%d>\n    ServerName %s\n", port, item.Domains[0])
 		for _, domain := range item.Domains[1:] {
@@ -446,9 +370,9 @@ func siteConfig(item site, port int, phpTarget string) []byte {
 				if strings.HasPrefix(phpTarget, "unix:") {
 					handler = "proxy:" + phpTarget + "|fcgi://localhost/"
 				}
-				fmt.Fprintf(&body, "    <FilesMatch %q>\n        SetHandler %q\n    </FilesMatch>\n", `\.php$`, handler)
+				fmt.Fprintf(&body, "    <FilesMatch %s>\n        SetHandler %q\n    </FilesMatch>\n", phpFiles, handler)
 			} else {
-				fmt.Fprintf(&body, "    <FilesMatch %q>\n        Require all denied\n    </FilesMatch>\n", `\.php$`)
+				fmt.Fprintf(&body, "    <FilesMatch %s>\n        Require all denied\n    </FilesMatch>\n", phpFiles)
 			}
 		} else {
 			fmt.Fprintf(&body, "    ProxyPreserveHost On\n    ProxyPass / %q\n    ProxyPassReverse / %q\n", item.Upstream+"/", item.Upstream+"/")
@@ -550,32 +474,52 @@ func (sm *siteManager) otherTLS(provider, excludedID string) (bool, error) {
 	return false, nil
 }
 
+// replaceApacheAccount 把 httpd.conf 里的 User/Group 指令统一成共享账户。
+// 指令缺失时补在末尾：两者都是全局指令，位置不影响解析。
+func replaceApacheAccount(base string) string {
+	for _, directive := range []string{"User", "Group"} {
+		pattern := regexp.MustCompile(`(?m)^\s*` + directive + `\s+\S+\s*$`)
+		if pattern.MatchString(base) {
+			base = pattern.ReplaceAllString(base, directive+" "+sharedAccount)
+			continue
+		}
+		base += directive + " " + sharedAccount + "\n"
+	}
+	return base
+}
+
 func siteInclude(base, provider, root string, php bool) ([]byte, error) {
 	pattern := filepath.Join(root, "sites", provider, "*.conf")
 	if provider == "apache" {
-		if php {
-			base = strings.Replace(base, "Group seraphim-apache", "Group seraphim-web", 1)
-		}
+		// Apache 的工作进程也必须以共享账户运行，才读得到站点目录（归 sera 所有）。
+		// 安装脚本原先把 daemon 换成 seraphim-apache，这里统一收敛到 sera。
+		base = replaceApacheAccount(base)
 		for _, module := range []string{"proxy_module", "proxy_http_module", "proxy_fcgi_module"} {
 			if module == "proxy_fcgi_module" && !php {
 				continue
 			}
-			if !strings.Contains(base, "LoadModule "+module+" ") {
-				base += "\nLoadModule " + module + " modules/mod_" + strings.TrimSuffix(module, "_module") + ".so\n"
+			// 只认真正生效的 LoadModule。官方 httpd.conf 给每个模块都留了一行被注释的
+			// 示例，#LoadModule proxy_fcgi_module 会被 Contains 误判成「已加载」，
+			// 于是 fcgi 处理器永远没被加载：Apache 把 .php 当普通文件吐源码，
+			// 静态站点的源码保护也一起失效，而 httpd -t 不会报错。
+			if regexp.MustCompile(`(?m)^\s*LoadModule\s+` + module + `\s`).MatchString(base) {
+				continue
 			}
+			base += "\nLoadModule " + module + " modules/mod_" + strings.TrimSuffix(module, "_module") + ".so\n"
 		}
 		if !strings.Contains(base, pattern) {
 			base += "IncludeOptional " + pattern + "\n"
 		}
 		return []byte(base), nil
 	}
-	if php {
-		userLine := regexp.MustCompile(`(?m)^\s*user\s+[^;]+;\s*$`)
-		if userLine.MatchString(base) {
-			base = userLine.ReplaceAllString(base, "user seraphim-web;")
-		} else {
-			base = "user seraphim-web;\n" + base
-		}
+	// Web 服务工作进程统一以共享账户运行：它既是站点目录的属主，也在 sera 组里，
+	// 所以读得到站点内容、连得上 PHP-FPM 的 Unix socket。无论是静态站点还是 PHP
+	// 站点都要写这一行——worker 用系统默认账户（nobody）时连站点目录都进不去。
+	userDirective := regexp.MustCompile(`(?m)^\s*user\s+[^;]+;\s*$`)
+	if userDirective.MatchString(base) {
+		base = userDirective.ReplaceAllString(base, "user "+sharedAccount+";")
+	} else {
+		base = "user " + sharedAccount + ";\n" + base
 	}
 	if strings.Contains(base, pattern) {
 		return []byte(base), nil
@@ -612,10 +556,11 @@ func atomicSiteWrite(path string, data []byte, mode os.FileMode) error {
 }
 
 func ensureSiteRoot(root, provider, id string) error {
+	siteRoot := filepath.Join(root, "web", provider, id)
 	for _, directory := range []string{
 		filepath.Join(root, "web"),
 		filepath.Join(root, "web", provider),
-		filepath.Join(root, "web", provider, id),
+		siteRoot,
 	} {
 		info, err := os.Lstat(directory)
 		if errors.Is(err, os.ErrNotExist) {
@@ -630,8 +575,11 @@ func ensureSiteRoot(root, provider, id string) error {
 		if !info.IsDir() {
 			return fmt.Errorf("网站目录不能是软链接或文件：%s", directory)
 		}
-		if err := os.Chmod(directory, info.Mode().Perm()|0755); err != nil {
-			return err
+		// 上层目录只需可遍历，站点目录自身的归属与权限交给 prepareSiteRoot。
+		if directory != siteRoot {
+			if err := os.Chmod(directory, info.Mode().Perm()|0755); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -734,10 +682,16 @@ func (sm *siteManager) apply(input site, deleteSite, creating bool) (site, error
 	if err != nil {
 		return site{}, err
 	}
+	// 证书文件被手工删掉、或从只恢复了一部分的备份里捡回来时，元数据里仍留着 tls=true，
+	// 于是 vhost 引用一个不存在的证书：Web 服务的配置检查会失败，之后保存任何网站都 409。
+	// 这里就地纠正——没有证书文件就当没启用 HTTPS，vhost 回到只用 80 的状态。
+	input.TLS = input.TLS && siteCertificateExists(input)
 	needsTLS := otherTLS || (!deleteSite && input.TLS && input.Enabled)
 	if err := os.MkdirAll(sm.siteDir(input.Provider), 0755); err != nil {
 		return site{}, err
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
 	changed := false
 	defer func() {
 		if changed {
@@ -765,6 +719,11 @@ func (sm *siteManager) apply(input site, deleteSite, creating bool) (site, error
 			if err := ensureSiteRoot(sm.root, input.Provider, input.ID); err != nil {
 				return site{}, err
 			}
+			// 站点目录归共享业务账户：PHP 才能在站点里写文件、建上传目录。
+			// 静态站点同样归它，与项目保持一致，权限模型只有 root 与 sera 两层。
+			if err := sm.prepareSiteRoot(input); err != nil {
+				return site{}, err
+			}
 		}
 		base, err := siteInclude(string(snapshots[0].data), input.Provider, sm.root, input.Kind == "php")
 		if err != nil {
@@ -788,7 +747,10 @@ func (sm *siteManager) apply(input site, deleteSite, creating bool) (site, error
 			}
 			phpTarget := ""
 			if input.Kind == "php" {
-				var err error
+				// 对应版本的 FPM 先就绪，vhost 才知道该转发到哪里。
+				if err := sm.ensurePHP(ctx, input.PHPVersion); err != nil {
+					return site{}, err
+				}
 				phpTarget, err = sm.phpTarget(input.PHPVersion)
 				if err != nil {
 					return site{}, err
@@ -801,15 +763,8 @@ func (sm *siteManager) apply(input site, deleteSite, creating bool) (site, error
 			return site{}, err
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-	defer cancel()
 	if err := sm.test(ctx, input.Provider); err != nil {
 		return site{}, err
-	}
-	if !deleteSite && input.Enabled && input.Kind == "php" {
-		if err := sm.ensurePHP(ctx, input.PHPVersion); err != nil {
-			return site{}, err
-		}
 	}
 	if sm.isRunning(ctx, input.Provider) {
 		if err := sm.reload(ctx, input.Provider); err != nil {

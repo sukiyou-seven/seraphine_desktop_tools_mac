@@ -67,18 +67,39 @@ func (pm *projectManager) pythonServerReady(item project) bool {
 	return true
 }
 
+// runAsProject 以项目运行账户在工程目录里执行一条命令，输出进项目日志。
+//
+// 工作目录必须是工程目录而不是固定的项目目录：npm install / bundle install
+// 这些命令只认当前目录下的清单文件，项目用自定义目录时原来会装到别处去。
 func (pm *projectManager) runAsProject(ctx context.Context, item project, binary string, args []string, log *os.File) error {
 	uid, gid, err := pm.ensureUser()
 	if err != nil {
 		return err
 	}
+	data := pm.dataDir(item.ID)
 	cmd := exec.CommandContext(ctx, binary, args...)
-	cmd.Dir = pm.projectDir(item.ID)
+	cmd.Dir = item.Directory
 	cmd.Env = []string{
-		"HOME=" + pm.dataDir(item.ID),
-		"PATH=" + filepath.Dir(binary) + ":/usr/local/bin:/usr/bin:/bin",
-		"PIP_CACHE_DIR=" + filepath.Join(pm.dataDir(item.ID), "pip-cache"),
+		"HOME=" + data,
+		"PATH=" + filepath.Dir(binary) + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin",
+		"PIP_CACHE_DIR=" + filepath.Join(data, "pip-cache"),
 		"PIP_DISABLE_PIP_VERSION_CHECK=1",
+		"PYTHONUNBUFFERED=1",
+		// 各包管理器的缓存都放回项目数据目录：HOME 已经改过，但还是显式指明，
+		// 免得某些版本又去写 $HOME 之外的位置。
+		"npm_config_cache=" + filepath.Join(data, "npm-cache"),
+		"npm_config_fund=false",
+		"npm_config_audit=false",
+		"npm_config_update_notifier=false",
+		"BUN_INSTALL_CACHE_DIR=" + filepath.Join(data, "bun-cache"),
+		"GEM_HOME=" + filepath.Join(data, "gems"),
+		"BUNDLE_PATH=" + filepath.Join(data, "bundle"),
+		"GOCACHE=" + filepath.Join(data, "go-build"),
+		"GOPATH=" + filepath.Join(data, "go"),
+		"GOMODCACHE=" + filepath.Join(data, "go", "pkg", "mod"),
+		"DENO_DIR=" + filepath.Join(data, "deno"),
+		"DOTNET_CLI_HOME=" + data,
+		"NO_COLOR=1",
 	}
 	cmd.Stdout, cmd.Stderr = log, log
 	setProjectCredential(cmd, uid, gid)
@@ -123,20 +144,8 @@ func (pm *projectManager) manageVenv(ctx context.Context, id, action string) err
 	work, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	if action == "install_requirements" {
-		if !pm.venvReady(item) {
-			return errors.New("请先创建与所选 Python 版本匹配的虚拟环境")
-		}
-		requirements := filepath.Join(item.Directory, "requirements.txt")
-		info, err := os.Lstat(requirements)
-		if err != nil || !info.Mode().IsRegular() {
-			return errors.New("工程目录中缺少普通文件 requirements.txt")
-		}
-		err = pm.runAsProject(work, item, filepath.Join(pm.venvDir(id), "bin", "python3"),
-			[]string{"-m", "pip", "install", "--no-input", "-r", requirements}, log)
-		if err != nil {
-			return fmt.Errorf("安装项目依赖失败：%w；请查看项目日志", err)
-		}
-		return nil
+		// 与其它运行环境共用同一套依赖安装实现，Python 只是其中一个配方。
+		return pm.installDependenciesLocked(ctx, item)
 	}
 	if action == "install_server" {
 		if item.PythonServer == "direct" || item.PythonServer == "" {
@@ -193,6 +202,8 @@ func (pm *projectManager) manageVenv(ctx context.Context, id, action string) err
 	if !pm.venvReady(item) {
 		return errors.New("虚拟环境创建后校验失败；请查看项目日志")
 	}
+	// 新虚拟环境里没有包，之前记下的「依赖已装」自然作废。
+	_ = os.Remove(pm.depsMarker(id))
 	complete = true
 	return nil
 }

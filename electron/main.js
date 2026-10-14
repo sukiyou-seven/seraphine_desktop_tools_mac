@@ -80,8 +80,9 @@ app.whenReady().then(() => {
   });
   ipcMain.handle('server:api', async (_event, action, payload) => {
     const { connection, token } = store.selected();
-    const [method, endpoint, body] = route(action, payload);
-    return (await request(connection, token, method, endpoint, { body })).data;
+    // route() 的第 4 项可以带请求选项（例如装依赖要放宽超时）。
+    const [method, endpoint, body, options] = route(action, payload);
+    return (await request(connection, token, method, endpoint, { body, ...options })).data;
   });
   const registerUploads = (paths) => {
     if (!Array.isArray(paths) || !paths.length || paths.length > 100) throw new Error('一次最多上传 100 个文件或文件夹');

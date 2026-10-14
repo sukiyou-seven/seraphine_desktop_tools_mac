@@ -293,6 +293,11 @@ func taskRunCommand(args []string) error {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, task.Executable, task.Arguments...)
 	cmd.Dir = task.Directory
+	// 面板的全局变量也带进计划任务：同一个 dev/prod 开关，脚本和常驻服务应该
+	// 看到一致的值。task-run 是独立进程，每次执行前重新读一遍变量表。
+	if variables := newGlobalVariableManager(*root).pairs(); len(variables) > 0 {
+		cmd.Env = append(os.Environ(), variables...)
+	}
 	cmd.Stdout, cmd.Stderr = logFile, logFile
 	start := time.Now().UTC()
 	_, _ = fmt.Fprintf(logFile, "\n[%s] start %s\n", start.Format(time.RFC3339), task.ID)

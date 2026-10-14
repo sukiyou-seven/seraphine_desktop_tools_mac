@@ -21,6 +21,9 @@ struct ServerDatabasesView: View {
     @State private var message = ""
     @State private var hasError = false
     @State private var newDatabase = ""
+    @State private var createAccountWithDatabase = true
+    @State private var newDatabaseUser = ""
+    @State private var newDatabaseLevel = "readwrite"
     @State private var newUser = ""
     @State private var grantDatabase = ""
     @State private var grantUser = ""
@@ -41,6 +44,8 @@ struct ServerDatabasesView: View {
     @State private var keyValuePendingDelete: String?
     @State private var keyValuePendingReset: String?
     @State private var secretSheet: DatabaseSecretSheet?
+    /// 密码类弹窗自己的错误信息。不能用主视图的 message：弹窗打开时它被盖住，用户只会看到"点了没反应"。
+    @State private var sheetError = ""
 
     private var selected: RemoteDatabaseInstance? { instances.first(where: { $0.id == selectedID }) }
     private var availableUsers: [RemoteDatabaseUser] {
@@ -240,10 +245,10 @@ struct ServerDatabasesView: View {
                         HStack {
                             Button("初始化管理密码") { showBootstrap = true }
                                 .disabled(working || instance.authState == "configured")
-                            Button("设置已有管理密码…") { credential = ""; showCredential = true }
+                            Button("设置已有管理密码…") { credential = ""; sheetError = ""; showCredential = true }
                                 .disabled(working)
                             Button("查看已保存密码") { revealPassword(engine: "mysql") }.disabled(working)
-                            Button("修改管理密码…") { currentCredential = ""; newCredential = ""; showChangeCredential = true }.disabled(working)
+                            Button("修改管理密码…") { currentCredential = ""; newCredential = ""; sheetError = ""; showChangeCredential = true }.disabled(working)
                             if instance.authState == "initial" {
                                 Text("安装时的临时密码尚未初始化").font(.caption).foregroundStyle(.orange)
                             }
@@ -274,13 +279,32 @@ struct ServerDatabasesView: View {
 
     private func databaseSection(_ instance: RemoteDatabaseInstance) -> some View {
         Card(title: "数据库") {
-            HStack {
-                TextField("新数据库名", text: $newDatabase)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 240)
-                Button("创建数据库") { createDatabase() }
-                    .disabled(working || newDatabase.isEmpty)
-                Spacer()
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    TextField("新数据库名", text: $newDatabase)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 200)
+                    Toggle("同时创建账户", isOn: $createAccountWithDatabase)
+                        .toggleStyle(.checkbox)
+                    if createAccountWithDatabase {
+                        TextField("账户名（留空则与库同名）", text: $newDatabaseUser)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(maxWidth: 200)
+                        Picker("权限", selection: $newDatabaseLevel) {
+                            Text("读写").tag("readwrite")
+                            Text("只读").tag("read")
+                        }
+                        .labelsHidden()
+                        .frame(width: 90)
+                    }
+                    Spacer()
+                    Button("创建数据库") { createDatabase() }
+                        .disabled(working || newDatabase.isEmpty)
+                }
+                if createAccountWithDatabase {
+                    Text("账户密码由服务端自动生成，创建后直接显示一次；无需再单独建用户。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
             if let catalog {
                 ForEach(catalog.databases, id: \.self) { name in
@@ -377,7 +401,7 @@ struct ServerDatabasesView: View {
                 Text("只允许从服务器本机连接；密码由服务端生成并仅显示一次。")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button("设置已有管理员密码…") { keyValueCredential = ""; showKeyValueCredential = true }
+                Button("设置已有管理员密码…") { keyValueCredential = ""; sheetError = ""; showKeyValueCredential = true }
                     .disabled(working)
                 Button("查看已保存密码") { revealPassword(engine: instance.id) }.disabled(working)
             }
@@ -456,6 +480,9 @@ struct ServerDatabasesView: View {
                 .textFieldStyle(.roundedBorder)
             Text("服务端会先验证密码，再保存到仅 root 可读的文件中。")
                 .font(.caption).foregroundStyle(.secondary)
+            if !sheetError.isEmpty {
+                Text(verbatim: sheetError).font(.callout).foregroundStyle(Color.orange).lineLimit(3)
+            }
             HStack {
                 Spacer()
                 Button("取消") { showKeyValueCredential = false }
@@ -475,6 +502,9 @@ struct ServerDatabasesView: View {
             Text("服务端会先验证密码，再保存到仅 root 可读的配置文件；此处不使用 macOS 钥匙串。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            if !sheetError.isEmpty {
+                Text(verbatim: sheetError).font(.callout).foregroundStyle(Color.orange).lineLimit(3)
+            }
             HStack {
                 Spacer()
                 Button("取消") { showCredential = false }
@@ -492,6 +522,9 @@ struct ServerDatabasesView: View {
             SecureField("新密码（至少 8 位）", text: $newCredential)
             Text("服务端先验证当前密码，再修改数据库中的密码并保存新值；不允许单引号和反斜杠。")
                 .font(.caption).foregroundStyle(.secondary)
+            if !sheetError.isEmpty {
+                Text(verbatim: sheetError).font(.callout).foregroundStyle(Color.orange).lineLimit(3)
+            }
             HStack {
                 Spacer()
                 Button("取消") { showChangeCredential = false }
@@ -580,15 +613,28 @@ struct ServerDatabasesView: View {
     private func createDatabase() {
         let name = newDatabase.trimmingCharacters(in: .whitespacesAndNewlines)
         let engine = selectedID
+        var account = createAccountWithDatabase ? newDatabaseUser.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+        if createAccountWithDatabase && account.isEmpty { account = name }
+        if !account.isEmpty && account.range(of: "^[A-Za-z][A-Za-z0-9_]{0,31}$", options: .regularExpression) == nil {
+            message = "账户名须以字母开头，只能包含字母、数字和下划线，最长 32 位"
+            hasError = true
+            return
+        }
+        let level = newDatabaseLevel
         working = true
         Task { @MainActor in
             do {
-                try await ServerDatabaseAPI.createDatabase(connection: connection, token: token, engine: engine, name: name)
+                let created = try await ServerDatabaseAPI.createDatabase(connection: connection, token: token,
+                                                                        engine: engine, name: name, user: account, level: level)
                 newDatabase = ""
+                newDatabaseUser = ""
                 working = false
                 await loadCatalog()
-                message = "数据库 \(name) 已创建"
+                message = account.isEmpty ? "数据库 \(name) 已创建" : "数据库 \(name) 已创建，账户 \(account) 已授权"
                 hasError = false
+                if let created, !created.password.isEmpty {
+                    secretSheet = DatabaseSecretSheet(title: "新账户密码（仅显示一次）", username: created.user, password: created.password)
+                }
             } catch { working = false; message = error.localizedDescription; hasError = true }
         }
     }
@@ -679,7 +725,7 @@ struct ServerDatabasesView: View {
                 await refresh()
                 message = "MySQL 管理密码已验证并保存"
                 hasError = false
-            } catch { working = false; message = error.localizedDescription; hasError = true }
+            } catch { working = false; sheetError = error.localizedDescription; message = error.localizedDescription; hasError = true }
         }
     }
 
@@ -710,7 +756,7 @@ struct ServerDatabasesView: View {
                 await refresh()
                 message = "MySQL 管理密码已修改并保存"
                 hasError = false
-            } catch { working = false; message = error.localizedDescription; hasError = true }
+            } catch { working = false; sheetError = error.localizedDescription; message = error.localizedDescription; hasError = true }
         }
     }
 
@@ -755,7 +801,7 @@ struct ServerDatabasesView: View {
                 await loadCatalog()
                 message = "管理员密码已验证并保存"
                 hasError = false
-            } catch { working = false; message = error.localizedDescription; hasError = true }
+            } catch { working = false; sheetError = error.localizedDescription; message = error.localizedDescription; hasError = true }
         }
     }
 

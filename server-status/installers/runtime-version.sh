@@ -44,29 +44,29 @@ case "$id" in
         install -d -m 0755 "$sera_prefix/etc" "$sera_prefix/etc/conf.d"
         install -d -m 0750 "$sera_prefix/run"
         cp php.ini-production "$sera_prefix/etc/php.ini"
-        if ! getent group seraphim-web >/dev/null 2>&1; then groupadd --system seraphim-web; fi
-        if ! id -u seraphim-web >/dev/null 2>&1; then useradd --system --no-create-home --gid seraphim-web --shell /sbin/nologin seraphim-web; fi
-        install -d -m 0750 -o seraphim-web -g seraphim-web "$sera_root/logs/php-$version"
+        # PHP 以 sera 运行（面板唯一的业务账户），它才是站点目录的属主。
+        sera_create_user sera
+        install -d -m 0750 -o sera -g sera "$sera_root/logs/php-$version"
         cat > "$sera_prefix/etc/php-fpm.conf" <<EOF
 [global]
 pid = $sera_prefix/run/php-fpm.pid
 error_log = $sera_root/logs/php-$version/php-fpm.log
 daemonize = no
 [www]
-user = seraphim-web
-group = seraphim-web
+user = sera
+group = sera
 listen = $sera_prefix/run/php-fpm.sock
-listen.owner = seraphim-web
-listen.group = seraphim-web
+listen.owner = sera
+listen.group = sera
 listen.mode = 0660
 pm = ondemand
 pm.max_children = 3
 pm.process_idle_timeout = 10s
 EOF
-        chown -R seraphim-web:seraphim-web "$sera_prefix/run"
+        chown -R sera:sera "$sera_prefix/run"
         "$sera_prefix/sbin/php-fpm" -t -y "$sera_prefix/etc/php-fpm.conf" -c "$sera_prefix/etc/php.ini"
         if [ -f "$sera_root/logs/php-$version/php-fpm.log" ]; then
-            chown seraphim-web:seraphim-web "$sera_root/logs/php-$version/php-fpm.log"
+            chown sera:sera "$sera_root/logs/php-$version/php-fpm.log"
             chmod 0600 "$sera_root/logs/php-$version/php-fpm.log"
         fi
         "$sera_prefix/bin/php" --version
@@ -78,8 +78,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=seraphim-web
-Group=seraphim-web
+User=sera
+Group=sera
 ExecStart=$sera_prefix/sbin/php-fpm --nodaemonize --fpm-config $sera_prefix/etc/php-fpm.conf --php-ini $sera_prefix/etc/php.ini
 Restart=on-failure
 RestartSec=3
