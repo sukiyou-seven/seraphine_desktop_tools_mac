@@ -766,7 +766,7 @@ func (a *api) mcpWriteFile(path, content, mode string) error {
 	if err := a.files.checkSymlinks(name, false); err != nil {
 		return err
 	}
-	managedProject := a.files.managedProjectPath(clean)
+	managedProject := a.files.managedProjectsTree(clean)
 	file, err := a.files.root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, permission)
 	if err != nil {
 		return err

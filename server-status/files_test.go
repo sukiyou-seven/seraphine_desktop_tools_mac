@@ -284,3 +284,51 @@ func TestManagedProjectFileUploadPermissions(t *testing.T) {
 		t.Fatal("工程目录内的写入没有解析运行账户")
 	}
 }
+
+// 元数据还没建的项目目录同样算项目地盘：用户完全可以先建目录、上传发布产物，
+// 再创建项目指向它。上传那一刻内容就得归运行账户，否则进程读不到。
+func TestUploadsIntoUnregisteredProjectDirsGetTheSharedOwner(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "www/seraphim/projects/publish"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	a := &api{token: "secret", files: &fileManager{root: root,
+		projectOwner: func() (int, int, error) { return os.Getuid(), os.Getgid(), nil }}}
+	request := func(method, target string, body []byte) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, target, bytes.NewReader(body))
+		r.Header.Set("Authorization", "Bearer secret")
+		w := httptest.NewRecorder()
+		if strings.HasPrefix(target, "/v1/files/content") {
+			a.fileContentHandler(w, r)
+		} else {
+			a.filesHandler(w, r)
+		}
+		return w
+	}
+	data := []byte("placeholder dll")
+	if got := request("PUT", "/v1/files/content?path=%2Fwww%2Fseraphim%2Fprojects%2Fpublish%2FMyApp.dll", data).Code; got != 204 {
+		t.Fatalf("upload: %d", got)
+	}
+	info, err := os.Stat(filepath.Join(dir, "www/seraphim/projects/publish/MyApp.dll"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("项目树里的上传不应是全局可读：%v", info.Mode())
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); !ok || int(stat.Uid) != os.Getuid() {
+		t.Fatalf("项目树里的上传应归运行账户：%v", info.Mode())
+	}
+	// 顶层目录本身不算树内内容，别把 /www/seraphim/projects 误当成项目目录。
+	if a.files.managedProjectsTree("/www/seraphim/projects") {
+		t.Fatal("projects 顶层目录不该算项目内容")
+	}
+	if a.files.managedProjectsTree("/www/seraphim/web") {
+		t.Fatal("web 树不该算项目内容")
+	}
+}

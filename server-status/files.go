@@ -126,14 +126,13 @@ func publicWebPath(path string) bool {
 	return strings.HasPrefix(path, "/www/seraphim/web/")
 }
 
-func (fm *fileManager) managedProjectPath(path string) bool {
-	id := managedProjectID(path)
-	if id == "" {
-		return false
-	}
-	marker := "www/seraphim/projects/" + id + "/.sera-project.json"
-	info, err := fm.root.Lstat(marker)
-	return err == nil && info.Mode().IsRegular()
+// managedProjectsTree 判断路径是否落在受管的项目目录树里（/www/seraphim/projects/
+// 之下）。项目进程统一以 sera 运行，树里的内容都归 sera——不管项目的元数据
+// 建没建：用户完全可以先在文件管理里建目录、上传发布产物，再创建项目指向它。
+func (fm *fileManager) managedProjectsTree(path string) bool {
+	const prefix = "/www/seraphim/projects/"
+	rest := strings.TrimPrefix(path, prefix)
+	return strings.HasPrefix(path, prefix) && rest != "" && rest != "/"
 }
 
 func (fm *fileManager) checkSymlinks(name string, includeFinal bool) error {
@@ -309,7 +308,7 @@ func (fm *fileManager) command(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		err = fm.root.Mkdir(name, 0755)
-		if err == nil && !fm.managedProjectPath(path) {
+		if err == nil && !fm.managedProjectsTree(path) {
 			var directory *os.File
 			directory, err = fm.root.Open(name)
 			if err == nil {
@@ -320,7 +319,7 @@ func (fm *fileManager) command(w http.ResponseWriter, r *http.Request) {
 				_ = fm.root.Remove(name)
 			}
 		}
-		if err == nil && fm.managedProjectPath(path) {
+		if err == nil && fm.managedProjectsTree(path) {
 			var uid, gid int
 			uid, gid, err = fm.owner()
 			if err == nil {
@@ -345,7 +344,7 @@ func (fm *fileManager) command(w http.ResponseWriter, r *http.Request) {
 		}
 		file, openErr := fm.root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 		if openErr == nil {
-			if !fm.managedProjectPath(path) {
+			if !fm.managedProjectsTree(path) {
 				err = file.Chmod(0644)
 			}
 			if closeErr := file.Close(); err == nil {
@@ -626,14 +625,14 @@ func (fm *fileManager) upload(w http.ResponseWriter, r *http.Request) {
 	written, copyErr := io.Copy(file, io.LimitReader(r.Body, maxUploadBytes+1))
 	if copyErr == nil {
 		mode := os.FileMode(0644)
-		if fm.managedProjectPath(path) {
+		if fm.managedProjectsTree(path) {
 			mode = 0600
 		} else if existingInfo != nil && !publicWebPath(path) {
 			mode = existingInfo.Mode().Perm()
 		}
 		copyErr = file.Chmod(mode)
 	}
-	if copyErr == nil && fm.managedProjectPath(path) {
+	if copyErr == nil && fm.managedProjectsTree(path) {
 		uid, gid, ownerErr := fm.owner()
 		if ownerErr == nil {
 			ownerErr = file.Chown(uid, gid)

@@ -611,7 +611,7 @@ func (pm *projectManager) installDependenciesLocked(ctx context.Context, item pr
 	if item.Runtime == "python" && !pm.venvReady(item) {
 		return errors.New("请先创建与所选 Python 版本匹配的虚拟环境")
 	}
-	if err := pm.prepareDirectories(item.ID); err != nil {
+	if err := pm.prepareDirectories(item); err != nil {
 		return err
 	}
 	if err := pm.workingDirectoryReady(item); err != nil {

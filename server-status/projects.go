@@ -242,6 +242,19 @@ func (pm *projectManager) normalize(item project) (project, error) {
 	if item.RuntimeVersion != "" && !versionPattern.MatchString(item.RuntimeVersion) {
 		return project{}, errors.New("无效运行环境版本")
 	}
+	// 合并式更新（PUT 只传要改的字段、MCP 的 update_project）会把上一个运行
+	// 环境的专属字段带过来，跨运行环境切换时只剩校验挑刺。规范化在这里统一
+	// 清掉：换了运行环境，Python 那套启动配置就作废。
+	if item.Runtime != "python" {
+		item.UseVenv = false
+		item.PythonServer = ""
+		item.PythonCallable = ""
+		item.PythonWorkers = 0
+		item.PythonThreads = 0
+	}
+	if item.PythonServer != "gunicorn" {
+		item.PythonWorker = ""
+	}
 	if item.UseVenv && item.Runtime != "python" {
 		return project{}, errors.New("仅 Python 项目可以使用虚拟环境")
 	}
@@ -455,8 +468,8 @@ func chownTree(root string, uid, gid int) error {
 // （例如从早期每项目一个专属账户迁回共享的 sera）需要把目录整体改属。
 const projectAccountMarker = ".sera-account"
 
-func (pm *projectManager) prepareDirectories(id string) error {
-	for _, path := range []string{pm.root, filepath.Join(pm.root, "projects"), pm.projectDir(id)} {
+func (pm *projectManager) prepareDirectories(item project) error {
+	for _, path := range []string{pm.root, filepath.Join(pm.root, "projects"), pm.projectDir(item.ID)} {
 		if err := noSymlinkDirectory(path, 0755); err != nil {
 			return err
 		}
@@ -470,26 +483,40 @@ func (pm *projectManager) prepareDirectories(id string) error {
 	if err != nil {
 		return err
 	}
-	dir := pm.projectDir(id)
-	// 工程目录归共享业务账户所有。0750 挡不住同账户的其他项目（它们本就是同一个
-	// 身份），但能挡住数据库、中间件这些各自独立的软件账户。
-	if err := os.Chown(dir, uid, gid); err != nil {
-		return err
-	}
-	if err := os.Chmod(dir, 0750); err != nil {
-		return err
+	// 默认工程目录与自定义工程目录都要归共享业务账户。用户完全可以先在文件
+	// 管理里建目录、上传发布产物，再创建项目指向它——上传时目录还不是项目，
+	// 内容是 root 的；项目指向它的那一刻就得归位，否则进程（sera）读不到。
+	// 0750 挡不住同账户的其他项目（它们本就是同一个身份），但能挡住数据库、
+	// 中间件这些各自独立的软件账户。
+	dirs := []string{pm.projectDir(item.ID)}
+	if clean := filepath.Clean(item.Directory); item.Directory != "" && clean != dirs[0] {
+		dirs = append(dirs, clean)
 	}
 	account := sharedAccount
-	marker := filepath.Join(dir, projectAccountMarker)
-	if current, readErr := os.ReadFile(marker); readErr != nil || strings.TrimSpace(string(current)) != account {
-		if err := chownTree(dir, uid, gid); err != nil {
+	for _, dir := range dirs {
+		if _, err := os.Stat(dir); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue // 不存在的目录由 workingDirectoryReady 负责报错
+			}
 			return err
 		}
-		if err := os.WriteFile(marker, []byte(account+"\n"), 0644); err != nil {
+		if err := os.Chown(dir, uid, gid); err != nil {
 			return err
+		}
+		if err := os.Chmod(dir, 0750); err != nil {
+			return err
+		}
+		marker := filepath.Join(dir, projectAccountMarker)
+		if current, readErr := os.ReadFile(marker); readErr != nil || strings.TrimSpace(string(current)) != account {
+			if err := chownTree(dir, uid, gid); err != nil {
+				return err
+			}
+			if err := os.WriteFile(marker, []byte(account+"\n"), 0644); err != nil {
+				return err
+			}
 		}
 	}
-	data := filepath.Join(dir, "data")
+	data := filepath.Join(pm.projectDir(item.ID), "data")
 	if err := noSymlinkDirectory(data, 0750); err != nil {
 		return err
 	}
@@ -614,11 +641,13 @@ func selfContainedDotnetExecutable(entry string) string {
 
 // selfContainedDotnet 判断 .NET 工程能不能脱离面板装的 dotnet 启动：
 //
-//   - 入口是 dll：与入口同名的可执行文件和 libcoreclr.so（自带的运行时核心库）
+//   - 入口是 dll：与入口同名的 apphost 和 libcoreclr.so（自带的运行时核心库）
 //     都在入口所在目录里，这是普通的自包含发布；
-//   - 入口没有扩展名：单文件发布（PublishSingleFile），整个应用连同运行时
-//     压成了一个可执行文件，直接执行它就行。
+//   - 入口没有扩展名：要么是单文件发布（PublishSingleFile，整个应用连同
+//     运行时压成一个可执行文件），要么是把 apphost 当入口——两者都直接执行它。
 //
+// 上传文件时执行位经常丢（HTTP 上传和多数压缩包都不带权限），而 apphost 没有
+// +x 位连 systemd 都起不来，所以识别为自包含布局的同时顺手把它补上执行位。
 // 框架依赖发布没有上述特征，跑起来仍要靠面板装的 dotnet，不能算自包含。
 func selfContainedDotnet(item project) bool {
 	if item.Runtime != "dotnet" {
@@ -627,12 +656,31 @@ func selfContainedDotnet(item project) bool {
 	entry := filepath.Join(item.Directory, item.Entry)
 	switch ext := filepath.Ext(item.Entry); {
 	case ext == "":
-		return executableFile(entry)
+		if !regularFile(entry) {
+			return false
+		}
+		makeExecutable(entry)
+		return true
 	case strings.EqualFold(ext, ".dll"):
-		return executableFile(selfContainedDotnetExecutable(entry)) &&
-			regularFile(filepath.Join(filepath.Dir(entry), "libcoreclr.so"))
+		apphost := selfContainedDotnetExecutable(entry)
+		if !regularFile(entry) || !regularFile(apphost) ||
+			!regularFile(filepath.Join(filepath.Dir(entry), "libcoreclr.so")) {
+			return false
+		}
+		makeExecutable(apphost)
+		return true
 	}
 	return false
+}
+
+// makeExecutable 给常规文件补执行位；已经可执行就不动，读取路径上的调用才不会
+// 反复改权限。
+func makeExecutable(path string) {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 != 0 {
+		return
+	}
+	_ = os.Chmod(path, info.Mode().Perm()|0111)
 }
 
 // runtimeReadyFor 判断这个项目的运行环境够不够启动：面板装的运行环境在，
@@ -995,7 +1043,7 @@ func (pm *projectManager) save(ctx context.Context, item project, creating bool)
 	if wasRunning && !pm.pythonServerReady(item) {
 		return project{}, errors.New("请先在项目虚拟环境中安装所选 Python 启动器")
 	}
-	if err := pm.prepareDirectories(item.ID); err != nil {
+	if err := pm.prepareDirectories(item); err != nil {
 		return project{}, err
 	}
 	if err := pm.workingDirectoryReady(item); err != nil {
@@ -1043,12 +1091,13 @@ func (pm *projectManager) save(ctx context.Context, item project, creating bool)
 	return pm.state(ctx, item), nil
 }
 
-// reconcileUnitAccount 让单元文件里的运行账户与当前结论保持一致。
-// 早期版本所有项目共用一个 sera-project 账户，后来改成一项目一账户；现在两者
-// 统一为共享的 sera。若不同步改写单元，服务会带着旧账户启动，而工程目录已经
-// 改属到 sera，于是读不到自己的数据目录，直接以 203/EXEC 崩溃重启。
-func (pm *projectManager) reconcileUnitAccount(ctx context.Context, item project) error {
+// reconcileUnit 在启动前把单元文件与当前配置对齐。升级面板、改代码或自包含
+// 判定翻转之后，盘上的单元可能还是旧格式（比如 ExecStart 还指着面板装的
+// dotnet），只靠「保存项目」重写会漏掉这些项目。内容一致就不动，daemon-reload
+// 才不会白跑；服务在跑且单元要改时，改完顺手重启。
+func (pm *projectManager) reconcileUnit(ctx context.Context, item project) error {
 	path := pm.unitPath(item.ID)
+	desired := pm.unit(item)
 	current, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -1056,12 +1105,11 @@ func (pm *projectManager) reconcileUnitAccount(ctx context.Context, item project
 	if err != nil {
 		return err
 	}
-	account := sharedAccount
-	if strings.Contains(string(current), "User="+account+"\n") {
+	if string(current) == string(desired) {
 		return nil
 	}
 	wasRunning := pm.state(ctx, item).ActiveState == "active"
-	if err := atomicSiteWrite(path, pm.unit(item), 0644); err != nil {
+	if err := atomicSiteWrite(path, desired, 0644); err != nil {
 		return err
 	}
 	if err := pm.systemd(context.Background(), "daemon-reload"); err != nil {
@@ -1099,10 +1147,10 @@ func (pm *projectManager) action(ctx context.Context, id, action string) error {
 		if !pm.pythonServerReady(item) {
 			return errors.New("请先在项目虚拟环境中安装所选 Python 启动器")
 		}
-		if err := pm.prepareDirectories(id); err != nil {
+		if err := pm.prepareDirectories(item); err != nil {
 			return err
 		}
-		if err := pm.reconcileUnitAccount(ctx, item); err != nil {
+		if err := pm.reconcileUnit(ctx, item); err != nil {
 			return err
 		}
 		if err := pm.workingDirectoryReady(item); err != nil {
@@ -1234,8 +1282,20 @@ func (a *api) projectsHandler(w http.ResponseWriter, r *http.Request) {
 	if len(parts) == 1 {
 		switch r.Method {
 		case http.MethodPut:
-			var item project
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&item); err != nil {
+			// 与 MCP 的 update_project 同一语义：只传要改的字段，其余沿用现配置。
+			// 早期版本要求整份 JSON，客户端漏一个字段就会把配置清掉，这里收紧为合并。
+			current, err := a.projects.read(id)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			var patch map[string]any
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&patch); err != nil {
+				http.Error(w, "项目配置无效", http.StatusBadRequest)
+				return
+			}
+			item, err := mergeArgs(current, patch)
+			if err != nil {
 				http.Error(w, "项目配置无效", http.StatusBadRequest)
 				return
 			}

@@ -129,7 +129,7 @@ func (pm *projectManager) manageVenv(ctx context.Context, id, action string) err
 	if pm.state(ctx, item).ActiveState == "active" {
 		return errors.New("请先停止项目，再修改虚拟环境")
 	}
-	if err := pm.prepareDirectories(id); err != nil {
+	if err := pm.prepareDirectories(item); err != nil {
 		return err
 	}
 	if err := pm.workingDirectoryReady(item); err != nil {

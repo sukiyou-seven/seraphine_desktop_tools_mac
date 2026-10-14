@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -166,12 +167,18 @@ func TestPythonASGIUnitsAndWorkerValidation(t *testing.T) {
 	}
 	invalid := base
 	invalid.PythonServer, invalid.PythonWorker = "uvicorn", "gthread"
-	if _, err := pm.normalize(invalid); err == nil {
-		t.Fatal("accepted worker class for Uvicorn")
+	cleaned, err := pm.normalize(invalid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 合并式更新会把上个启动器的残留 worker class 带过来，规范化直接清掉，
+	// 不让一行陈旧配置把整个保存堵死。
+	if cleaned.PythonWorker != "" {
+		t.Fatalf("Uvicorn 的残留 worker class 应被清掉：%q", cleaned.PythonWorker)
 	}
 	legacy := base
 	legacy.PythonServer, legacy.PythonThreads = "gunicorn", 3
-	legacy, err := pm.normalize(legacy)
+	legacy, err = pm.normalize(legacy)
 	if err != nil || legacy.PythonWorker != "gthread" {
 		t.Fatalf("legacy threads lost: %+v %v", legacy, err)
 	}
@@ -375,7 +382,7 @@ func TestSharedAccountNameIsUsableAsServiceAccount(t *testing.T) {
 
 func TestProjectDirectoryRecordsItsAccount(t *testing.T) {
 	_, pm := projectTestAPI(t)
-	if err := pm.prepareDirectories("demo"); err != nil {
+	if err := pm.prepareDirectories(project{ID: "demo"}); err != nil {
 		t.Fatal(err)
 	}
 	dir := pm.projectDir("demo")
@@ -395,14 +402,14 @@ func TestProjectDirectoryRecordsItsAccount(t *testing.T) {
 		t.Fatalf("迁移标记：%q", got)
 	}
 	// 重复调用必须幂等。
-	if err := pm.prepareDirectories("demo"); err != nil {
+	if err := pm.prepareDirectories(project{ID: "demo"}); err != nil {
 		t.Fatal(err)
 	}
 	// 标记丢失（从早期版本升级）时必须重新迁移并写回。
 	if err := os.Remove(marker); err != nil {
 		t.Fatal(err)
 	}
-	if err := pm.prepareDirectories("demo"); err != nil {
+	if err := pm.prepareDirectories(project{ID: "demo"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := read(); got != sharedAccount {
@@ -426,7 +433,7 @@ func TestReconcileUnitAccountUpgradesLegacyUnit(t *testing.T) {
 	if err := os.WriteFile(pm.unitPath("legacy"), []byte(legacy), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := pm.reconcileUnitAccount(context.Background(), item); err != nil {
+	if err := pm.reconcileUnit(context.Background(), item); err != nil {
 		t.Fatal(err)
 	}
 	updated, err := os.ReadFile(pm.unitPath("legacy"))
@@ -443,7 +450,7 @@ func TestReconcileUnitAccountUpgradesLegacyUnit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := pm.reconcileUnitAccount(context.Background(), item); err != nil {
+	if err := pm.reconcileUnit(context.Background(), item); err != nil {
 		t.Fatal(err)
 	}
 	after, err := os.Stat(pm.unitPath("legacy"))
@@ -560,5 +567,72 @@ func TestSelfContainedDotnetRunsOnItsOwnRuntime(t *testing.T) {
 	// 客户端的启动按钮跟着 RuntimeReady 走，自包含工程必须是就绪的。
 	if !pm.state(context.Background(), item).RuntimeReady {
 		t.Fatal("自包含工程的 RuntimeReady 应当为 true")
+	}
+}
+
+// PUT 走合并语义：只传要改的字段，其余沿用现配置——和 MCP 的 update_project
+// 同一套行为，接口文档上「只传要改的字段」要说到做到。
+func TestProjectUpdateMergesPartialPatch(t *testing.T) {
+	a, pm := projectTestAPI(t)
+	created := projectRequest(a, "POST", "/v1/projects",
+		`{"id":"demo","name":"Demo","runtime":"python","entry":"app.py","port":8080,"use_venv":true}`, true)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("创建失败：%d %s", created.Code, created.Body.String())
+	}
+	// 只改入口：名字、运行环境、端口、虚拟环境都不该被清掉。
+	patched := projectRequest(a, "PUT", "/v1/projects/demo", `{"entry":"main.py"}`, true)
+	if patched.Code != http.StatusNoContent {
+		t.Fatalf("更新失败：%d %s", patched.Code, patched.Body.String())
+	}
+	item := pm.mustRead("demo")
+	if item.Entry != "main.py" || item.Name != "Demo" || item.Runtime != "python" ||
+		item.Port != 8080 || !item.UseVenv {
+		t.Fatalf("合并结果不对：%+v", item)
+	}
+	// 指到不存在的项目要 404，而不是含糊的 409。
+	if missing := projectRequest(a, "PUT", "/v1/projects/ghost", `{"entry":"main.py"}`, true); missing.Code != http.StatusNotFound {
+		t.Fatalf("不存在的项目应返回 404：%d", missing.Code)
+	}
+	// 整份 JSON 照样能传：patch 里带全字段时行为不变。
+	full := projectRequest(a, "PUT", "/v1/projects/demo",
+		`{"id":"demo","name":"Renamed","runtime":"python","entry":"app.py","port":8081}`, true)
+	if full.Code != http.StatusNoContent {
+		t.Fatalf("整份更新失败：%d %s", full.Code, full.Body.String())
+	}
+	if item := pm.mustRead("demo"); item.Name != "Renamed" || item.Port != 8081 {
+		t.Fatalf("整份更新结果不对：%+v", item)
+	}
+}
+
+// 上传发布产物时执行位经常丢（HTTP 上传不带权限），而 apphost 没有 +x 位连
+// systemd 都起不来。识别为自包含布局时应当顺手把它补上。
+func TestSelfContainedDotnetRestoresTheExecutableBit(t *testing.T) {
+	directory := t.TempDir()
+	item := project{ID: "app", Name: "App", Runtime: "dotnet",
+		Entry: "publish/MyApp.dll", Directory: directory}
+	if err := os.MkdirAll(filepath.Join(directory, "publish"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for name, mode := range map[string]os.FileMode{
+		"publish/MyApp.dll": 0644, "publish/MyApp": 0644, "publish/libcoreclr.so": 0644,
+	} {
+		if err := os.WriteFile(filepath.Join(directory, name), []byte("x"), mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !selfContainedDotnet(item) {
+		t.Fatal("apphost 丢了执行位也应当被识别为自包含")
+	}
+	info, err := os.Stat(filepath.Join(directory, "publish", "MyApp"))
+	if err != nil || info.Mode().Perm()&0111 == 0 {
+		t.Fatalf("apphost 应当被补上执行位：%v %v", info.Mode(), err)
+	}
+	// 已经可执行的文件不被反复改写（权限保持原样，包括 setgid 等额外位）。
+	if err := os.Chmod(filepath.Join(directory, "publish", "MyApp"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	selfContainedDotnet(item)
+	if info, err := os.Stat(filepath.Join(directory, "publish", "MyApp")); err != nil || info.Mode().Perm() != 0755 {
+		t.Fatalf("可执行的 apphost 不该被改动：%v", info.Mode())
 	}
 }
