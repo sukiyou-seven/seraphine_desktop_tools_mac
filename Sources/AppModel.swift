@@ -140,6 +140,9 @@ final class AppModel: ObservableObject {
         Diag.log("AppModel 初始化")
         let loaded = SettingsStore.load()
         settings = loaded
+        // 数据库凭据清单（credentials.json）：启动就要读回来，
+        // 否则重启后界面上的密码全部变「—」，像丢了似的（文件其实一直都在）。
+        credentials = CredentialStore.load()
         mongo = MongoService(settings: loaded.mongo)
         redis = RedisService(settings: loaded.redis)
         mysql = MySQLService(settings: loaded.mysql)
