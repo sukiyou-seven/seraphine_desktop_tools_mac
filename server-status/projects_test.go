@@ -454,3 +454,111 @@ func TestReconcileUnitAccountUpgradesLegacyUnit(t *testing.T) {
 		t.Fatal("账户未变化时不应重写单元")
 	}
 }
+
+// .NET 自包含发布（dotnet publish --self-contained）把运行时一起打进工程目录：
+// 不装 dotnet 也要能启动、自检不能再报「运行环境未安装」。
+func TestSelfContainedDotnetRunsOnItsOwnRuntime(t *testing.T) {
+	_, pm := projectTestAPI(t)
+	directory := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(directory, "publish"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	item := project{ID: "app", Name: "App", Runtime: "dotnet",
+		Entry: "publish/MyApp.dll", Directory: directory}
+	// 发布目录里的文件都放在 publish/ 下
+
+	// 框架依赖发布：只有 dll 和依赖程序集，没有自带的运行时核心库，跑不了。
+	for name, mode := range map[string]os.FileMode{"MyApp.dll": 0644, "MyApp": 0755} {
+		if err := os.WriteFile(filepath.Join(directory, "publish", name), []byte("placeholder"), mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if selfContainedDotnet(item) {
+		t.Fatal("没有 libcoreclr.so 的框架依赖发布不该算自包含")
+	}
+	if err := os.WriteFile(filepath.Join(directory, "publish", "libcoreclr.so"), []byte("coreclr"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !selfContainedDotnet(item) {
+		t.Fatal("可执行文件与 libcoreclr.so 齐备时应当被识别为自包含")
+	}
+	if !pm.runtimeReadyFor(item) {
+		t.Fatal("自包含工程不依赖面板装的 dotnet")
+	}
+
+	// 启动命令直接执行自包含可执行文件，不再经过面板装的 dotnet。
+	unit := string(pm.unit(item))
+	executable := selfContainedDotnetExecutable(filepath.Join(directory, item.Entry))
+	if !strings.Contains(unit, systemdQuoted(executable)) {
+		t.Fatalf("ExecStart 应该直接跑自包含可执行文件：\n%s", unit)
+	}
+	if strings.Contains(unit, "MyApp.dll") {
+		t.Fatalf("自包含启动不该再带入口参数：\n%s", unit)
+	}
+	if strings.Contains(unit, filepath.Join(pm.root, "server", "dotnet", "dotnet")) {
+		t.Fatalf("自包含启动不该引用面板装的 dotnet：\n%s", unit)
+	}
+
+	// 框架依赖发布的工程没有自带运行时：删掉核心库后回到原来的行为，
+	// 面板装的 dotnet 在时能跑，不在时启动前就该拦住。
+	if err := os.Remove(filepath.Join(directory, "publish", "libcoreclr.so")); err != nil {
+		t.Fatal(err)
+	}
+	unit = string(pm.unit(item))
+	if !strings.Contains(unit, systemdQuoted(filepath.Join(directory, "publish", "MyApp.dll"))) {
+		t.Fatalf("框架依赖发布仍然用 dotnet 跑入口 dll：\n%s", unit)
+	}
+	if !pm.runtimeReadyFor(item) {
+		t.Fatal("面板装的 dotnet 在时，框架依赖工程照样可以启动")
+	}
+	if err := os.RemoveAll(filepath.Join(pm.root, "server", "dotnet")); err != nil {
+		t.Fatal(err)
+	}
+	if pm.runtimeReadyFor(item) {
+		t.Fatal("框架依赖工程在 dotnet 缺席时不能放行启动")
+	}
+
+	// 单文件发布（PublishSingleFile）：入口本身就是可执行文件，没有 dll
+	// 也没有 libcoreclr.so。此刻面板装的 dotnet 已被删掉，正是验证时机。
+	single := item
+	single.Entry = "publish/MyApp"
+	if !selfContainedDotnet(single) {
+		t.Fatal("无扩展名的可执行入口应当被识别为自包含")
+	}
+	if !validProjectEntry("dotnet", "publish/MyApp") {
+		t.Fatal("dotnet 入口应当接受无扩展名的可执行文件")
+	}
+	if !validProjectEntry("dotnet", "publish/MyApp.dll") {
+		t.Fatal("dotnet 入口仍然接受 dll")
+	}
+	if !pm.runtimeReadyFor(single) {
+		t.Fatal("单文件发布不依赖面板装的 dotnet")
+	}
+	unit = string(pm.unit(single))
+	if !strings.Contains(unit, systemdQuoted(filepath.Join(directory, "publish", "MyApp"))) {
+		t.Fatalf("单文件发布的 ExecStart 应该直接跑这个可执行文件：\n%s", unit)
+	}
+
+	// 自检的「运行环境」一条对自包含发布说「自带运行时」，而不是报错。
+	if err := os.WriteFile(filepath.Join(directory, "publish", "libcoreclr.so"), []byte("coreclr"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	checks := pm.checks(context.Background(), item, unitStatus{})
+	found := false
+	for _, check := range checks {
+		if check.ID != "runtime" {
+			continue
+		}
+		found = true
+		if check.Level != checkOK || !strings.Contains(check.Detail, "自包含") {
+			t.Fatalf("自包含工程的运行环境自检应当通过：%+v", check)
+		}
+	}
+	if !found {
+		t.Fatal("自检里没有「运行环境」一条")
+	}
+	// 客户端的启动按钮跟着 RuntimeReady 走，自包含工程必须是就绪的。
+	if !pm.state(context.Background(), item).RuntimeReady {
+		t.Fatal("自包含工程的 RuntimeReady 应当为 true")
+	}
+}

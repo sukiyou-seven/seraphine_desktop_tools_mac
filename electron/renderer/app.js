@@ -955,7 +955,7 @@ function renderProjectPathPicker() {
   P.entries = entries;
   $('#path-content').innerHTML = `<h2>选择服务器${P.mode === 'directory' ? '工程目录' : '入口文件'}</h2><div class="toolbar"><button class="secondary" data-path-action="up">上一级</button><input id="picker-path" value="${esc(P.path)}" aria-label="服务器目录"><button class="secondary" data-path-action="go">前往</button></div>${P.message ? `<p class="help">${esc(P.message)}</p>` : ''}<div class="path-list">${entries.map((item, index) => row(`<span class="mono">${item.kind === 'directory' ? '📁' : '📄'} ${esc(item.name)}</span>`, item.kind === 'directory'
     ? `${button('进入', 'picker.enter', `data-index="${index}"`)}${P.mode === 'directory' ? button('选择', 'picker.choose', `data-index="${index}"`) : ''}`
-    : button('选择', 'picker.choose', `data-index="${index}" ${extensions.includes(item.name.split('.').pop().toLowerCase()) ? '' : 'disabled'}`))).join('') || empty('此目录没有可选条目')}</div><div class="dialog-actions"><button class="secondary" data-path-action="close">取消</button>${P.mode === 'directory' ? '<button data-path-action="choose-current">选择此目录</button>' : runtime === 'go' ? '<button data-path-action="go-current">使用此目录作为 Go 入口</button>' : ''}</div>`;
+    : button('选择', 'picker.choose', `data-index="${index}" ${extensions.includes(item.name.split('.').pop().toLowerCase()) || (runtime === 'dotnet' && !item.name.includes('.')) ? '' : 'disabled'}`))).join('') || empty('此目录没有可选条目')}</div><div class="dialog-actions"><button class="secondary" data-path-action="close">取消</button>${P.mode === 'directory' ? '<button data-path-action="choose-current">选择此目录</button>' : runtime === 'go' ? '<button data-path-action="go-current">使用此目录作为 Go 入口</button>' : ''}</div>`;
 }
 function applyProjectPath(path, useGoDirectory = false) {
   if (P.mode === 'directory' || useGoDirectory) $('#field-directory').value = path;
@@ -1315,16 +1315,25 @@ renders.domains = () => {
     ${S.dnsSelected ? card(`${S.dnsSelected} · 解析记录`, `<table class="table"><thead><tr><th>主机</th><th>类型</th><th>值</th><th>TTL</th><th>状态</th><th></th></tr></thead><tbody>${S.dnsRecords.map((record, index) => `<tr><td class="mono">${esc(record.RR)}</td><td>${esc(record.Type)}</td><td class="mono">${esc(record.Value)}</td><td>${esc(record.TTL)}</td><td>${tag(record.Status === 'ENABLE' ? '启用' : '停用', record.Status === 'ENABLE')}</td><td class="actions-cell">${button('编辑', 'domains.edit', `data-index="${index}"`)} ${button('删除', 'domains.delete', `data-index="${index}"`, 'danger')}</td></tr>`).join('')}</tbody></table>${S.dnsRecords.length ? '' : empty('没有解析记录')}`, button('新增记录', 'domains.add')) : ''}
     ${card('证书', `<p class="help">使用当前阿里云账号自动添加 DNS-01 TXT 记录，向 Let’s Encrypt 申请证书。续期可再次申请；证书文件存于本机应用数据目录；部署后网站将启用 HTTPS 443。</p>${(S.certificates || []).map((cert) => row(`<strong>${esc(cert.domains.join('、'))}</strong><div class="small muted">到期 ${esc(String(cert.notAfter || '').slice(0, 10))} · ${esc(cert.keyType)}</div><div class="mono small muted">${esc(cert.fullchainPath)}<br>${esc(cert.privateKeyPath)}</div>`, `${button('部署到网站', 'domains.cert.deploy', `data-cert="${esc(cert.id)}"`)}${button('复制证书路径', 'domains.cert.copy', `data-cert="${esc(cert.id)}"`)}`)).join('') || empty('尚未申请证书')}`)}`;
 };
+// 主机记录的手误抢救：填了 `www.example.com` 就剥成 `www`（与 macOS 端同款行为）；
+// `account.admin` 这类多级子域名不以域名结尾，原样保留。DNS 大小写不敏感，剥后缀不区分大小写。
+function dnsNormalizeRR(rr, domain) {
+  let host = String(rr || '').trim();
+  const base = String(domain || '').trim();
+  if (host && base && host.toLowerCase().endsWith(`.${base.toLowerCase()}`))
+    host = host.slice(0, host.length - base.length - 1);
+  return host;
+}
 function dnsRecordForm(record) {
   modal(record ? '编辑解析记录' : '新增解析记录', [
-    { name: 'rr', label: '主机记录（主域名填 @）', value: record?.RR || '', required: true },
+    { name: 'rr', label: '主机记录（多级子域名如 account.admin；主域名填 @）', value: record?.RR || '', required: true },
     { name: 'type', label: '类型', type: 'select', options: ['A', 'AAAA', 'CNAME', 'TXT', 'MX', 'NS', 'SRV', 'CAA'].map((type) => [type, type]), value: record?.Type || 'A' },
     { name: 'value', label: '记录值', value: record?.Value || '', required: true, full: true },
     { name: 'ttl', label: 'TTL（秒）', type: 'number', value: record?.TTL || S.dnsSettings.defaultTTL },
     { name: 'priority', label: '优先级（MX/SRV，1–50）', type: 'number', value: record?.Priority || '' }
   ], async (values) => {
     if (values.type === 'A' && !/^(?:\d{1,3}\.){3}\d{1,3}$/.test(values.value.trim())) throw new Error('A 记录需要 IPv4 地址');
-    const params = { RR: values.rr.trim(), Type: values.type, Value: values.value.trim(),
+    const params = { RR: dnsNormalizeRR(values.rr, S.dnsSelected), Type: values.type, Value: values.value.trim(),
       TTL: Math.max(60, Math.min(86400, Number(values.ttl) || 600)) };
     if (['MX', 'SRV'].includes(values.type)) {
       if (!(Number(values.priority) >= 1 && Number(values.priority) <= 50)) throw new Error('优先级须在 1–50 之间');

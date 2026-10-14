@@ -318,11 +318,13 @@ final class DNSService: @unchecked Sendable {
     /// 返回一句给人看的成功说明（顺带带上新记录的 RecordId）
     func addRecord(domain: String, rr: String, type: String, value: String,
                    ttl: Int, priority: String) -> Outcome<String> {
-        let check = validate(rr: rr, type: type, value: value, priority: priority)
-        if let message = check { return .failure(message) }
+        let host = Self.normalizeRR(rr, domain: domain)
+        if let message = validate(rr: host, type: type, value: value, priority: priority) {
+            return .failure(message)
+        }
 
         var params = ["DomainName": domain,
-                      "RR": rr,
+                      "RR": host,
                       "Type": type,
                       "Value": value,
                       "TTL": String(min(max(ttl, 60), 86400))]
@@ -337,13 +339,15 @@ final class DNSService: @unchecked Sendable {
         }
     }
 
-    func updateRecord(recordId: String, rr: String, type: String, value: String,
+    func updateRecord(recordId: String, domain: String, rr: String, type: String, value: String,
                       ttl: Int, priority: String) -> Outcome<String> {
-        let check = validate(rr: rr, type: type, value: value, priority: priority)
-        if let message = check { return .failure(message) }
+        let host = Self.normalizeRR(rr, domain: domain)
+        if let message = validate(rr: host, type: type, value: value, priority: priority) {
+            return .failure(message)
+        }
 
         var params = ["RecordId": recordId,
-                      "RR": rr,
+                      "RR": host,
                       "Type": type,
                       "Value": value,
                       "TTL": String(min(max(ttl, 60), 86400))]
@@ -359,13 +363,12 @@ final class DNSService: @unchecked Sendable {
     }
 
     /// 本地先挡一道：阿里云对这些的报错文案不算好懂，而且来回一趟也慢。
+    ///
+    /// `rr` 应该是已经过 `normalizeRR` 的值（或者本来就只填子域名部分）。
+    /// 多级子域名（`account.admin`）是合法写法，阿里云原样接受；
+    /// 这里只管格式，不再把「带点」一律当成误填了整个域名。
     func validate(rr: String, type: String, value: String, priority: String) -> String? {
-        let host = rr.trimmingCharacters(in: .whitespaces)
-        if host.isEmpty { return "主机记录不能为空（主域名本身请填 @）" }
-        if host.contains(" ") { return "主机记录里有空格" }
-        if host.contains(".") && !host.hasPrefix("_") && type != "NS" {
-            return "主机记录只填最左边那一段，比如 www（不是 www.example.com）"
-        }
+        if let message = Self.validateRR(rr) { return message }
         let recordValue = value.trimmingCharacters(in: .whitespaces)
         if recordValue.isEmpty { return "记录值不能为空" }
         let upper = type.uppercased()
@@ -378,6 +381,44 @@ final class DNSService: @unchecked Sendable {
             let pri = priority.trimmingCharacters(in: .whitespaces)
             guard let level = Int(pri), (1...50).contains(level) else {
                 return "\(upper) 记录要填优先级（1–50，越小越优先）"
+            }
+        }
+        return nil
+    }
+
+    /// 主机记录的手误抢救：最常见的是把整个域名（`www.example.com`）填进主机记录。
+    /// 已知域名时剥掉这个后缀，让 `www.example.com` 落成 `www`，而不是报错卡住。
+    /// 真正的多级子域名（`account.admin`）不以域名结尾，原样保留。
+    static func normalizeRR(_ rr: String, domain: String) -> String {
+        var host = rr.trimmingCharacters(in: .whitespaces)
+        let base = domain.trimmingCharacters(in: .whitespaces)
+        if !base.isEmpty, host.lowercased().hasSuffix("." + base.lowercased()) {
+            host = String(host.dropLast(base.count + 1))
+        }
+        return host
+    }
+
+    /// 主机记录的格式校验：`@`（主域名）与 `*`（泛解析）直接放行；
+    /// 其余按 DNS 标签来——每段 1–63 字符，字母/数字/下划线开头结尾，中间可带连字符
+    /// （`_acme-challenge` 这类下划线开头的保留标签也因此放行）。
+    static func validateRR(_ rr: String) -> String? {
+        let host = rr.trimmingCharacters(in: .whitespaces)
+        if host.isEmpty { return "主机记录不能为空（主域名本身请填 @）" }
+        if host.contains(" ") { return "主机记录里有空格" }
+        if host == "@" || host == "*" { return nil }
+        let labels = host.split(separator: ".", omittingEmptySubsequences: false)
+        if labels.contains(where: { $0.isEmpty }) {
+            return "主机记录里有连续或多余的点（比如 a..b）"
+        }
+        for label in labels {
+            if label.count > 63 { return "主机记录每段最长 63 个字符" }
+            let isWord: (Character) -> Bool = { $0.isLetter || $0.isNumber || $0 == "_" }
+            let isInner: (Character) -> Bool = { isWord($0) || $0 == "-" }
+            if !isWord(label.first!) || !isWord(label.last!) {
+                return "主机记录每段要以字母、数字或下划线开头结尾（比如 account.admin、_acme-challenge）"
+            }
+            if !label.allSatisfy(isInner) {
+                return "主机记录只能包含字母、数字、连字符和下划线"
             }
         }
         return nil

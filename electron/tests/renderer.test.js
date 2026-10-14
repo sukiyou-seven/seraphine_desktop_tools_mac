@@ -68,6 +68,7 @@ exports.projectDetail = projectDetail; exports.projectAction = projectAction;
 exports.projectDetailAction = projectDetailAction; exports.renderProjectDetail = renderProjectDetail;
   exports.closeProjectDetail = closeProjectDetail; exports.projectForm = projectForm;
   exports.variablesAction = variablesAction; exports.apiAction = apiAction;
+  exports.dnsNormalizeRR = dnsNormalizeRR;
   exports.helpers = { actionMenu, projectStartupText, projectServerLabel, projectStateLabel,
     projectFailureText, parseEnvText, formatEnvText, fmtUptime, dependencyText, dependencyCardText,
     checkActionLabel, copyText };`,
@@ -501,4 +502,14 @@ test('renderer: API 设置页在服务端只给了半份数据时也不崩', () 
   const html = app.element('#content').innerHTML;
   assert.match(html, /暂未获取到接口列表/);
   assert.match(html, /AI 能用的 0 个工具/);
+});
+
+// 主机记录：多级子域名（account.admin）是合法写法要放行；误填整个域名则剥掉后缀。
+test('renderer: 主机记录剥掉误填的域名后缀，多级子域名原样保留', () => {
+  const app = loadRenderer();
+  assert.equal(app.dnsNormalizeRR('www.example.com', 'example.com'), 'www');
+  assert.equal(app.dnsNormalizeRR('WWW.Example.COM', 'Example.com'), 'WWW');
+  assert.equal(app.dnsNormalizeRR('account.admin', 'example.com'), 'account.admin');
+  assert.equal(app.dnsNormalizeRR('@', 'example.com'), '@');
+  assert.equal(app.dnsNormalizeRR('  www.example.com  ', 'example.com'), 'www');
 });

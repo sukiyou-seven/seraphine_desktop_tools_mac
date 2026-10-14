@@ -1707,10 +1707,29 @@ check("A 记录拒绝越界的 IPv4",
       dnsService.validate(rr: "www", type: "A", value: "1.2.3.999", priority: "") != nil)
 check("主机记录不能为空",
       dnsService.validate(rr: "   ", type: "A", value: "1.2.3.4", priority: "") != nil)
-check("主机记录不许写全域名（只填最左边一段）",
-      dnsService.validate(rr: "www.example.com", type: "A", value: "1.2.3.4", priority: "") != nil)
+check("多级子域名是合法写法（account.admin）",
+      dnsService.validate(rr: "account.admin", type: "A", value: "1.2.3.4", priority: "") == nil)
 check("下划线开头的验证记录放行",
       dnsService.validate(rr: "_acme-challenge", type: "TXT", value: "token", priority: "") == nil)
+check("@ 与 * 直接放行",
+      dnsService.validate(rr: "@", type: "A", value: "1.2.3.4", priority: "") == nil
+      && dnsService.validate(rr: "*", type: "A", value: "1.2.3.4", priority: "") == nil)
+check("连续的点拦住",
+      dnsService.validate(rr: "a..b", type: "A", value: "1.2.3.4", priority: "") != nil)
+check("连字符开头结尾拦住",
+      dnsService.validate(rr: "-abc", type: "A", value: "1.2.3.4", priority: "") != nil
+      && dnsService.validate(rr: "abc-", type: "A", value: "1.2.3.4", priority: "") != nil)
+check("带空格的标签拦住",
+      dnsService.validate(rr: "a b", type: "A", value: "1.2.3.4", priority: "") != nil)
+// 误填整个域名不报错，而是自动剥掉域名后缀
+check("误填全域名剥掉域名后缀",
+      DNSService.normalizeRR("www.example.com", domain: "example.com") == "www"
+      && dnsService.validate(rr: DNSService.normalizeRR("www.example.com", domain: "example.com"),
+                             type: "A", value: "1.2.3.4", priority: "") == nil)
+check("剥后缀不分大小写",
+      DNSService.normalizeRR("WWW.Example.COM", domain: "Example.com") == "WWW")
+check("不以域名结尾的多级子域名原样保留",
+      DNSService.normalizeRR("account.admin", domain: "example.com") == "account.admin")
 check("MX 必须填优先级",
       dnsService.validate(rr: "@", type: "MX", value: "mail.example.com", priority: "") != nil)
 check("MX 优先级合法就通过",

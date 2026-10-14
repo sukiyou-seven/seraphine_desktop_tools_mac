@@ -209,7 +209,7 @@ struct DNSView: View {
             }
 
             HStack(spacing: 8) {
-                labeledField("主机记录", placeholder: "www 或 @", width: 110,
+                labeledField("主机记录", placeholder: "www、account.admin 或 @", width: 150,
                              text: $model.dnsState.editor.rr)
                 Text(verbatim: "类型").font(.caption).foregroundStyle(.secondary)
                 Picker("", selection: $model.dnsState.editor.type) {

@@ -210,7 +210,9 @@ func validProjectEntry(runtimeID, entry string) bool {
 	case "openjdk":
 		return ext == ".jar"
 	case "dotnet":
-		return ext == ".dll"
+		// 自包含发布也能以可执行文件为入口：单文件发布（PublishSingleFile）
+		// 连 dll 都没有，整个应用就一个可执行文件
+		return ext == ".dll" || ext == ""
 	case "ruby":
 		return ext == ".rb"
 	case "bun", "deno":
@@ -603,6 +605,45 @@ func systemdQuoted(value string) string {
 	return "\"" + value + "\""
 }
 
+// selfContainedDotnetExecutable 给出与入口 dll 同名的可执行文件路径：
+// 自包含发布（dotnet publish --self-contained）会把 `MyApp.dll` 连同
+// 同名的原生可执行文件 `MyApp` 一起放进发布目录。
+func selfContainedDotnetExecutable(entry string) string {
+	return filepath.Join(filepath.Dir(entry), strings.TrimSuffix(filepath.Base(entry), filepath.Ext(entry)))
+}
+
+// selfContainedDotnet 判断 .NET 工程能不能脱离面板装的 dotnet 启动：
+//
+//   - 入口是 dll：与入口同名的可执行文件和 libcoreclr.so（自带的运行时核心库）
+//     都在入口所在目录里，这是普通的自包含发布；
+//   - 入口没有扩展名：单文件发布（PublishSingleFile），整个应用连同运行时
+//     压成了一个可执行文件，直接执行它就行。
+//
+// 框架依赖发布没有上述特征，跑起来仍要靠面板装的 dotnet，不能算自包含。
+func selfContainedDotnet(item project) bool {
+	if item.Runtime != "dotnet" {
+		return false
+	}
+	entry := filepath.Join(item.Directory, item.Entry)
+	switch ext := filepath.Ext(item.Entry); {
+	case ext == "":
+		return executableFile(entry)
+	case strings.EqualFold(ext, ".dll"):
+		return executableFile(selfContainedDotnetExecutable(entry)) &&
+			regularFile(filepath.Join(filepath.Dir(entry), "libcoreclr.so"))
+	}
+	return false
+}
+
+// runtimeReadyFor 判断这个项目的运行环境够不够启动：面板装的运行环境在，
+// 或者 .NET 工程是自包含发布（自带运行时，不依赖系统 dotnet）。
+func (pm *projectManager) runtimeReadyFor(item project) bool {
+	if selfContainedDotnet(item) {
+		return true
+	}
+	return pm.runtimeReadyVersion(item.Runtime, item.RuntimeVersion)
+}
+
 func (pm *projectManager) unit(item project) []byte {
 	runtime, _ := projectRuntimeByID(item.Runtime)
 	base := item.Directory
@@ -614,6 +655,10 @@ func (pm *projectManager) unit(item project) []byte {
 	}
 	entry := filepath.Join(base, item.Entry)
 	args := append([]string{binary}, runtime.Subcommand...)
+	// 自包含发布自带完整运行时：直接执行工程里的可执行文件，系统没装 dotnet 也能跑。
+	if item.Runtime == "dotnet" && selfContainedDotnet(item) {
+		args = []string{selfContainedDotnetExecutable(entry)}
+	}
 	if item.Runtime == "python" && item.PythonServer != "" && item.PythonServer != "direct" {
 		module, _ := pythonModule(item.Entry)
 		binary = filepath.Join(pm.venvDir(item.ID), "bin", item.PythonServer)
@@ -643,7 +688,9 @@ func (pm *projectManager) unit(item project) []byte {
 	if item.Runtime == "deno" {
 		args = append(args, "--allow-read="+base, "--allow-write="+data)
 	}
-	if item.Runtime != "python" || item.PythonServer == "" || item.PythonServer == "direct" {
+	if item.Runtime == "dotnet" && selfContainedDotnet(item) {
+		// 自包含可执行文件本身就是入口，不带 entry 参数
+	} else if item.Runtime != "python" || item.PythonServer == "" || item.PythonServer == "direct" {
 		args = append(args, entry)
 	}
 	quoted := make([]string, len(args))
@@ -846,7 +893,7 @@ func (pm *projectManager) applyStatus(item project, status unitStatus) project {
 }
 
 func (pm *projectManager) state(ctx context.Context, item project) project {
-	item.RuntimeReady = pm.runtimeReadyVersion(item.Runtime, item.RuntimeVersion)
+	item.RuntimeReady = pm.runtimeReadyFor(item)
 	item.VenvReady = pm.venvReady(item)
 	item.ServerReady = pm.pythonServerReady(item)
 	return pm.applyStatus(item, pm.unitStatus(ctx, item.ID))
@@ -939,7 +986,7 @@ func (pm *projectManager) save(ctx context.Context, item project, creating bool)
 	if !creating {
 		wasRunning = pm.state(ctx, old).ActiveState == "active"
 	}
-	if wasRunning && !pm.runtimeReadyVersion(item.Runtime, item.RuntimeVersion) {
+	if wasRunning && !pm.runtimeReadyFor(item) {
 		return project{}, errors.New("正在运行的项目不能切换到未安装的运行环境")
 	}
 	if wasRunning && item.UseVenv && !pm.venvReady(item) {
@@ -1043,7 +1090,7 @@ func (pm *projectManager) action(ctx context.Context, id, action string) error {
 		return err
 	}
 	if action == "start" || action == "restart" || action == "enable" {
-		if !pm.runtimeReadyVersion(item.Runtime, item.RuntimeVersion) {
+		if !pm.runtimeReadyFor(item) {
 			return errors.New("项目运行环境未安装")
 		}
 		if item.UseVenv && !pm.venvReady(item) {

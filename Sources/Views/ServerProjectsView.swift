@@ -840,7 +840,9 @@ private struct ServerProjectPathPicker: View {
         case "node": return ["js", "mjs", "cjs"]
         case "go": return ["go"]
         case "openjdk": return ["jar"]
-        case "dotnet": return ["dll"]
+        case "dotnet":
+            // dll 之外也允许无扩展名的可执行文件：自包含 / 单文件发布的入口
+            return ["dll", ""]
         case "ruby": return ["rb"]
         case "bun", "deno": return ["js", "mjs", "ts", "tsx"]
         default: return []

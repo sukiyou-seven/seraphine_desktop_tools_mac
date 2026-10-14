@@ -1512,7 +1512,9 @@ final class AppModel: ObservableObject {
         syncDNSSettings()
         let service = dns
         let draft = dnsState.editor
-        let rr = draft.rr.trimmingCharacters(in: .whitespaces)
+        // 手误抢救：填了 `www.example.com` 就剥成 `www`；`account.admin` 这种
+        // 多级子域名不以域名结尾，原样保留
+        let rr = DNSService.normalizeRR(draft.rr, domain: domain)
         let value = draft.value.trimmingCharacters(in: .whitespaces)
         let ttl = Int(draft.ttl.trimmingCharacters(in: .whitespaces)) ?? settings.dns.clampedTTL
 
@@ -1524,7 +1526,7 @@ final class AppModel: ObservableObject {
 
         if let recordId = dnsState.editingRecordId {
             dnsWrite("正在保存解析记录…") {
-                service.updateRecord(recordId: recordId, rr: rr, type: draft.type,
+                service.updateRecord(recordId: recordId, domain: domain, rr: rr, type: draft.type,
                                      value: value, ttl: ttl, priority: draft.priority)
             } after: {
                 self.dnsCancelEdit()

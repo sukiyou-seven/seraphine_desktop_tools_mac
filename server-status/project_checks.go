@@ -76,13 +76,22 @@ func (pm *projectManager) checks(ctx context.Context, item project, status unitS
 			Detail: detail, Hint: "看日志与系统日志定位原因；再次启动时会自动清除失败计数", Action: "log"})
 	}
 
-	if pm.runtimeReadyVersion(item.Runtime, item.RuntimeVersion) {
+	switch {
+	case item.Runtime == "dotnet" && selfContainedDotnet(item):
+		// 自包含发布（dotnet publish --self-contained）把运行时一起打进了工程目录，
+		// 系统里装没装 dotnet 都无所谓——这一条不能再拿「运行环境未安装」去吓人。
+		result = append(result, projectCheck{ID: "runtime", Label: "运行环境", Level: checkOK,
+			Detail: "自包含发布，使用工程自带的 .NET 运行时"})
+	case pm.runtimeReadyVersion(item.Runtime, item.RuntimeVersion):
 		result = append(result, projectCheck{ID: "runtime", Label: "运行环境", Level: checkOK,
 			Detail: runtimeLabel(runtime, item.RuntimeVersion) + " 已安装"})
-	} else {
+	default:
 		hint := "在「环境管理」里安装 " + runtime.Name + "，再编辑项目选择该版本"
 		if item.RuntimeVersion == "" {
 			hint = "项目还没有选定运行环境版本，编辑项目时选择已安装的版本"
+		}
+		if item.Runtime == "dotnet" {
+			hint += "；自包含发布（--self-contained）的工程也可以直接运行，无需安装"
 		}
 		result = append(result, projectCheck{ID: "runtime", Label: "运行环境", Level: checkError,
 			Detail: runtimeLabel(runtime, item.RuntimeVersion) + " 未安装", Hint: hint, Action: "edit"})
