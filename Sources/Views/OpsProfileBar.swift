@@ -35,7 +35,7 @@ struct OpsProfileBar: View {
                         .textFieldStyle(.roundedBorder)
                         .frame(maxWidth: 260)
                         .onChange(of: model.settings.opsProfiles[index].name) { _ in model.persistSettings() }
-                    Text(verbatim: "一份配置 = 一个阿里云账号 + 一套证书设置")
+                    Text(verbatim: "一份配置 = 一个云账号（阿里云 / 腾讯云）+ 一套证书设置")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 0)

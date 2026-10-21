@@ -264,12 +264,14 @@ struct OpsProfile: Codable, Identifiable, Equatable {
         acme = try container.decodeIfPresent(ACMESettings.self, forKey: .acme) ?? acme
     }
 
-    /// 下拉里显示的标签：优先用名字，其次用 AccessKey 后 4 位。
+    /// 下拉里显示的标签：优先用名字，其次用阿里云 / 腾讯云密钥后 4 位。
     var label: String {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
         if !trimmed.isEmpty { return trimmed }
-        let key = dns.aliKey.trimmingCharacters(in: .whitespaces)
-        return key.isEmpty ? "新配置" : "阿里云 ****\(key.suffix(4))"
+        let aliKey = dns.aliKey.trimmingCharacters(in: .whitespaces)
+        if !aliKey.isEmpty { return "阿里云 ****\(aliKey.suffix(4))" }
+        let tencentID = dns.tencentSecretId.trimmingCharacters(in: .whitespaces)
+        return tencentID.isEmpty ? "新配置" : "腾讯云 ****\(tencentID.suffix(4))"
     }
 }
 

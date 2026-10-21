@@ -5,11 +5,13 @@ import CryptoKit
 
 /// 「域名解析」页的设置。
 ///
-/// 只走阿里云云解析（AliDNS）的 OpenAPI，先支持阿里云一家；
-/// `provider` 字段留着，以后加 Cloudflare / DNSPod 时不用再动设置文件的结构。
+/// 解析记录管理只走阿里云云解析（AliDNS）的 OpenAPI；`provider` 字段留着，
+/// 以后加 Cloudflare / DNSPod 时不用再动设置文件的结构。
+/// 腾讯云的凭据目前只用于证书申请的 DNS-01 自动验证（acme.sh 的 dns_tencent），
+/// 不会影响解析记录页。
 ///
-/// ⚠️ AccessKey 明文存在工具的设置文件里，建议用只有 `AliyunDNSFullAccess` 的 RAM 子账号。
-/// 一份「服务器运维」配置（`OpsProfile`）只对应**一个**阿里云账号。
+/// ⚠️ AccessKey / SecretKey 明文存在工具的设置文件里，建议用权限最小的子账号。
+/// 一份「服务器运维」配置（`OpsProfile`）只对应**一个**云账号。
 ///
 /// 以前这里是一个账号数组（`DNSCredential`），现在多账号请建多份配置 ——
 /// 切配置就同时换了阿里云账号、宝塔面板和证书设置。
@@ -17,6 +19,9 @@ struct DNSSettings: Codable, Equatable {
     var provider = "aliyun"
     var aliKey = ""
     var aliSecret = ""
+    /// 腾讯云 API 密钥（证书的 DNS-01 验证用，acme.sh 的 dns_tencent 插件读取）
+    var tencentSecretId = ""
+    var tencentSecretKey = ""
     /// 每次拉取解析记录的条数（阿里云接口上限 100）
     var pageSize = 50
     /// 记录列表默认的 TTL（阿里云默认 600，范围 ≤ 86400）
@@ -25,10 +30,13 @@ struct DNSSettings: Codable, Equatable {
     init() {}
 
     init(provider: String = "aliyun", aliKey: String = "", aliSecret: String = "",
+         tencentSecretId: String = "", tencentSecretKey: String = "",
          pageSize: Int = 50, defaultTTL: Int = 600) {
         self.provider = provider
         self.aliKey = aliKey
         self.aliSecret = aliSecret
+        self.tencentSecretId = tencentSecretId
+        self.tencentSecretKey = tencentSecretKey
         self.pageSize = pageSize
         self.defaultTTL = defaultTTL
     }
@@ -39,6 +47,10 @@ struct DNSSettings: Codable, Equatable {
         provider = try container.decodeIfPresent(String.self, forKey: .provider) ?? provider
         aliKey = try container.decodeIfPresent(String.self, forKey: .aliKey) ?? aliKey
         aliSecret = try container.decodeIfPresent(String.self, forKey: .aliSecret) ?? aliSecret
+        tencentSecretId = try container.decodeIfPresent(String.self, forKey: .tencentSecretId)
+            ?? tencentSecretId
+        tencentSecretKey = try container.decodeIfPresent(String.self, forKey: .tencentSecretKey)
+            ?? tencentSecretKey
         pageSize = try container.decodeIfPresent(Int.self, forKey: .pageSize) ?? pageSize
         defaultTTL = try container.decodeIfPresent(Int.self, forKey: .defaultTTL) ?? defaultTTL
     }
@@ -47,6 +59,13 @@ struct DNSSettings: Codable, Equatable {
         !aliKey.trimmingCharacters(in: .whitespaces).isEmpty
             && !aliSecret.trimmingCharacters(in: .whitespaces).isEmpty
     }
+
+    /// 腾讯云凭据是否齐全（证书页的「腾讯云 DNS」模式用）
+    var hasTencentCredentials: Bool {
+        !tencentSecretId.trimmingCharacters(in: .whitespaces).isEmpty
+            && !tencentSecretKey.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
     var isConfigured: Bool { provider == "aliyun" && hasCredentials }
 
     var providerLabel: String {

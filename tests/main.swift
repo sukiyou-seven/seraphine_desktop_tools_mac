@@ -1788,6 +1788,24 @@ let single = try? JSONDecoder().decode(AppSettings.self, from: legacySingle)
 check("旧单账号进入默认配置",
       single?.dns.aliKey == "old-dns" && single?.dns.aliSecret == "old-secret")
 
+print("== 证书：腾讯云 DNS 凭据 ==")
+var tencentProfile = OpsProfile()
+tencentProfile.dns.tencentSecretId = "AKID123456"
+tencentProfile.dns.tencentSecretKey = "secret-xyz"
+check("腾讯云凭据齐全时判定为已配置", tencentProfile.dns.hasTencentCredentials)
+check("阿里云解析配置不受腾讯云凭据影响", tencentProfile.dns.isConfigured == false)
+check("没名字时配置标签用腾讯云 SecretId 后 4 位",
+      tencentProfile.label == "腾讯云 ****3456", tencentProfile.label)
+let tencentEncoded = try? JSONEncoder().encode(tencentProfile)
+let tencentRestored = tencentEncoded.flatMap { try? JSONDecoder().decode(OpsProfile.self, from: $0) }
+check("腾讯云凭据能往返保存",
+      tencentRestored?.dns.tencentSecretId == "AKID123456"
+          && tencentRestored?.dns.tencentSecretKey == "secret-xyz")
+let oldProfileData = Data(#"{"id":"p1","name":"旧配置","dns":{"aliKey":"LTAI","aliSecret":"s"}}"#.utf8)
+let oldProfile = try? JSONDecoder().decode(OpsProfile.self, from: oldProfileData)
+check("旧配置没有腾讯云字段也能解码",
+      oldProfile?.dns.hasTencentCredentials == false && oldProfile?.dns.hasCredentials == true)
+
 print("== 服务器管理：多配置切换与保存 ==")
 var multi = AppSettings()
 multi.dns.aliKey = "ali-a"

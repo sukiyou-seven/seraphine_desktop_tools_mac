@@ -106,6 +106,8 @@ enum ACMEFileError: LocalizedError {
 
 /// Let's Encrypt 证书申请，走 acme.sh。
 /// - 阿里云模式：`--dns dns_ali`，凭据通过 Ali_Key / Ali_Secret 环境变量传入（DNS-01 验证）。
+/// - 腾讯云模式：`--dns dns_tencent`，凭据通过 Tencent_SecretId / Tencent_SecretKey
+///   环境变量传入，调用腾讯云 DNSPod 接口写 TXT 记录。
 /// - 手动模式：acme.sh 的手动 DNS 两段式 —— 先拿到 TXT 记录，用户自行添加，再完成验证。
 final class ACMEService: @unchecked Sendable {
     private(set) var settings: ACMESettings
@@ -221,6 +223,53 @@ final class ACMEService: @unchecked Sendable {
         ACMECertificate.isECCKeyLength(issueKeyLength) ? "_ecc" : ""
     }
 
+    /// acme.sh 的 DNS 插件（`dnsapi/*.sh`）不一定会跟主脚本一起装上（通过 Gitee
+    /// 镜像只装了单文件），缺失时 acme.sh 会悄悄退回「手动模式」，只把 TXT 记录
+    /// 打印出来而不去写解析，最后表现为验证失败。申请前先把插件补齐。
+    private static let dnsAPIMirrors = [
+        "https://cdn.jsdelivr.net/gh/acmesh-official/acme.sh@master/dnsapi",
+        "https://gitee.com/neilpang/acme.sh/raw/master/dnsapi",
+        "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/dnsapi",
+    ]
+
+    /// 确保 `dnsapi/<name>.sh` 存在；成功返回 nil，失败返回可直接展示的说明。
+    func ensureDNSAPI(_ name: String) -> String? {
+        let directory = home + "/dnsapi"
+        let target = directory + "/" + name + ".sh"
+        if let text = try? String(contentsOfFile: target, encoding: .utf8),
+           text.contains("\(name)_add") {
+            return nil
+        }
+        try? FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        let temporary = directory + "/.\(name).sh.download"
+        var failures: [String] = []
+        for mirror in Self.dnsAPIMirrors {
+            _ = try? FileManager.default.removeItem(atPath: temporary)
+            let url = "\(mirror)/\(name).sh"
+            let result = Shell.run(["/usr/bin/curl", "-fsSL", "--max-time", "30",
+                                    "-o", temporary, url], timeout: 45)
+            guard result.ok,
+                  let text = try? String(contentsOfFile: temporary, encoding: .utf8),
+                  text.contains("\(name)_add") else {
+                failures.append("\(mirror)：\(result.ok ? "下载到的内容不完整" : result.message)")
+                continue
+            }
+            _ = try? FileManager.default.removeItem(atPath: target)
+            guard (try? FileManager.default.moveItem(atPath: temporary, toPath: target)) != nil else {
+                failures.append("\(mirror)：写入 \(target) 失败")
+                continue
+            }
+            _ = try? FileManager.default.setAttributes([.posixPermissions: 0o755],
+                                                       ofItemAtPath: target)
+            Diag.log("已补齐 acme.sh DNS 插件：\(target)")
+            return nil
+        }
+        _ = try? FileManager.default.removeItem(atPath: temporary)
+        return "缺少 acme.sh 的 \(name) 插件，自动下载失败。\n"
+             + "可以手动把 \(name).sh 放到 \(directory)/ 后重试。\n\n"
+             + failures.joined(separator: "\n")
+    }
+
     /// 阿里云 DNS 自动验证（DNS-01）：acme.sh 自动写 TXT 记录、验证、再删掉。
     /// 凭据来自「域名解析」页那份统一配置（不再用证书页自己的字段）。
     func issueWithAliyun(domains: [String], email: String,
@@ -236,12 +285,50 @@ final class ACMEService: @unchecked Sendable {
             return .failure("阿里云方式需要 AccessKey —— 在「域名解析」页里填一次，"
                             + "这里和那边共用同一份凭据。")
         }
+        if let error = ensureDNSAPI("dns_ali") {
+            return .failure("阿里云 DNS 插件不可用", detail: error)
+        }
 
         var args = baseArgs(list, email: email)
         args += ["--dns", "dns_ali"]
         let env = ["Ali_Key": key, "Ali_Secret": secret, "Ali_Region": "cn-hangzhou"]
 
         Diag.log("申请证书（阿里云 DNS）：\(list.joined(separator: ", "))")
+        let result = Shell.run([bin] + args, timeout: 600, extraEnv: env)
+        guard result.ok else {
+            return .failure("申请失败：\(result.message)", detail: String(result.stdout.suffix(800)))
+        }
+        return ActionResult(ok: true,
+                            message: "证书已签发：\(list.joined(separator: ", "))",
+                            detail: "证书目录：\(home)/\(list[0])\(issueDirectorySuffix)/\n\n"
+                                  + String(result.stdout.suffix(400)))
+    }
+
+    /// 腾讯云 DNS 自动验证（DNS-01）：走 acme.sh 的 `dns_tencent` 插件
+    /// （腾讯云 DNSPod API，不是 DNSPod 的独立 Token），自动写/删 TXT 记录。
+    /// 凭据与阿里云一样存在当前「服务器运维」配置里，续期时继续复用。
+    func issueWithTencent(domains: [String], email: String,
+                          secretId: String, secretKey: String) -> ActionResult {
+        guard let bin else {
+            return .failure("找不到 acme.sh。可以点上面的「安装 acme.sh」，或在「设置」里指定路径。")
+        }
+        let list = normalizedDomains(domains)
+        guard !list.isEmpty else { return .failure("至少要填一个域名") }
+        let id = secretId.trimmingCharacters(in: .whitespaces)
+        let key = secretKey.trimmingCharacters(in: .whitespaces)
+        guard !id.isEmpty, !key.isEmpty else {
+            return .failure("腾讯云方式需要 SecretId / SecretKey —— 在下方填一次，"
+                            + "会随当前配置保存，续期时继续使用。")
+        }
+        if let error = ensureDNSAPI("dns_tencent") {
+            return .failure("腾讯云 DNS 插件不可用", detail: error)
+        }
+
+        var args = baseArgs(list, email: email)
+        args += ["--dns", "dns_tencent"]
+        let env = ["Tencent_SecretId": id, "Tencent_SecretKey": key]
+
+        Diag.log("申请证书（腾讯云 DNS）：\(list.joined(separator: ", "))")
         let result = Shell.run([bin] + args, timeout: 600, extraEnv: env)
         guard result.ok else {
             return .failure("申请失败：\(result.message)", detail: String(result.stdout.suffix(800)))
@@ -381,17 +468,33 @@ final class ACMEService: @unchecked Sendable {
     }
 
     func renew(domain: String, ecc: Bool = false,
-               accessKey: String = "", accessSecret: String = "") -> ActionResult {
+               accessKey: String = "", accessSecret: String = "",
+               tencentSecretId: String = "", tencentSecretKey: String = "") -> ActionResult {
         guard let bin else { return .failure("找不到 acme.sh") }
         let name = domain.trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty else { return .failure("域名不能为空") }
 
-        // 续期时如果 acme.sh 需要重新做 DNS-01，它得能自己写 TXT 记录，所以凭据一并带上
+        // 续期时如果 acme.sh 需要重新做 DNS-01，它得能自己写 TXT 记录，所以凭据一并带上。
+        // 阿里云和腾讯云的键同时传没有副作用：acme.sh 只读证书对应的那个插件需要的变量。
         var env: [String: String] = [:]
         let key = accessKey.trimmingCharacters(in: .whitespaces)
         let secret = accessSecret.trimmingCharacters(in: .whitespaces)
         if !key.isEmpty, !secret.isEmpty {
-            env = ["Ali_Key": key, "Ali_Secret": secret, "Ali_Region": "cn-hangzhou"]
+            env["Ali_Key"] = key
+            env["Ali_Secret"] = secret
+            env["Ali_Region"] = "cn-hangzhou"
+            if let error = ensureDNSAPI("dns_ali") {
+                return .failure("阿里云 DNS 插件不可用", detail: error)
+            }
+        }
+        let tencentID = tencentSecretId.trimmingCharacters(in: .whitespaces)
+        let tencentKey = tencentSecretKey.trimmingCharacters(in: .whitespaces)
+        if !tencentID.isEmpty, !tencentKey.isEmpty {
+            env["Tencent_SecretId"] = tencentID
+            env["Tencent_SecretKey"] = tencentKey
+            if let error = ensureDNSAPI("dns_tencent") {
+                return .failure("腾讯云 DNS 插件不可用", detail: error)
+            }
         }
 
         // ECC 证书必须显式带 --ecc，否则 acme.sh 可能去找 RSA 目录（`<域名>` 而不是 `<域名>_ecc`）。

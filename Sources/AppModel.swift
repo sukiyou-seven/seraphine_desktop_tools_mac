@@ -1161,7 +1161,8 @@ final class AppModel: ObservableObject {
 
     @Published var acmeStatus = ACMEStatus()
     @Published var acmeDomains = ""
-    /// aliyun（自动 DNS 验证）或 manual（手动加 TXT 记录）
+    /// aliyun（阿里云 DNS 自动验证）、tencent（腾讯云 DNSPod 自动验证）
+    /// 或 manual（手动加 TXT 记录）
     @Published var acmeMode = "aliyun"
     @Published var acmeChallenges: [ACMEChallenge] = []
     @Published var acmeCertificates: [ACMECertificate] = []
@@ -1208,19 +1209,30 @@ final class AppModel: ObservableObject {
         // 凭据统一从「域名解析」那份配置里拿（先在主线程取出来，闭包跑在后台）
         let accessKey = settings.dns.aliKey
         let accessSecret = settings.dns.aliSecret
+        let tencentSecretId = settings.dns.tencentSecretId
+        let tencentSecretKey = settings.dns.tencentSecretKey
         guard !domains.isEmpty else {
             toast = Toast(text: "请先填域名", ok: false)
             return
         }
-        if acmeMode == "manual" {
+        switch acmeMode {
+        case "manual":
             generateChallenges()
-            return
-        }
-        perform("正在申请证书（DNS 自动验证，可能要 1 分钟）…") {
-            service.issueWithAliyun(domains: domains, email: email,
-                                    accessKey: accessKey, accessSecret: accessSecret)
-        } after: {
-            self.loadCertificates()
+        case "tencent":
+            perform("正在申请证书（腾讯云 DNS 自动验证，可能要 1 分钟）…") {
+                service.issueWithTencent(domains: domains, email: email,
+                                         secretId: tencentSecretId,
+                                         secretKey: tencentSecretKey)
+            } after: {
+                self.loadCertificates()
+            }
+        default:
+            perform("正在申请证书（DNS 自动验证，可能要 1 分钟）…") {
+                service.issueWithAliyun(domains: domains, email: email,
+                                        accessKey: accessKey, accessSecret: accessSecret)
+            } after: {
+                self.loadCertificates()
+            }
         }
     }
 
@@ -1283,8 +1295,13 @@ final class AppModel: ObservableObject {
         let service = acme
         let accessKey = settings.dns.aliKey
         let accessSecret = settings.dns.aliSecret
+        let tencentSecretId = settings.dns.tencentSecretId
+        let tencentSecretKey = settings.dns.tencentSecretKey
         perform("正在续期 \(domain)…") {
-            service.renew(domain: domain, ecc: ecc, accessKey: accessKey, accessSecret: accessSecret)
+            service.renew(domain: domain, ecc: ecc,
+                          accessKey: accessKey, accessSecret: accessSecret,
+                          tencentSecretId: tencentSecretId,
+                          tencentSecretKey: tencentSecretKey)
         } after: {
             self.loadCertificates()
         }
@@ -1433,6 +1450,15 @@ final class AppModel: ObservableObject {
         let key = settings.dns.aliKey.trimmingCharacters(in: .whitespaces)
         let label = settings.selectedOpsProfile?.label ?? "阿里云"
         return key.count > 4 ? "\(label)（****\(key.suffix(4))）" : label
+    }
+
+    /// 证书页的腾讯云凭据摘要：只露 SecretId 后 4 位
+    var tencentCredentialSummary: String {
+        guard settings.dns.hasTencentCredentials else { return "未配置" }
+        let id = settings.dns.tencentSecretId.trimmingCharacters(in: .whitespaces)
+        let suffix = id.count > 4 ? "****\(id.suffix(4))" : id
+        let name = settings.selectedOpsProfile?.name.trimmingCharacters(in: .whitespaces) ?? ""
+        return name.isEmpty ? "腾讯云 \(suffix)" : "\(name)（腾讯云 \(suffix)）"
     }
 
     /// 保存设置并让服务拿到最新配置（和证书页一个套路）

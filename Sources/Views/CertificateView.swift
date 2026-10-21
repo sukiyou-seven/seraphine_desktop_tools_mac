@@ -68,7 +68,7 @@ private struct ACMEStatusCard: View {
                 InfoRow(label: "证书目录", value: model.acmeStatus.home)
             } else {
                 Text(verbatim: "申请 Let's Encrypt 证书需要 acme.sh。它是单文件 shell 脚本，零依赖，"
-                     + "并且内置阿里云 DNS 插件（DNS-01 验证就靠它）。")
+                     + "申请时会自动补齐阿里云 / 腾讯云 DNS 插件（DNS-01 验证就靠它）。")
                     .font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
                 Text(verbatim: "点下面的按钮会先试官方源；如果下载失败（国内直连 GitHub 常超时），"
@@ -140,6 +140,7 @@ private struct ACMEIssueCard: View {
 
                 Picker("", selection: $model.acmeMode) {
                     Text(verbatim: "阿里云域名解析（自动完成 DNS 验证）").tag("aliyun")
+                    Text(verbatim: "腾讯云域名解析（自动完成 DNS 验证）").tag("tencent")
                     Text(verbatim: "手动 DNS（自己加 TXT 记录）").tag("manual")
                 }
                 .pickerStyle(.radioGroup)
@@ -164,6 +165,57 @@ private struct ACMEIssueCard: View {
                     Text(verbatim: "使用当前配置的阿里云账号申请和手动续期；换账号请在页面顶部切换配置。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    HStack {
+                        Button("申请证书") { model.issueCertificate() }
+                            .disabled(model.acmeDomains.trimmingCharacters(in: .whitespaces).isEmpty)
+                        Text(verbatim: "会自动完成 DNS 验证并签发（首次约 30 秒～2 分钟）")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } else if model.acmeMode == "tencent" {
+                    Text(verbatim: "工具会通过腾讯云 DNSPod 接口自动添加 _acme-challenge TXT 记录，"
+                         + "验证通过后删掉记录，全程无需人工。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    HStack(spacing: 10) {
+                        Text("SecretId")
+                            .font(.callout)
+                            .frame(width: 120, alignment: .leading)
+                        TextField("AKID...", text: $model.settings.dns.tencentSecretId)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(.callout, design: .monospaced))
+                            .frame(maxWidth: 320)
+                            .onChange(of: model.settings.dns.tencentSecretId) { _ in
+                                model.persistSettings()
+                            }
+                        Text(verbatim: model.tencentCredentialSummary)
+                            .font(.caption)
+                            .foregroundStyle(model.settings.dns.hasTencentCredentials
+                                             ? Color.secondary : Color.orange)
+                        Spacer(minLength: 0)
+                    }
+                    HStack(spacing: 10) {
+                        Text("SecretKey")
+                            .font(.callout)
+                            .frame(width: 120, alignment: .leading)
+                        SecureField("腾讯云控制台 → 访问管理 → API 密钥管理",
+                                    text: $model.settings.dns.tencentSecretKey)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(.callout, design: .monospaced))
+                            .frame(maxWidth: 320)
+                            .onChange(of: model.settings.dns.tencentSecretKey) { _ in
+                                model.persistSettings()
+                            }
+                        Spacer(minLength: 0)
+                    }
+                    Text(verbatim: "⚠️ 密钥明文保存在设置文件里，建议用只有 DNSPod 权限的子账号；"
+                         + "凭据随顶部配置保存，续期时继续使用。")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
 
                     HStack {
