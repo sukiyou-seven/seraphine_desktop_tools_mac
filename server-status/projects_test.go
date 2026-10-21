@@ -527,6 +527,10 @@ func TestSelfContainedDotnetRunsOnItsOwnRuntime(t *testing.T) {
 
 	// 单文件发布（PublishSingleFile）：入口本身就是可执行文件，没有 dll
 	// 也没有 libcoreclr.so。此刻面板装的 dotnet 已被删掉，正是验证时机。
+	// 入口内容要带原生可执行文件头，识别逻辑不会把普通文本文件当成单文件发布。
+	if err := os.WriteFile(filepath.Join(directory, "publish", "MyApp"), []byte("\x7fELF\x02\x01\x01\x00"), 0755); err != nil {
+		t.Fatal(err)
+	}
 	single := item
 	single.Entry = "publish/MyApp"
 	if !selfContainedDotnet(single) {

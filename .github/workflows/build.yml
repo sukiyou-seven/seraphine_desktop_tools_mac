@@ -10,8 +10,36 @@ permissions:
   contents: read
 
 jobs:
+  cleanup-artifacts:
+    name: Clean up stale artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    # 清理失败不应该拖住构建，真正需要的是后面的上传步骤有空间。
+    continue-on-error: true
+    # 构建产物只是发布前的中转文件，发布完成后就不再需要。GitHub 的 artifact
+    # 存储配额很小（500 MB），30 天保留期会很快把配额吃满，直接导致上传阶段
+    # 报 "Artifact storage quota has been hit" 并让整个 workflow 失败。
+    steps:
+      - name: Delete artifacts from older runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cutoff=$(( $(date -u +%s) - 24*3600 ))
+          gh api --paginate "repos/$GH_REPO/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | [.id, .created_at] | @tsv' |
+          while IFS=$'\t' read -r id created; do
+            if (( $(date -u -d "$created" +%s) < cutoff )); then
+              echo "deleting artifact $id ($created)"
+              gh api -X DELETE "repos/$GH_REPO/actions/artifacts/$id" || true
+            fi
+          done
+
   swiftui-macos:
     name: SwiftUI macOS arm64
+    needs: cleanup-artifacts
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
@@ -33,10 +61,11 @@ jobs:
           name: Seraphim-SwiftUI-mac-arm64
           path: build/Seraphim-SwiftUI-mac-arm64.zip
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 1
 
   electron:
     name: Electron macOS, Windows, Linux
+    needs: cleanup-artifacts
     runs-on: macos-15
     defaults:
       run:
@@ -75,21 +104,21 @@ jobs:
           name: Seraphim-Electron-mac-arm64
           path: build/electron/Seraphim-Electron-*-mac-arm64.zip
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 1
       - name: Upload Electron Windows package
         uses: actions/upload-artifact@v4
         with:
           name: Seraphim-Electron-win-x64
           path: build/electron/Seraphim-Electron-*-win-x64.zip
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 1
       - name: Upload Electron Linux package
         uses: actions/upload-artifact@v4
         with:
           name: Seraphim-Electron-linux-x64
           path: build/electron/Seraphim-Electron-*-linux-x64.tar.gz
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 1
 
   release:
     name: Publish GitHub Release
@@ -97,6 +126,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     steps:
       - name: Download desktop packages
         uses: actions/download-artifact@v4
@@ -133,3 +163,14 @@ jobs:
             gh release create "$tag" release/* --title "$title" \
               --notes "Automated release from commit $GITHUB_SHA. Unsigned desktop packages."
           fi
+      - name: Remove intermediate artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[].id' |
+          while read -r id; do
+            gh api -X DELETE "repos/$GH_REPO/actions/artifacts/$id" || true
+          done
