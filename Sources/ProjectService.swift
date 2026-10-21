@@ -8,6 +8,9 @@ struct ProjectComponent: Identifiable, Equatable {
     let scripts: [String]
     let hasPython: Bool
     let hasWeChat: Bool
+    /// 目录里有 .NET 相关产物（.csproj / .sln / .dll / .exe）—— 但不限于这些：
+    /// 只要有可运行的入口，就能在「自定义入口」里选它。
+    let hasDotnet: Bool
     var id: String { directory }
 }
 
@@ -62,11 +65,17 @@ enum ProjectDiscovery {
             let hasWeChat = weChatProjectDirectory(in: path) != nil
                 || scripts.contains { $0.localizedCaseInsensitiveContains("mp-weixin")
                     || $0.localizedCaseInsensitiveContains("weapp") }
-            if !scripts.isEmpty || hasPython || hasWeChat {
+            // .NET / C#：有工程文件或编译产物就算一个子工程。
+            // 不只看这些 —— 任何带可执行文件的目录都允许通过「自定义入口」跑起来。
+            let dotnetMarkers: Set<String> = ["csproj", "sln", "slnx", "dll", "exe"]
+            let hasDotnet = ((try? fm.contentsOfDirectory(atPath: path)) ?? []).contains { name in
+                dotnetMarkers.contains((name as NSString).pathExtension.lowercased())
+            }
+            if !scripts.isEmpty || hasPython || hasWeChat || hasDotnet {
                 let relative = path == base.path ? "." : String(path.dropFirst(base.path.count + 1))
                 components.append(ProjectComponent(directory: path, relativePath: relative,
                                                    scripts: scripts, hasPython: hasPython,
-                                                   hasWeChat: hasWeChat))
+                                                   hasWeChat: hasWeChat, hasDotnet: hasDotnet))
             }
 
             guard depth < maxDepth else { return }
@@ -79,6 +88,14 @@ enum ProjectDiscovery {
             }
         }
         walk(base, depth: 0)
+        // 兜底：一个「子工程」都没认出来时，把根目录本身当成一个组件 ——
+        // 这样任何项目（C# / Go / Java / 只要有个能跑的东西）都能进来手动指定入口，
+        // 而不是因为「没被识别」就彻底看不到。
+        if components.isEmpty {
+            components.append(ProjectComponent(directory: base.path, relativePath: ".",
+                                               scripts: [], hasPython: false,
+                                               hasWeChat: false, hasDotnet: false))
+        }
         return ProjectScan(components: components.sorted { $0.relativePath < $1.relativePath },
                            interpreters: interpreters.sorted())
     }
@@ -372,6 +389,43 @@ final class ProjectRunner: ObservableObject {
         guard let args = Self.parseArguments(rawArguments) else { error = "Python 参数的引号没有闭合"; return }
         launch(id: pythonID(component), executable: python,
                arguments: [scriptURL.path] + args, cwd: component.directory)
+    }
+
+    // MARK: 自定义入口（不限类型）
+
+    /// 每个子工程自定义的入口（可执行文件 / .dll / 脚本，路径相对子工程目录或绝对路径）。
+    @Published var customExecutables: [String: String] = [:]
+    /// 自定义入口的参数。
+    @Published var customArguments: [String: String] = [:]
+
+    func customID(_ component: ProjectComponent) -> String { "\(component.directory)|custom" }
+
+    /// 跑用户自己选的入口。
+    ///
+    /// **不限制类型**：可执行文件直接跑；`.dll` 交给 `dotnet`；其余能执行的脚本（带 shebang）
+    /// 也能跑。这样 C# 编译出来的 `Ylp.Api`、Go 的二进制、任意脚本都能在这里启动。
+    func startCustom(_ component: ProjectComponent) {
+        let raw = (customExecutables[component.directory] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { error = "先选择要运行的入口文件"; return }
+        let url = URL(fileURLWithPath: raw, relativeTo: URL(fileURLWithPath: component.directory + "/"))
+            .standardizedFileURL
+        guard FileManager.default.fileExists(atPath: url.path) else { error = "找不到入口：\(raw)"; return }
+        let rawArguments = customArguments[component.directory] ?? ""
+        guard let args = Self.parseArguments(rawArguments) else { error = "入口参数的引号没有闭合"; return }
+
+        if FileManager.default.isExecutableFile(atPath: url.path) {
+            launch(id: customID(component), executable: url.path, arguments: args,
+                   cwd: component.directory)
+            return
+        }
+        // 不是可执行位（常见于 .dll 或复制过来的二进制）：.dll 用 dotnet 跑，其它提示原因
+        if url.pathExtension.lowercased() == "dll",
+           let dotnet = ProjectDiscovery.executable("dotnet") {
+            launch(id: customID(component), executable: dotnet, arguments: [url.path] + args,
+                   cwd: component.directory)
+            return
+        }
+        error = "这个文件不可执行：\(raw)（.dll 需要 dotnet；其它文件请先 chmod +x）"
     }
 
     private func launch(id: String, executable: String, arguments: [String], cwd: String) {

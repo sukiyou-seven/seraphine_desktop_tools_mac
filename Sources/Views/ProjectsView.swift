@@ -201,6 +201,9 @@ struct ProjectsView: View {
                             runner.startPython(component, in: root)
                         }
                     }
+                    Divider()
+                    Text("自定义入口（不限类型）").font(.callout.weight(.semibold))
+                    customControls(component)
                 }
                 .frame(maxWidth: .infinity, alignment: .topLeading)
             }
@@ -240,6 +243,50 @@ struct ProjectsView: View {
                 .labelsHidden().frame(maxWidth: 360)
                 Button("添加…") { choosePythonInterpreter(for: component) }
             }
+        }
+    }
+
+    /// 自定义入口：可执行文件 / .dll / 脚本都行，**不限制类型**。
+    /// C# 编译出来的 `Ylp.Api`（或 Go 的二进制、任意带 shebang 的脚本）都能在这里选。
+    private func customControls(_ component: ProjectComponent) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                TextField("入口文件（.exe / .dll / 可执行脚本，不限类型）", text: Binding(
+                    get: { runner.customExecutables[component.directory] ?? "" },
+                    set: { runner.customExecutables[component.directory] = $0 }))
+                    .frame(maxWidth: 360)
+                Button("选择…") { chooseCustomExecutable(for: component) }
+                TextField("参数（可选）", text: Binding(
+                    get: { runner.customArguments[component.directory] ?? "" },
+                    set: { runner.customArguments[component.directory] = $0 }))
+                    .frame(maxWidth: 220)
+            }
+            .textFieldStyle(.roundedBorder)
+            commandRow(id: runner.customID(component),
+                       title: customEntryTitle(component)) {
+                runner.startCustom(component)
+            }
+        }
+    }
+
+    private func customEntryTitle(_ component: ProjectComponent) -> String {
+        let path = (runner.customExecutables[component.directory] ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { return "（还没选入口）" }
+        return URL(fileURLWithPath: path).lastPathComponent
+    }
+
+    private func chooseCustomExecutable(for component: ProjectComponent) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        panel.message = "选择要运行的入口（可执行文件、.dll、脚本都行，不限类型）"
+        panel.prompt = "选为入口"
+        panel.directoryURL = URL(fileURLWithPath: component.directory)
+        if panel.runModal() == .OK, let url = panel.url {
+            runner.customExecutables[component.directory] = url.path
         }
     }
 

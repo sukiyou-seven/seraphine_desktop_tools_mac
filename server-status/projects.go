@@ -187,7 +187,12 @@ func projectRuntimeByID(id string) (projectRuntime, bool) {
 	return projectRuntime{}, false
 }
 
+// validProjectEntry 只做**路径安全**校验：必须是工程目录内的相对路径，且不能有 `..`。
+//
+// 刻意**不再按运行时限制扩展名** —— C# 单文件发布出来的 `Ylp.Api`（扩展名 .api）、
+// 任意二进制、脚本都应该能当入口；填错类型时启动阶段会给出明确错误，不需要在保存时拦。
 func validProjectEntry(runtimeID, entry string) bool {
+	_ = runtimeID // 保留参数签名：调用方和以后可能恢复的按类型提示都还用它
 	if !projectEntryPattern.MatchString(entry) || filepath.IsAbs(entry) {
 		return false
 	}
@@ -196,29 +201,7 @@ func validProjectEntry(runtimeID, entry string) bool {
 			return false
 		}
 	}
-	if entry == "." {
-		return runtimeID == "go"
-	}
-	ext := strings.ToLower(filepath.Ext(entry))
-	switch runtimeID {
-	case "python":
-		return ext == ".py"
-	case "node":
-		return ext == ".js" || ext == ".mjs" || ext == ".cjs"
-	case "go":
-		return ext == ".go"
-	case "openjdk":
-		return ext == ".jar"
-	case "dotnet":
-		// 自包含发布也能以可执行文件为入口：单文件发布（PublishSingleFile）
-		// 连 dll 都没有，整个应用就一个可执行文件
-		return ext == ".dll" || ext == ""
-	case "ruby":
-		return ext == ".rb"
-	case "bun", "deno":
-		return ext == ".js" || ext == ".mjs" || ext == ".ts" || ext == ".tsx"
-	}
-	return false
+	return true
 }
 
 func (pm *projectManager) normalize(item project) (project, error) {
@@ -643,8 +626,10 @@ func selfContainedDotnetExecutable(entry string) string {
 //
 //   - 入口是 dll：与入口同名的 apphost 和 libcoreclr.so（自带的运行时核心库）
 //     都在入口所在目录里，这是普通的自包含发布；
-//   - 入口没有扩展名：要么是单文件发布（PublishSingleFile，整个应用连同
-//     运行时压成一个可执行文件），要么是把 apphost 当入口——两者都直接执行它。
+//   - 入口没有扩展名，或者是**任意其它扩展名**（.exe / .api / 自定义名字）：
+//     单文件发布（PublishSingleFile）就是这样一个原生可执行文件，直接执行它即可，
+//     不依赖系统 dotnet。C# 单文件发布的产物经常就叫 `Ylp.Api` 这种名字，
+//     所以不能只认「无扩展名」。
 //
 // 上传文件时执行位经常丢（HTTP 上传和多数压缩包都不带权限），而 apphost 没有
 // +x 位连 systemd 都起不来，所以识别为自包含布局的同时顺手把它补上执行位。
@@ -654,20 +639,47 @@ func selfContainedDotnet(item project) bool {
 		return false
 	}
 	entry := filepath.Join(item.Directory, item.Entry)
-	switch ext := filepath.Ext(item.Entry); {
-	case ext == "":
-		if !regularFile(entry) {
-			return false
-		}
-		makeExecutable(entry)
-		return true
-	case strings.EqualFold(ext, ".dll"):
+	if !regularFile(entry) {
+		return false
+	}
+	if strings.EqualFold(filepath.Ext(item.Entry), ".dll") {
 		apphost := selfContainedDotnetExecutable(entry)
-		if !regularFile(entry) || !regularFile(apphost) ||
+		if !regularFile(apphost) ||
 			!regularFile(filepath.Join(filepath.Dir(entry), "libcoreclr.so")) {
 			return false
 		}
 		makeExecutable(apphost)
+		return true
+	}
+	// 非 .dll 的入口：只有确实是可执行二进制（ELF / PE / Mach-O）才按自包含单文件处理，
+	// 免得把 appsettings.json 这类普通文件误判成入口。
+	if !looksLikeExecutable(entry) {
+		return false
+	}
+	makeExecutable(entry)
+	return true
+}
+
+// looksLikeExecutable 用文件头判断是不是原生可执行文件。
+// 单文件发布的 .NET 应用是 ELF（Linux）/ PE（Windows）/ Mach-O（macOS）。
+func looksLikeExecutable(path string) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	head := make([]byte, 4)
+	if _, err := file.Read(head); err != nil || len(head) < 4 {
+		return false
+	}
+	switch {
+	case head[0] == 0x7f && head[1] == 'E' && head[2] == 'L' && head[3] == 'F': // ELF
+		return true
+	case head[0] == 'M' && head[1] == 'Z': // PE / .NET apphost
+		return true
+	case head[0] == 0xcf && head[1] == 0xfa && head[2] == 0xed && head[3] == 0xfe: // Mach-O 64
+		return true
+	case head[0] == 0xca && head[1] == 0xfe && head[2] == 0xba && head[3] == 0xbe: // Mach-O universal
 		return true
 	}
 	return false

@@ -826,27 +826,15 @@ private struct ServerProjectPathPicker: View {
     @State private var loading = false
     @State private var errorMessage = ""
 
+    /// 入口**不限制文件类型**：`Ylp.Api`（C# 单文件发布，扩展名是 `.api`）、`.dll`、
+    /// 任意二进制或脚本都能选。以前按运行时白名单过滤，导致 `.api` / 无扩展名之外的文件
+    /// 全都点不了「选择」。现在只区分「文件夹 / 常规文件」。
     private var visibleEntries: [RemoteFile] {
         (listing?.entries ?? []).filter { $0.isDirectory || (selection == .entry && $0.isRegularFile) }
             .sorted {
                 if $0.isDirectory != $1.isDirectory { return $0.isDirectory }
                 return $0.name.localizedStandardCompare($1.name) == .orderedAscending
             }
-    }
-
-    private var allowedExtensions: Set<String> {
-        switch runtime {
-        case "python": return ["py"]
-        case "node": return ["js", "mjs", "cjs"]
-        case "go": return ["go"]
-        case "openjdk": return ["jar"]
-        case "dotnet":
-            // dll 之外也允许无扩展名的可执行文件：自包含 / 单文件发布的入口
-            return ["dll", ""]
-        case "ruby": return ["rb"]
-        case "bun", "deno": return ["js", "mjs", "ts", "tsx"]
-        default: return []
-        }
     }
 
     var body: some View {
@@ -886,8 +874,8 @@ private struct ServerProjectPathPicker: View {
                                     Button("选择") { choose(item.path) }
                                 }
                             } else {
+                                // 不限类型：任意文件都能选（C# 的 Ylp.Api、.dll、二进制、脚本…）
                                 Button("选择") { choose(item.path) }
-                                    .disabled(!allowedExtensions.contains((item.name as NSString).pathExtension.lowercased()))
                             }
                         }
                         .padding(.horizontal, 10)
