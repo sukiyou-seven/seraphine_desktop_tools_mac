@@ -126,7 +126,7 @@ func TestCreateDatabaseWithUserGrantAndRollback(t *testing.T) {
 	}
 	joined := strings.Join(*queries, "\n")
 	for _, expected := range []string{"CREATE DATABASE `shopdb`", "CREATE USER 'shopuser'@'localhost' IDENTIFIED BY",
-		"GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP ON `shopdb`.* TO 'shopuser'@'localhost'"} {
+		"GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP, REFERENCES, TRIGGER, CREATE VIEW, SHOW VIEW, CREATE TEMPORARY TABLES, LOCK TABLES ON `shopdb`.* TO 'shopuser'@'localhost'"} {
 		if !strings.Contains(joined, expected) {
 			t.Fatalf("missing %q in queries: %s", expected, joined)
 		}

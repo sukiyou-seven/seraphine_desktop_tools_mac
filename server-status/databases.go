@@ -565,7 +565,10 @@ func (dm *databaseManager) grant(ctx context.Context, engine, database, username
 	}
 	privileges := "SELECT"
 	if level == "readwrite" {
-		privileges = "SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP"
+		// 建外键要 REFERENCES；触发器 / 视图 / 临时表 / 锁表这些在建库、导入 dump 时也常用，
+		// 一并给上，免得「读写」账号实际却跑不了常规迁移脚本。
+		privileges = "SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP, " +
+			"REFERENCES, TRIGGER, CREATE VIEW, SHOW VIEW, CREATE TEMPORARY TABLES, LOCK TABLES"
 	}
 	_, err := dm.query(ctx, engine, "GRANT "+privileges+" ON "+name+".* TO "+account, "")
 	return err
